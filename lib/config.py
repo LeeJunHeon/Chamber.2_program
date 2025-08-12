@@ -48,7 +48,7 @@ DAC_FULL_SCALE = 4095      # 12bit DAC 0~4095
 # RF Power 보정 및 제어 설정
 # ======================================================================
 RF_MAX_POWER = 600      # 최대 설정 가능 파워 (W)
-RF_RAMP_STEP = 0.5      # Ramp-up 시 한 스텝당 올릴 파워 (W)
+RF_RAMP_STEP = 1.5      # Ramp-up 시 한 스텝당 올릴 파워 (W)
 RF_MAINTAIN_STEP = 0.1  # 파워 유지 시 미세조정할 파워 (W)
 RF_TOLERANCE_POWER = 1  # 목표 파워 도달로 인정할 허용 오차 (± W)
 

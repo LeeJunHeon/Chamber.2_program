@@ -93,12 +93,12 @@ class ProcessController(QObject):
         if is_cold_start:
             self.log_message.emit("Process", "전체 공정 모드로 시작 (Base Pressure 대기 포함).")
             steps.append({'action': 'IG_CMD', 'value': base_pressure, 'message': f'베이스 압력({base_pressure:.1e}) 도달 대기'})
-            steps.append({'action': 'RGA_SCAN', 'message': 'RGA 측정 시작'})
+            #steps.append({'action': 'RGA_SCAN', 'message': 'RGA 측정 시작'})
             
             for gas, info in gas_info.items():
                 steps.append({'action': 'MFC_CMD', 'params': ('FLOW_OFF', {'channel': info["channel"]}), 'message': f'Ch{info["channel"]}({gas}) Flow Off'})
             
-            steps.append({'action': 'MFC_CMD', 'params': ('VALVE_OPEN', {}), 'message': '전체 MFC Valve Open'})
+            steps.append({'action': 'MFC_CMD', 'params': ('VALVE_OPEN', {}), 'message': 'MFC Valve Open'})
             steps.append({'action': 'MFC_CMD', 'params': ('PS_ZEROING', {}), 'message': '압력 센서 Zeroing'})
             
             for gas, info in gas_info.items():
@@ -120,7 +120,7 @@ class ProcessController(QObject):
         # --- 2-3. 압력 제어 시작 ---
         sp1_value = working_pressure / 10.0
         steps.append({'action': 'MFC_CMD', 'params': ('SP4_ON', {}), 'message': '압력 제어(SP4) 시작'})
-        steps.append({'action': 'MFC_CMD', 'params': ('SP1_SET', {'value': sp1_value}), 'message': f'목표 압력(SP1) {sp1_value:.2f} 설정'})
+        steps.append({'action': 'MFC_CMD', 'params': ('SP1_SET', {'value': sp1_value}), 'message': f'목표 압력(SP1) {working_pressure:.2f} 설정'})
 
         # delay 1분
         steps.append({'action': 'DELAY', 'duration': 60000, 'message': '압력 안정화 대기 (60초)'})
@@ -280,10 +280,11 @@ class ProcessController(QObject):
         # Action에 따라 해당하는 시그널을 올바른 파라미터 형식으로 emit
         if action == 'DELAY':
             duration = int(step.get('duration', 100))
-            self.step_timer.start(duration)
             msg = step.get('message', '')
+            self.step_timer.start(duration)
 
-            if ('Shutter Delay' in msg) or ('메인 공정 진행' in msg):
+            # 1초 미만이면 카운트다운 생략
+            if duration >= 1000:
                 self._start_countdown(duration, msg)
             else:
                 self._stop_countdown()
@@ -409,6 +410,14 @@ class ProcessController(QObject):
             except TypeError:
                 pass # 이미 끊긴 경우 발생하는 오류는 무시합니다.
 
+        if self._aborting:
+            self.log_message.emit(
+                "Process",
+                f"경고: 종류 중 '{source}' 단계 검증 실패({reason}). 실패를 무시하고 다음 단계로 진행합니다."
+            )
+            self.on_step_completed()
+            return
+
         full_reason = f"[{source} {reason}]"
         self.log_message.emit("Process", f"오류 발생: {full_reason}. 공정을 중단합니다.")
         # 공정을 비상 종료하는 abort_process() 메소드를 호출합니다.
@@ -471,6 +480,10 @@ class ProcessController(QObject):
     @Slot()
     def abort_process(self):
         """[수정됨] 외부에서 공정을 강제 중단시킬 때, 안전 종료 절차를 '시작'합니다."""
+
+        if getattr(self, "_aborting", False):
+            self.log_message.emit("Process", "이미 종료 중입니다. 추가 정지 요청은 무시합니다.")
+            return
 
         self._stop_countdown()
         self._aborting = True

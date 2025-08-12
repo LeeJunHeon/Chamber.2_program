@@ -165,6 +165,7 @@ class MainWindow(QWidget):
         self.dc_power_controller.request_status_read.connect(self.faduino_controller.force_status_read)
         self.dc_power_controller.send_dc_power_value.connect(self.faduino_controller.set_dc_power)
         self.dc_power_controller.send_dc_power_value_unverified.connect(self.faduino_controller.set_dc_power_unverified)
+        self.faduino_controller.dc_power_updated.connect(self.dc_power_controller.update_measurements)
         self.faduino_controller.dc_power_updated.connect(self.handle_dc_power_feedback)
 
         # # RF Power 연결
@@ -189,10 +190,11 @@ class MainWindow(QWidget):
         self.ui.For_p_edit.setPlainText(f"{for_p:.1f}")
         self.ui.Ref_p_edit.setPlainText(f"{ref_p:.1f}")
 
-    @Slot(float, float)
+    @Slot(float, float, float)
     def handle_dc_power_feedback(self, power, voltage, current):
         """Faduino로부터 DC 전압/전류를 받아 Power 계산 후 UI와 DC 컨트롤러에 전달"""
         if voltage is None or current is None:
+            self.append_log("Main", "voltage, current값이 비어있습니다.")
             return
 
         # 1. UI 업데이트

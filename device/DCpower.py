@@ -23,6 +23,9 @@ class DCPowerController(QObject):
     # UI 로깅을 위한 상태 메시지 신호
     status_message = Signal(str, str)
 
+    # UI로 DC 값을 보내는 신호
+    update_dc_status_display = Signal(float, float, float)
+
     # 공정 컨트롤러에게 목표 파워에 도달했음을 알리는 신호
     target_reached = Signal()
     target_failed = Signal(str, str)
@@ -120,6 +123,8 @@ class DCPowerController(QObject):
             
         self.current_power = power if power is not None else 0.0
         self.status_message.emit("DCpower", f"피드백 수신 - Power: {power:.2f}W, Voltage: {voltage:.2f}V, Current: {current:.2f}A")
+
+        self.update_dc_status_display.emit(power, voltage, current)
         
         power_difference = self.target_power - self.current_power
 

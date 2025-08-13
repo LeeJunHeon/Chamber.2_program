@@ -189,14 +189,14 @@ class MainWindow(QWidget):
         self.dc_power_controller.state_changed.connect(self.faduino_controller.on_dc_state_changed)
 
         # # DC Power 연결
-        self.dc_power_controller.request_status_read.connect(self.faduino_controller.force_status_read)
+        self.dc_power_controller.request_status_read.connect(self.faduino_controller.force_dc_read)
         self.dc_power_controller.send_dc_power_value.connect(self.faduino_controller.set_dc_power)
         self.dc_power_controller.send_dc_power_value_unverified.connect(self.faduino_controller.set_dc_power_unverified)
         self.faduino_controller.dc_power_updated.connect(self.dc_power_controller.update_measurements)
-        self.faduino_controller.dc_power_updated.connect(self.handle_dc_power_feedback)
+        self.dc_power_controller.update_dc_status_display.connect(self.handle_dc_power_display)
 
         # # RF Power 연결
-        self.rf_power_controller.request_status_read.connect(self.faduino_controller.force_status_read)
+        self.rf_power_controller.request_status_read.connect(self.faduino_controller.force_rf_read)
         self.rf_power_controller.send_rf_power_value.connect(self.faduino_controller.set_rf_power)
         self.rf_power_controller.send_rf_power_value_unverified.connect(self.faduino_controller.set_rf_power_unverified)
         self.faduino_controller.rf_power_updated.connect(self.rf_power_controller.update_measurements)
@@ -214,23 +214,23 @@ class MainWindow(QWidget):
     # <--- 추가: Faduino의 DC 전압/전류 피드백을 처리하는 슬롯 ---
     @Slot(float, float)
     def handle_rf_power_display(self, for_p, ref_p):
-        self.ui.For_p_edit.setPlainText(f"{for_p:.1f}")
-        self.ui.Ref_p_edit.setPlainText(f"{ref_p:.1f}")
-
-    @Slot(float, float, float)
-    def handle_dc_power_feedback(self, power, voltage, current):
-        """Faduino로부터 DC 전압/전류를 받아 Power 계산 후 UI와 DC 컨트롤러에 전달"""
-        if voltage is None or current is None:
-            self.append_log("Main", "voltage, current값이 비어있습니다.")
+        if for_p is None or ref_p is None:
+            self.append_log("Main", "for.p, ref.p 값이 비어있습니다.")
             return
 
-        # 1. UI 업데이트
-        self.ui.Power_edit.setPlainText(f"{power:.2f}")
-        self.ui.Voltage_edit.setPlainText(f"{voltage:.2f}")
-        self.ui.Current_edit.setPlainText(f"{current:.2f}")
-        
-        # 2. DCPowerController에 피드백 전달
-        self.dc_power_controller.update_measurements(power, voltage, current)
+        self.ui.For_p_edit.setPlainText(f"{for_p:.2f}")
+        self.ui.Ref_p_edit.setPlainText(f"{ref_p:.2f}")
+
+    @Slot(float, float, float)
+    def handle_dc_power_display(self, power, voltage, current):
+        if power is None or voltage is None or current is None:
+            self.append_log("Main", "power, voltage, current값이 비어있습니다.")
+            return
+
+        # UI 업데이트만 수행
+        self.ui.Power_edit.setPlainText(f"{power:.3f}")
+        self.ui.Voltage_edit.setPlainText(f"{voltage:.3f}")
+        self.ui.Current_edit.setPlainText(f"{current:.3f}")
 
     @Slot(str)
     def update_mfc_pressure_ui(self, pressure_value):

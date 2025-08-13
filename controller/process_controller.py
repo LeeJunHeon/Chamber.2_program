@@ -200,7 +200,6 @@ class ProcessController(QObject):
                     'message': f'Ch{info["channel"]}({gas}) Flow Off'
                 })
 
-
             # 2. MFC Valve Open (전체 가스 밸브 열기)
             shutdown_steps.append({'action': 'MFC_CMD', 'params': ('VALVE_OPEN', {}), 'message': '전체 MFC Valve Open'})
             

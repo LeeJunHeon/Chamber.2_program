@@ -144,7 +144,7 @@ class ProcessController(QObject):
 
         # Shutter delay
         if shutter_delay_sec > 0:
-            steps.append({'action': 'DELAY', 'duration': shutter_delay_sec * 1000, 'message': f'Shutter Delay {shutter_delay_min}분'})
+            steps.append({'action': 'DELAY', 'duration': int(shutter_delay_sec * 1000), 'message': f'Shutter Delay {shutter_delay_min}분'})
         
         # Main shutter open
         if use_ms:
@@ -153,9 +153,9 @@ class ProcessController(QObject):
         # --- 2-5. 메인 공정 (데이터 수집) ---
         if process_time_sec > 0:
             oes_integration_time = int(params.get("integration_time", 1000))
-            steps.append({'action': 'OES_RUN', 'params': (process_time_sec, oes_integration_time), 'message': f'OES 측정 시작 ({process_time_min}분)'})
+            #steps.append({'action': 'OES_RUN', 'params': (process_time_sec, oes_integration_time), 'message': f'OES 측정 시작 ({process_time_min}분)', 'parallel': True})
             # DELAY 액션에 polling:True 플래그를 추가하여 이 시간 동안만 데이터 수집
-            steps.append({'action': 'DELAY', 'duration': process_time_sec * 1000, 'message': f'메인 공정 진행 ({process_time_min}분)', 'polling': True})
+            #steps.append({'action': 'DELAY', 'duration': int(process_time_sec * 1000), 'message': f'메인 공정 진행 ({process_time_min}분)', 'polling': True, 'parallel': True})
 
         # --- 2-6. 종료 단계 ---
         shutdown_sequence = self._create_shutdown_sequence(is_full_shutdown=is_full_cycle, params=params)
@@ -341,7 +341,10 @@ class ProcessController(QObject):
         병렬 처리('parallel': True) 스텝을 인식하여 동시에 실행합니다.
         """
 
-        self._stop_countdown()
+        sender = self.sender()
+        # ✅ Delay(= self.step_timer) 종료일 때만 카운트다운 중지
+        if sender is self.step_timer:
+            self._stop_countdown()
 
         # --- 1. 병렬 작업이 진행 중이었는지 먼저 확인 ---
         if self._parallel_tasks_remaining > 0:

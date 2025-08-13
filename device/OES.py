@@ -101,14 +101,14 @@ class OESController(QObject):
             return False
 
     @Slot(float, int)
-    def run_measurement(self, process_time_min, integration_time_ms):
+    def run_measurement(self, duration_sec, integration_time_ms):
         if self.is_running or self.sChannel < 0:
             reason = "이미 실행 중" if self.is_running else "초기화 실패"
             self.status_message.emit("OES", f"오류: {reason}")
             self.oes_failed.emit("OES", reason)
             return
         
-        self.status_message.emit("OES", f"{process_time_min}분 동안 측정을 시작합니다.")
+        self.status_message.emit("OES", f"{duration_sec/60:.1f}분 동안 측정을 시작합니다.")
         self.is_running = True
         
         # --- [수정됨] 측정 시작 시 데이터 리스트와 타임스탬프 초기화 ---
@@ -122,7 +122,7 @@ class OESController(QObject):
         self.sp_dll.spSetDblIntEx(float(integration_time_ms), self.sChannel)
 
         self.acquisition_timer.start(1000)
-        self.process_timer.start(int(process_time_min * 1000))
+        self.process_timer.start(int(duration_sec * 1000))
 
     @Slot()
     def stop_measurement(self):

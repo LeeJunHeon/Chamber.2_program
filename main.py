@@ -1,9 +1,10 @@
 # main.py
 import sys
 import csv
+import atexit, signal
 from datetime import datetime
 from PyQt6.QtWidgets import QApplication, QWidget, QMessageBox, QFileDialog
-from PyQt6.QtCore import QTimer, QThread, pyqtSlot as Slot
+from PyQt6.QtCore import QCoreApplication, QTimer, QThread, pyqtSlot as Slot
 
 # === controller import ===
 from UI import Ui_Form
@@ -91,6 +92,32 @@ class MainWindow(QWidget):
 
         # ▼▼▼ [추가] 공정이 끝나면 다음 공정을 시작하도록 신호 연결 ▼▼▼
         self.process_controller.process_finished.connect(self._start_next_process_from_queue)
+
+        # === 프로그램이 비정상적으로 종료되었을때의 시그널 ===
+        self._about_quit_called = False
+        self._emergency_done = False
+
+        app = QCoreApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._on_about_to_quit)
+
+        # atexit: 인터프리터 정상 종료 시 마지막으로 한 번 더 정리
+        atexit.register(self._emergency_cleanup)
+
+        # 콘솔 종료 시그널 핸들러(가능한 플랫폼에서만 작동; 실패/미지원이어도 무해)
+        def _sig_handler(*_):
+            # 여러 번 들어와도 1회만 실행
+            self._emergency_cleanup()
+            # 여기서 sys.exit를 추가로 부를 필요는 없음(상황에 따라 UI 앱 종료 흐름과 충돌 가능)
+        for sig in (getattr(signal, "SIGINT", None),   # Ctrl+C
+                    getattr(signal, "SIGTERM", None),  # 일반 종료 신호
+                    getattr(signal, "SIGBREAK", None)  # Windows Ctrl+Break
+                    ):
+            if sig is not None:
+                try:
+                    signal.signal(sig, _sig_handler)
+                except Exception:
+                    pass
 
     def _connect_signals(self):
         # ▼▼▼ [추가] 데이터 로깅을 위한 신호 연결 ▼▼▼
@@ -464,11 +491,11 @@ class MainWindow(QWidget):
 
     def _set_default_ui_values(self):
         # --- 공정 조건 ---
-        self.ui.Base_pressure_edit.setPlainText("1e-5") #
+        self.ui.Base_pressure_edit.setPlainText("9e-6") #
         self.ui.Intergration_time_edit.setPlainText("60") #
         self.ui.Working_pressure_edit.setPlainText("2") #
-        self.ui.Process_time_edit.setPlainText("10") #
-        self.ui.Shutter_delay_edit.setPlainText("5") #
+        self.ui.Process_time_edit.setPlainText("1") #
+        self.ui.Shutter_delay_edit.setPlainText("1") #
 
         # --- 가스 및 건 ---
         self.ui.Ar_flow_edit.setPlainText("20") #
@@ -476,8 +503,8 @@ class MainWindow(QWidget):
         self.ui.N2_flow_edit.setPlainText("0") #
 
         # --- 파워 설정 ---
-        self.ui.DC_power_edit.setPlainText("200") #
-        self.ui.RF_power_edit.setPlainText("200") #
+        self.ui.DC_power_edit.setPlainText("100") #
+        self.ui.RF_power_edit.setPlainText("100") #
 
     def _reset_ui_after_process(self):
         """공정 종료(성공/실패) 후 UI를 초기 상태로 정리"""
@@ -501,10 +528,32 @@ class MainWindow(QWidget):
         self.ui.Ref_p_edit.setPlainText("0.0")
         # Working pressure/flow들은 위의 _set_default_ui_values()가 이미 채워줍니다.
 
-
     def closeEvent(self, event):
         """프로그램 종료 시 생성된 모든 워커 스레드를 안전하게 종료합니다."""
-        print("프로그램 종료 절차 시작...")
+        self.append_log("main", "프로그램 종료 절차 시작...")
+
+        
+        # 0) 공정이 돌고 있다면 비상 종료 시퀀스부터 시작 (장비들이 스스로 정리)
+        try:
+            if getattr(self.process_controller, "is_running", False):
+                self.process_controller.abort_process()
+                # abort가 장비 cleanup을 트리거하지만, 혹시 몰라 잠깐 대기
+                for _ in range(6):
+                    QCoreApplication.processEvents()
+                    QThread.msleep(20)
+        except Exception:
+            pass
+
+        # 1) 장비 직접 cleanup (이중 안전장치)
+        try: self.faduino_controller.cleanup()
+        except Exception: pass
+        try: self.mfc_controller.cleanup()
+        except Exception: pass
+        try: self.ig_controller.cleanup()
+        except Exception: pass
+        try: self.oes_controller.cleanup()
+        except Exception: pass
+        # (RF/DC 컨트롤러는 Faduino를 통해 파워 0으로 내리므로 별도 close 불필요)
 
         # 종료할 스레드 목록을 리스트로 관리하여 코드를 깔끔하게 유지
         threads = [
@@ -521,10 +570,69 @@ class MainWindow(QWidget):
             if thread and thread.isRunning():
                 thread.quit()   # 1. 스레드의 이벤트 루프에 종료 요청
                 thread.wait()   # 2. 스레드가 완전히 종료될 때까지 대기
-                print(f"{thread} 종료 완료.")
+                self.append_log("main", f"{thread} 종료 완료.")
 
-        print("모든 스레드 종료. 프로그램을 닫습니다.")
+        self.append_log("Main", "모든 스레드 종료. 프로그램을 닫습니다.")
         super().closeEvent(event)
+
+    @Slot()
+    def _on_about_to_quit(self):
+        """앱이 정상 종료되기 직전 마지막 청소(중복 호출 방지)."""
+        if self._about_quit_called:
+            return
+        self._about_quit_called = True
+
+        # 공정이 돌고 있으면 안전 종료 시퀀스 먼저
+        try:
+            if getattr(self.process_controller, "is_running", False):
+                self.process_controller.abort_process()
+                # abort 직후 ~100ms 정도 이벤트 소화(시그널/타이머 처리 유도)
+                for _ in range(6):
+                    QCoreApplication.processEvents()
+                    QThread.msleep(20)
+        except Exception:
+            pass
+
+        # 장치 정리(시리얼/타이머 닫기)
+        for ctrl in (
+            getattr(self, 'faduino_controller', None),
+            getattr(self, 'mfc_controller', None),
+            getattr(self, 'ig_controller', None),
+            getattr(self, 'oes_controller', None),
+        ):
+            try:
+                if ctrl:
+                    ctrl.cleanup()
+            except Exception:
+                pass
+
+    def _emergency_cleanup(self):
+        """응답없음/예외 등 비정상 종료 시 마지막으로 포트 닫기(드물게라도 실행되도록)."""
+        if self._emergency_done:
+            return
+        self._emergency_done = True
+
+        # 이벤트 루프가 멈췄을 가능성이 있으니, Qt 위젯 조작은 하지 말고 장치 핸들만 정리
+        try:
+            if getattr(self, "process_controller", None) and \
+               getattr(self.process_controller, "is_running", False):
+                # 이벤트 루프가 죽었으면 abort가 즉시 효과 없을 수도 있지만, 시도는 무해
+                self.process_controller.abort_process()
+        except Exception:
+            pass
+
+        for ctrl in (
+            getattr(self, 'faduino_controller', None),
+            getattr(self, 'mfc_controller', None),
+            getattr(self, 'ig_controller', None),
+            getattr(self, 'oes_controller', None),
+        ):
+            try:
+                if ctrl:
+                    ctrl.cleanup()
+            except Exception:
+                pass
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

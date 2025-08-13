@@ -75,7 +75,7 @@ class RFPowerController(QObject):
             return
         
         self.target_power = min(target_power, RF_MAX_POWER)
-        self.current_power_step = 30.0
+        self.current_power_step = 6.0   # 초기 설정 파워 값
         self._is_running = True
         self.state_changed.emit(True)
 

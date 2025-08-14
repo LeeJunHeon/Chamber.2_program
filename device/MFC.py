@@ -173,6 +173,30 @@ class MFCController(QObject):
         # 명령 전송 후 500ms 뒤에 검증 단계 실행
         QTimer.singleShot(500, self._verify_response)
 
+    def _parse_r69_bits(self, resp: str) -> str:
+        """
+        R69 응답을 상태비트 문자열(예: '1000')로 변환.
+        매뉴얼 규격: 응답은 'L0' 접두사 다음에 채널별 0/1 나열.
+        예) 'L01000' -> '1000'
+        """
+        s = (resp or "").strip()
+        if s.startswith("L0"):
+            payload = s[2:]
+        elif s.startswith("L"):           # 방어적 처리
+            payload = s[1:]
+        else:
+            payload = s
+        # 중간 공백/문자 섞여도 안전하게 0/1만 추출
+        bits = "".join(ch for ch in payload if ch in "01")
+        # 최대 4채널까지만 사용
+        return bits[:4]
+
+    def _is_channel_on(self, ch: int) -> bool:
+        """R69 기반 채널 ON/OFF 판정 (1-base 채널번호)."""
+        resp = self._execute_read_command('READ_MFC_ON_OFF_STATUS')
+        bits = self._parse_r69_bits(resp)
+        return (1 <= ch <= len(bits)) and (bits[ch-1] == '1')
+
     def _verify_response(self):
         """[수정됨] 명령어 전송 후 응답을 검증하는 단계. 모든 검증 로직이 여기에 통합됩니다."""
 
@@ -188,13 +212,15 @@ class MFCController(QObject):
                 ch = params['channel']
                 # params['value']에는 handle_command에서 변환한 '스케일링된' 값이 들어있습니다.
                 scaled_value = float(params['value'])
+                scale_factor = MFC_SCALE_FACTORS.get(ch, 1.0)
+                expected_hw = scaled_value / scale_factor   
 
                 read_val_str = self._execute_read_command('READ_FLOW_SET', {'channel': ch})
                 
                 # 1. 검증: 장비에서 읽은 값과 '스케일링된' 목표값을 비교합니다.
                 if read_val_str and '+' in read_val_str and abs(float(read_val_str.split('+')[1]) - scaled_value) < 0.1:
                     # 2. 내부 저장: 유량 안정화 모니터링을 위해 '스케일링된' 값을 저장합니다.
-                    self.last_setpoints[ch] = scaled_value
+                    self.last_setpoints[ch] = expected_hw
                     
                     # 3. UI 표시: 사용자 확인을 위해 다시 원래 값으로 변환합니다.
                     scale_factor = MFC_SCALE_FACTORS.get(ch, 1.0)
@@ -205,20 +231,25 @@ class MFCController(QObject):
 
             elif cmd == "FLOW_ON":
                 ch = params['channel']
-                status_str = self._execute_read_command('READ_MFC_ON_OFF_STATUS')
-                if status_str and status_str.startswith("L") and len(status_str) > ch and status_str[1 + ch] == '1':
+                if self._is_channel_on(ch):
                     self.status_message.emit("MFC < 확인", f"Ch{ch} Flow ON 확인. 유량 안정화 시작...")
-                    # 안정화 로직 시작 (타이머가 결과를 비동기적으로 보고하므로 여기서는 즉시 리턴)
                     self.stabilization_attempts = 0
                     self.stabilization_timer.start()
-                    return  # 중요: 타이머가 자율적으로 동작하므로 여기서 함수 종료
+                    return
+                else:
+                    self.status_message.emit("MFC(경고)", f"Ch{ch} Flow ON 미확인 (재시도 {self.retry_attempts}/3)")
+                    self._try_command()
+                    return
 
             elif cmd == "FLOW_OFF":
                 ch = params['channel']
-                status_str = self._execute_read_command('READ_MFC_ON_OFF_STATUS')
-                if status_str and status_str.startswith("L") and len(status_str) > ch and status_str[1 + ch] == '0':
+                if not self._is_channel_on(ch):
                     self.status_message.emit("MFC < 확인", f"Ch{ch} Flow OFF 확인.")
                     success = True
+                else:
+                    self.status_message.emit("MFC(경고)", f"Ch{ch} Flow OFF 미확인 (재시도 {self.retry_attempts}/3)")
+                    self._try_command()
+                    return
             
             elif cmd in ["VALVE_CLOSE", "VALVE_OPEN"]:
                 self.status_message.emit("MFC", "밸브 이동 대기 (3초)...")

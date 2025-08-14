@@ -86,10 +86,6 @@ class MainWindow(QWidget):
         self.rga_thread.start()
         self.data_logger_thread.start()
 
-        # === 6. UI 업데이트 시그널 연결 ===
-        self.mfc_controller.update_flow.connect(self.update_mfc_flow_ui)
-        self.mfc_controller.update_pressure.connect(self.update_mfc_pressure_ui)
-
         # ▼▼▼ [추가] 공정이 끝나면 다음 공정을 시작하도록 신호 연결 ▼▼▼
         self.process_controller.process_finished.connect(self._start_next_process_from_queue)
 
@@ -205,6 +201,10 @@ class MainWindow(QWidget):
         # RGA, OES 그래프 연결
         self.rga_controller.rga_data_updated.connect(self.graph_controller.update_rga_plot)
         self.oes_controller.oes_data_updated.connect(self.graph_controller.update_oes_plot)
+
+        # MFC UI 업데이트 연결
+        self.mfc_controller.update_flow.connect(self.update_mfc_flow_ui)
+        self.mfc_controller.update_pressure.connect(self.update_mfc_pressure_ui)
         
         # UI 버튼 연결
         self.ui.Start_button.clicked.connect(self.on_start_button_clicked)

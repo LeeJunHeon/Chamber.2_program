@@ -25,6 +25,11 @@ class MFCController(QObject):
         self._is_running = False
         self._is_aborted = False # 명령 중단(abort) 상태를 저장할 플래그
 
+        # gas 안정화를 위한 변수
+        self._stabilizing_channel = None
+        self._stabilizing_target = 0.0
+        self._pending_cmd_for_timer = None
+
         # [GAS 채널 3] 지원을 위해 자료구조
         self.last_setpoints = {1: 0.0, 2: 0.0, 3: 0.0}
         self.flow_error_counters = {1: 0, 2: 0, 3: 0.0}
@@ -129,6 +134,9 @@ class MFCController(QObject):
         """진행 중인 모든 비동기 작업을 즉시 중단합니다."""
         if not self._is_aborted:
             self.status_message.emit("MFC", "상위 컨트롤러에 의해 현재 명령이 중단되었습니다.")
+            self._stabilizing_channel = None
+            self._stabilizing_target = 0.0
+            self._pending_cmd_for_timer = None
             self._is_aborted = True
             if self.stabilization_timer.isActive(): self.stabilization_timer.stop()
 
@@ -220,18 +228,25 @@ class MFCController(QObject):
                 # 1. 검증: 장비에서 읽은 값과 '스케일링된' 목표값을 비교합니다.
                 if read_val_str and '+' in read_val_str and abs(float(read_val_str.split('+')[1]) - scaled_value) < 0.1:
                     # 2. 내부 저장: 유량 안정화 모니터링을 위해 '스케일링된' 값을 저장합니다.
-                    self.last_setpoints[ch] = expected_hw
+                    self.last_setpoints[ch] = scale_factor
                     
                     # 3. UI 표시: 사용자 확인을 위해 다시 원래 값으로 변환합니다.
-                    scale_factor = MFC_SCALE_FACTORS.get(ch, 1.0)
-                    original_value = scaled_value / scale_factor
+                    original_value = expected_hw
                     
                     self.status_message.emit("MFC < 확인", f"Ch{ch} 목표값 {original_value:.1f} sccm 설정 완료.")
                     success = True
+                else:
+                    self.status_message.emit("MFC(경고)", f"Ch{ch} FLOW_SET 확인 실패 (재시도 {self.retry_attempts}/3)")
+                    self._try_command()
+                return
 
             elif cmd == "FLOW_ON":
                 ch = params['channel']
                 if self._is_channel_on(ch):
+                    self._stabilizing_channel = ch
+                    self._stabilizing_target = float(self.last_setpoints.get(ch, 0.0))
+                    self._pending_cmd_for_timer = "FLOW_ON"
+
                     self.status_message.emit("MFC < 확인", f"Ch{ch} Flow ON 확인. 유량 안정화 시작...")
                     self.stabilization_attempts = 0
                     self.stabilization_timer.start()
@@ -278,9 +293,12 @@ class MFCController(QObject):
                 if flow_str and '+' in flow_str:
                     try:
                         flow_val = float(flow_str.split('+')[1]) 
+                        scale_factor = MFC_SCALE_FACTORS.get(ch, 1.0)
+                        flow_ui = flow_val / scale_factor
+
                         gas_name = self.gas_map.get(ch) 
                         if gas_name:
-                            self.update_flow.emit(gas_name, flow_val)
+                            self.update_flow.emit(gas_name, flow_ui)
                         success = True
                     except (ValueError, IndexError):
                         success = False
@@ -346,26 +364,55 @@ class MFCController(QObject):
 
         if self._is_aborted: return
 
-        ch = self.current_params['channel']
-        target_flow = self.last_setpoints.get(ch, 0.0)
+        ch = self._stabilizing_channel
+        target_flow = float(self._stabilizing_target)
+        pending_cmd = self._pending_cmd_for_timer or "FLOW_ON"
+
+        if ch is None or target_flow <= 0:
+            # 비정상 상태: 타이머 정리 후 실패 처리
+            if self.stabilization_timer.isActive():
+                self.stabilization_timer.stop()
+            self.command_failed.emit(pending_cmd, "안정화 대상 채널/목표 없음")
+            # 스냅샷 리셋
+            self._stabilizing_channel = None
+            self._stabilizing_target = 0.0
+            self._pending_cmd_for_timer = None
+            return
+
         tolerance = target_flow * FLOW_ERROR_TOLERANCE
         self.stabilization_attempts += 1
 
         flow_str = self._execute_read_command('READ_FLOW', {'channel': ch})
-        actual_flow = -1
+        actual_flow = -1.0
         if flow_str and '+' in flow_str:
-            try: actual_flow = float(flow_str.split('+')[1])
-            except (ValueError, IndexError): pass
+            try: 
+                actual_flow = float(flow_str.split('+')[1])
+            except (ValueError, IndexError): 
+                pass
 
-        self.status_message.emit("MFC", f"유량 확인 중... (목표: {target_flow:.1f}, 현재: {actual_flow:.1f})")
+        scale_factor = MFC_SCALE_FACTORS.get(ch, 1.0)
+        self.status_message.emit(
+            "MFC", 
+            f"유량 확인 중... (목표: {target_flow:.1f} / {target_flow/scale_factor:.1f}sccm," 
+            f"현재: {actual_flow:.1f} / {actual_flow/scale_factor:.1f}sccm)"
+        )
 
         if actual_flow != -1 and abs(actual_flow - target_flow) <= tolerance:
             self.stabilization_timer.stop()
             self.status_message.emit("MFC < 확인", f"Ch{ch} 유량 안정화 완료.")
-            self.command_confirmed.emit(self.current_cmd)
+                # ▶ current_cmd 대신 스냅샷 커맨드로 보고 (변조 방지)
+            self.command_confirmed.emit(pending_cmd)
+            # 스냅샷 리셋
+            self._stabilizing_channel = None
+            self._stabilizing_target = 0.0
+            self._pending_cmd_for_timer = None
         elif self.stabilization_attempts >= 30: # 30초 초과 시
             self.stabilization_timer.stop()
             self.command_failed.emit(self.current_cmd, "유량 안정화 시간 초과")
+            # 스냅샷 리셋
+            self._stabilizing_channel = None
+            self._stabilizing_target = 0.0
+            self._pending_cmd_for_timer = None
 
     def _execute_read_command(self, cmd_key, params=None):
         """읽기 명령을 보내고 응답을 즉시 반환하는 내부 함수."""
@@ -396,6 +443,9 @@ class MFCController(QObject):
     def cleanup(self):
         self.polling_timer.stop()
         self.stabilization_timer.stop()
+        self._stabilizing_channel = None
+        self._stabilizing_target = 0.0
+        self._pending_cmd_for_timer = None
         if self.serial_mfc and self.serial_mfc.is_open:
             self.serial_mfc.close()
             self.status_message.emit("MFC", "시리얼 포트를 안전하게 닫았습니다.")

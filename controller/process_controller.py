@@ -155,7 +155,8 @@ class ProcessController(QObject):
             oes_integration_time = int(params.get("integration_time", 1000))
             #steps.append({'action': 'OES_RUN', 'params': (process_time_sec, oes_integration_time), 'message': f'OES 측정 시작 ({process_time_min}분)', 'parallel': True})
             # DELAY 액션에 polling:True 플래그를 추가하여 이 시간 동안만 데이터 수집
-            #steps.append({'action': 'DELAY', 'duration': int(process_time_sec * 1000), 'message': f'메인 공정 진행 ({process_time_min}분)', 'polling': True, 'parallel': True})
+            steps.append({'action': 'DELAY', 'duration': int(process_time_sec * 1000), 'message': f'메인 공정 진행 ({process_time_min}분)'})
+            #, 'polling': True, 'parallel': True 삭제
 
         # --- 2-6. 종료 단계 ---
         shutdown_sequence = self._create_shutdown_sequence(is_full_shutdown=is_full_cycle, params=params)

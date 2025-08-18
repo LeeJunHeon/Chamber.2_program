@@ -1,4 +1,0 @@
-﻿#,base_pressure,main_shutter,gun1,gun2,gun3,Ar,O2,N2,Ar_flow,O2_flow,N2_flow,working_pressure,rf_power,dc_power,use_rf_power,use_dc_power,shutter_delay,process_time,controll_process
-1,9.00E-06,F,T,F,F,T,F,F,20,0,0,2,0,100,F,T,1,1,F
-2,9.00E-06,F,F,T,F,T,F,F,20,0,0,2,100,0,T,F,1,1,F
-3,9.00E-06,F,T,T,F,T,F,F,20,0,0,2,100,100,T,T,1,1,F

@@ -351,19 +351,22 @@ class MainWindow(QWidget):
         """모든 장비의 연결을 확인하고, 끊겨있으면 연결을 시도합니다. 하나라도 실패하면 False를 반환합니다."""
         # 1. Faduino
         if not self.faduino_controller.serial_faduino:
-            if not self.faduino_controller.connect_faduino(): return False
+            if not self.faduino_controller.connect_faduino(): 
+                return False
         
         # 2. MFC
-        if not self.mfc_controller.serial_mfc:
-            if not self.mfc_controller.connect_mfc_device(): return False
+        if not self.mfc_controller.serial_mfc.is_open():
+            self.mfc_controller.connect_mfc_device() # 성공/실패는 MFC의 워치독이 주기적으로 관리
             
         # 3. OES (main에서 쓰레드를 사용하니 보완필요)
         if self.oes_controller.sChannel < 0:
-            if not self.oes_controller.initialize_device(): return False
+            if not self.oes_controller.initialize_device(): 
+                return False
             
         # 4. IG
         if not self.ig_controller.serial_ig:
-            if not self.ig_controller.connect_device(): return False
+            if not self.ig_controller.connect_device(): 
+                return False
         
         self.append_log("MAIN", "모든 장비가 성공적으로 연결되었습니다.")
         return True

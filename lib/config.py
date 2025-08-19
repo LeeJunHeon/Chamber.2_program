@@ -4,11 +4,12 @@ from pathlib import Path
 # === 시리얼 포트 설정 ===
 IG_PORT = "COM11"
 IG_BAUD = 9600
-IG_WAIT_TIMEOUT = 600  # IG 대기 최대 시간 (초). 예: 600초 = 10분
 
-# IG 컨트롤러의 세부 타이머 설정 (초 단위)
-MAX_READ_RETRIES = 3
-RESPONSE_TIMEOUT_SEC = 5.0
+MFC_PORT = "COM12"
+MFC_BAUD = 9600
+
+FADUINO_PORT = "COM13"
+FADUINO_BAUD = 9600
 
 # === RGA ===
 # RGA_PORT = "COM17" RGA를 직접 연결하지 않고 외부 프로그램을 사용
@@ -22,13 +23,21 @@ RGA_CSV_PATH = Path(RGA_CSV_PATH)
 # OES_PORT = "COM5"
 # OES_BAUD = 9600w
 
-MFC_PORT = "COM12"
-MFC_BAUD = 9600
+# === IG ===
+IG_WAIT_TIMEOUT = 600  # IG 대기 최대 시간 (초). 예: 600초 = 10분
 
-FADUINO_PORT = "COM13"
-FADUINO_BAUD = 9600
+# IG 컨트롤러의 세부 타이머 설정 (초 단위)
+MAX_READ_RETRIES = 3
+RESPONSE_TIMEOUT_SEC = 5.0
 
 # === Faduino ===
+FADUINO_POLLING_INTERVAL_MS = 1000
+FADUINO_WATCHDOG_INTERVAL_MS = 1000
+FADUINO_TIMEOUT_MS = 800
+FADUINO_GAP_MS = 150
+FADUINO_RECONNECT_BACKOFF_START_MS = 500
+FADUINO_RECONNECT_BACKOFF_MAX_MS = 8000
+
 BUTTON_TO_PIN = {
     "MV": 0,
     "Ar": 1,
@@ -93,8 +102,10 @@ DC_OFFSET_ADC_TO_VOLT = -6.8453 # 전압 y절편 (offset)
 DC_PARAM_ADC_TO_AMP = 0.000150567 # 전류 기울기 (param)
 DC_OFFSET_ADC_TO_AMP = -0.003118  # 전류 y절편 (offset)
 
+
 # === OES ===
 OES_AVG_COUNT = 3 # OES 측정 시 평균을 낼 횟수
+
 
 # === MFC ===
 FLOW_ERROR_TOLERANCE = 0.05  # 5% 오차 허용

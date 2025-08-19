@@ -505,4 +505,5 @@ class ProcessController(QObject):
         self.process_sequence = emergency_steps
         self._current_step_idx = -1
         self.is_running = True # 비상 종료 시퀀스를 실행하기 위해 잠시 True로 설정
+        self.process_status_changed.emit(True)
         self.on_step_completed()

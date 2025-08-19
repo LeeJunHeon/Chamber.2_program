@@ -210,6 +210,9 @@ class MainWindow(QWidget):
         self.ui.Start_button.clicked.connect(self.on_start_button_clicked)
         self.ui.Stop_button.clicked.connect(self.process_controller.abort_process)
         self.ui.Process_list_button.clicked.connect(self.on_process_list_button_clicked)
+        self.process_controller.process_status_changed.connect(self._on_process_status_changed)
+        # 초기 UI Stop button 비활성화
+        self._on_process_status_changed(False)
 
     # <--- 추가: Faduino의 DC 전압/전류 피드백을 처리하는 슬롯 ---
     @Slot(float, float)
@@ -246,6 +249,12 @@ class MainWindow(QWidget):
             self.ui.O2_flow_edit.setPlainText(f"{flow_value:.1f}")
         elif gas_name == "N2":
             self.ui.N2_flow_edit.setPlainText(f"{flow_value:.1f}")
+
+    @Slot(bool)
+    def _on_process_status_changed(self, running: bool):
+        # 실행/종료 ‘상태’에 따라 버튼 토글
+        self.ui.Start_button.setEnabled(not running)
+        self.ui.Stop_button.setEnabled(running)
 
     @Slot()
     def on_process_list_button_clicked(self):
@@ -311,7 +320,7 @@ class MainWindow(QWidget):
         self.ui.Ar_checkbox.setChecked(params.get('Ar', 'F') == 'T')
         self.ui.O2_checkbox.setChecked(params.get('O2', 'F') == 'T')
         self.ui.N2_checkbox.setChecked(params.get('N2', 'F') == 'T')
-        self.ui.Main_shuter_checkbox.setChecked(params.get('main_shutter', 'F') == 'T')
+        self.ui.Main_shutter_checkbox.setChecked(params.get('main_shutter', 'F') == 'T')
         self.ui.RF_power_checkbox.setChecked(params.get('use_rf_power', 'F') == 'T')
         self.ui.DC_power_checkbox.setChecked(params.get('use_dc_power', 'F') == 'T')
 
@@ -345,14 +354,16 @@ class MainWindow(QWidget):
 
     def _check_and_connect_devices(self):
         """모든 장비의 연결을 확인하고, 끊겨있으면 연결을 시도합니다. 하나라도 실패하면 False를 반환합니다."""
-        # 1. Faduino
-        if not self.faduino_controller.serial_faduino:
-            if not self.faduino_controller.connect_faduino(): 
-                return False
+
+        # Faduino (QSerialPort)
+        if not getattr(self.faduino_controller, "serial_faduino", None) \
+        or not self.faduino_controller.serial_faduino.isOpen():
+            self.faduino_controller.connect_faduino()  # 성공/실패는 Faduino 워치독이 재시도
         
-        # 2. MFC
-        if not getattr(self.mfc_controller, "serial_mfc", None) or not self.mfc_controller.serial_mfc.isOpen():
-            self.mfc_controller.connect_mfc_device() # 성공/실패는 MFC의 워치독이 주기적으로 관리
+        # MFC (QSerialPort)
+        if not getattr(self.mfc_controller, "serial_mfc", None) \
+        or not self.mfc_controller.serial_mfc.isOpen():
+            self.mfc_controller.connect_mfc_device()  # 성공/실패는 MFC 워치독이 재시도
             
         # 3. OES (main에서 쓰레드를 사용하니 보완필요)
         if self.oes_controller.sChannel < 0:
@@ -366,6 +377,160 @@ class MainWindow(QWidget):
         
         self.append_log("MAIN", "모든 장비가 성공적으로 연결되었습니다.")
         return True
+
+    def _validate_single_run_inputs(self) -> dict | None:
+        """UI 단일 공정 시작 전, 위→아래 순서로 즉시 팝업하며 검증. 성공 시 params 일부를 dict로 반환."""
+        # ----------------------
+        # 1) Gun 개수 (G1/G2/G3 중 1개 또는 2개만 허용)
+        # ----------------------
+        use_g1 = self.ui.G1_checkbox.isChecked()
+        use_g2 = self.ui.G2_checkbox.isChecked()
+        use_g3 = self.ui.G3_checkbox.isChecked()
+        checked_count = int(use_g1) + int(use_g2) + int(use_g3)
+        if checked_count == 0 or checked_count == 3:
+            msg_box = QMessageBox(self)
+            msg_box.setIcon(QMessageBox.Icon.Warning)
+            msg_box.setWindowTitle("선택 오류")
+            msg_box.setText("Gun 선택 개수를 확인해주세요.")
+            msg_box.setInformativeText("G1, G2, G3 중 1개 또는 2개만 선택해야 합니다.")
+            msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
+            msg_box.exec()
+            return None
+
+        # ----------------------
+        # 2) Gun 타겟 이름 (선택된 것만, G1 → G2 → G3 순서로 즉시 팝업)
+        # ----------------------
+        g1_name = self.ui.G1_target_name.toPlainText().strip()
+        g2_name = self.ui.G2_target_name.toPlainText().strip()
+        g3_name = self.ui.G3_target_name.toPlainText().strip()
+
+        if use_g1 and not g1_name:
+            QMessageBox.warning(self, "입력값 확인", "G1 타겟 이름이 비어 있습니다.")
+            return None
+        if use_g2 and not g2_name:
+            QMessageBox.warning(self, "입력값 확인", "G2 타겟 이름이 비어 있습니다.")
+            return None
+        if use_g3 and not g3_name:
+            QMessageBox.warning(self, "입력값 확인", "G3 타겟 이름이 비어 있습니다.")
+            return None
+
+        # ----------------------
+        # 3) 가스 선택 (최소 1개) — 위에서 아래: Ar → O2 → N2
+        # ----------------------
+        use_ar = self.ui.Ar_checkbox.isChecked()
+        use_o2 = self.ui.O2_checkbox.isChecked()
+        use_n2 = self.ui.N2_checkbox.isChecked()
+        if not (use_ar or use_o2 or use_n2):
+            QMessageBox.warning(self, "선택 오류", "가스를 하나 이상 선택해야 합니다.")
+            return None
+
+        # ----------------------
+        # 4) 선택된 가스의 유량 값 (존재/숫자/양수) — Ar → O2 → N2 순서
+        # ----------------------
+        if use_ar:
+            txt = self.ui.Ar_flow_edit.toPlainText().strip()
+            if not txt:
+                QMessageBox.warning(self, "입력값 확인", "Ar 유량을 입력하세요.")
+                return None
+            try:
+                ar_flow = float(txt)
+                if ar_flow <= 0:
+                    QMessageBox.warning(self, "입력값 확인", "Ar 유량은 0보다 커야 합니다.")
+                    return None
+            except ValueError:
+                QMessageBox.warning(self, "입력값 확인", "Ar 유량이 올바른 수치가 아닙니다.")
+                return None
+        else:
+            ar_flow = 0.0
+
+        if use_o2:
+            txt = self.ui.O2_flow_edit.toPlainText().strip()
+            if not txt:
+                QMessageBox.warning(self, "입력값 확인", "O2 유량을 입력하세요.")
+                return None
+            try:
+                o2_flow = float(txt)
+                if o2_flow <= 0:
+                    QMessageBox.warning(self, "입력값 확인", "O2 유량은 0보다 커야 합니다.")
+                    return None
+            except ValueError:
+                QMessageBox.warning(self, "입력값 확인", "O2 유량이 올바른 수치가 아닙니다.")
+                return None
+        else:
+            o2_flow = 0.0
+
+        if use_n2:
+            txt = self.ui.N2_flow_edit.toPlainText().strip()
+            if not txt:
+                QMessageBox.warning(self, "입력값 확인", "N2 유량을 입력하세요.")
+                return None
+            try:
+                n2_flow = float(txt)
+                if n2_flow <= 0:
+                    QMessageBox.warning(self, "입력값 확인", "N2 유량은 0보다 커야 합니다.")
+                    return None
+            except ValueError:
+                QMessageBox.warning(self, "입력값 확인", "N2 유량이 올바른 수치가 아닙니다.")
+                return None
+        else:
+            n2_flow = 0.0
+
+        # ----------------------
+        # 5) 파워 선택 (최소 1개) — RF → DC 순서
+        # ----------------------
+        use_rf = self.ui.RF_power_checkbox.isChecked()
+        use_dc = self.ui.DC_power_checkbox.isChecked()
+        if not (use_rf or use_dc):
+            QMessageBox.warning(self, "선택 오류", "RF 파워 또는 DC 파워 중 하나 이상을 반드시 선택해야 합니다.")
+            return None
+
+        # ----------------------
+        # 6) 선택된 파워 값 (존재/숫자/양수) — RF → DC 순서
+        # ----------------------
+        if use_rf:
+            txt = self.ui.RF_power_edit.toPlainText().strip()
+            if not txt:
+                QMessageBox.warning(self, "입력값 확인", "RF 파워(W)를 입력하세요.")
+                return None
+            try:
+                rf_power = float(txt)
+                if rf_power <= 0:
+                    QMessageBox.warning(self, "입력값 확인", "RF 파워(W)는 0보다 커야 합니다.")
+                    return None
+            except ValueError:
+                QMessageBox.warning(self, "입력값 확인", "RF 파워(W)가 올바른 수치가 아닙니다.")
+                return None
+        else:
+            rf_power = 0.0
+
+        if use_dc:
+            txt = self.ui.DC_power_edit.toPlainText().strip()
+            if not txt:
+                QMessageBox.warning(self, "입력값 확인", "DC 파워(W)를 입력하세요.")
+                return None
+            try:
+                dc_power = float(txt)
+                if dc_power <= 0:
+                    QMessageBox.warning(self, "입력값 확인", "DC 파워(W)는 0보다 커야 합니다.")
+                    return None
+            except ValueError:
+                QMessageBox.warning(self, "입력값 확인", "DC 파워(W)가 올바른 수치가 아닙니다.")
+                return None
+        else:
+            dc_power = 0.0
+
+        # ----------------------
+        # 7) 성공: params 일부를 dict로 반환(네가 쓰는 키 이름에 맞춰)
+        # ----------------------
+        return {
+            "use_ms": self.ui.Main_shutter_checkbox.isChecked(),
+            "use_g1": use_g1, "use_g2": use_g2, "use_g3": use_g3,
+            "use_ar": use_ar, "use_o2": use_o2, "use_n2": use_n2,
+            "ar_flow": ar_flow, "o2_flow": o2_flow, "n2_flow": n2_flow,
+            "use_rf_power": use_rf, "use_dc_power": use_dc,
+            "rf_power": rf_power, "dc_power": dc_power,
+            "G1_target_name": g1_name, "G2_target_name": g2_name, "G3_target_name": g3_name,
+        }
 
     @Slot()
     def on_start_button_clicked(self):
@@ -392,79 +557,42 @@ class MainWindow(QWidget):
             self._start_next_process_from_queue(True)
         else:
             # 경우 2: 파일이 로드되지 않은 경우 -> UI 값으로 단일 공정 실행
-            self.append_log("MAIN", "입력받은 UI값으로 단일 공정을 시작합니다.")
-            
-            # === 현재 UI에서 값을 읽어 파라미터 생성 (기존 코드와 동일) ===
-            use_rf = self.ui.RF_power_checkbox.isChecked()
-            use_dc = self.ui.DC_power_checkbox.isChecked()
-
-            if not use_rf and not use_dc:
-                QMessageBox.warning(self, "선택 오류", "RF 파워 또는 DC 파워 중 하나 이상을 반드시 선택해야 합니다.")
-                return
-
+            # 1. 먼저 숫자 필드들 파싱
             try:
                 base_pressure = float(self.ui.Base_pressure_edit.toPlainText() or 1e-5)
                 integration_time = int(self.ui.Intergration_time_edit.toPlainText() or 60)
-                ar_flow = float(self.ui.Ar_flow_edit.toPlainText() or 0.0)
-                o2_flow = float(self.ui.O2_flow_edit.toPlainText() or 0.0)
-                n2_flow = float(self.ui.N2_flow_edit.toPlainText() or 0.0)
                 working_pressure = float(self.ui.Working_pressure_edit.toPlainText() or 0.0)
-                rf_power = float(self.ui.RF_power_edit.toPlainText() or 0.0)
-                dc_power = float(self.ui.DC_power_edit.toPlainText() or 0.0)
                 shutter_delay = float(self.ui.Shutter_delay_edit.toPlainText() or 0.0)
                 process_time = float(self.ui.Process_time_edit.toPlainText() or 0.0) 
 
             except ValueError:
                 self.append_log("UI", "오류: 값 입력란을 확인해주세요.")
                 return
-
-            # Gun 체크 유효성 검사
-            gun_checkboxes = [self.ui.G1_checkbox, self.ui.G2_checkbox, self.ui.G3_checkbox]
-            checked_count = sum(1 for cb in gun_checkboxes if cb.isChecked())
-            if checked_count == 0 or checked_count == 3:
-                msg_box = QMessageBox(self)
-                msg_box.setIcon(QMessageBox.Icon.Warning)
-                msg_box.setWindowTitle("선택 오류")
-                msg_box.setText("Gun 선택 개수를 확인해주세요.")
-                msg_box.setInformativeText("G1, G2, G3 중 1개 또는 2개만 선택해야 합니다.")
-                msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
-                msg_box.exec()
+            
+            # 2. 검증 + 값 생성
+            vals = self._validate_single_run_inputs()
+            if vals is None:
                 return
 
-            # 최종 params
+            # 3. 최종 params
             params = {
                 "base_pressure": base_pressure,
                 "integration_time": integration_time,
-                "use_ms": self.ui.Main_shuter_checkbox.isChecked(),
-                "use_g1": self.ui.G1_checkbox.isChecked(),
-                "use_g2": self.ui.G2_checkbox.isChecked(),
-                "use_g3": self.ui.G3_checkbox.isChecked(),
-                "use_ar": self.ui.Ar_checkbox.isChecked(),
-                "use_o2": self.ui.O2_checkbox.isChecked(),
-                "use_n2": self.ui.N2_checkbox.isChecked(),
-                "ar_flow": ar_flow,
-                "o2_flow": o2_flow,
-                "n2_flow": n2_flow,
                 "working_pressure": working_pressure,
-                "use_rf_power": use_rf,
-                "use_dc_power": use_dc,
-                "rf_power": rf_power,
-                "dc_power": dc_power,
                 "shutter_delay": shutter_delay,
                 "process_time": process_time,
                 "process_note": self.ui.note_edit.toPlainText(),
-                "G1_target_name": self.ui.G1_target_name.toPlainText(),
-                "G2_target_name": self.ui.G2_target_name.toPlainText(),
-                "G3_target_name": self.ui.G3_target_name.toPlainText(),
+                **vals,
             }
 
+            self.append_log("MAIN", "입력 검증 통과 → 공정 시작")
             # ProcessController로 파라미터를 전달하여 단일 공정 시작
             self.process_controller.start_process(params)
 
     @Slot(str, str)
     def append_log(self, source: str, msg: str):
         """
-        [수정됨] 로그 메시지를 UI와 log.txt 파일에 동시에 추가합니다.
+        로그 메시지를 UI와 log.txt 파일에 동시에 추가합니다.
         """
         # --- UI에 표시될 로그 메시지 (기존과 동일) ---
         ui_now = datetime.now().strftime("%H:%M:%S")
@@ -514,7 +642,7 @@ class MainWindow(QWidget):
         for cb in [
             self.ui.G1_checkbox, self.ui.G2_checkbox, self.ui.G3_checkbox,
             self.ui.Ar_checkbox, self.ui.O2_checkbox, self.ui.N2_checkbox,
-            self.ui.Main_shuter_checkbox, self.ui.RF_power_checkbox, self.ui.DC_power_checkbox
+            self.ui.Main_shutter_checkbox, self.ui.RF_power_checkbox, self.ui.DC_power_checkbox
         ]:
             cb.setChecked(False)
 
@@ -531,7 +659,6 @@ class MainWindow(QWidget):
         """프로그램 종료 시 생성된 모든 워커 스레드를 안전하게 종료합니다."""
         self.append_log("main", "프로그램 종료 절차 시작...")
 
-        
         # 0) 공정이 돌고 있다면 비상 종료 시퀀스부터 시작 (장비들이 스스로 정리)
         try:
             if getattr(self.process_controller, "is_running", False):

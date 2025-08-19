@@ -1,181 +1,546 @@
-# Faduino.py 기존 serial 방식
+# -*- coding: utf-8 -*-
+"""
+Faduino.py — PyQt6 QSerialPort(완전 비동기) 기반 Faduino 컨트롤러 (리팩터링판)
 
-import serial
-import time
-from PyQt6.QtCore import QObject, QTimer, QMutex, QThread, pyqtSignal as Signal, pyqtSlot as Slot
+핵심:
+  - QSerialPort + readyRead 시그널 → UI/이벤트 루프 블로킹 없음
+  - 단일 명령 큐(타임아웃/재시도/인터커맨드 간격) → 폴링·검증 충돌 제거
+  - 연결 워치독 + 자동 재연결(지수 백오프) → 공정 중간 끊김에 강함
+  - 기존 명령 프로토콜 유지: "R,pin,val", "W,val", "D,val", "S", "r", "d", "P"
+  - 기존 시그널 이름/의미 유지: status_message/rf_power_updated/dc_power_updated/command_confirmed/command_failed
+
+참고:
+  - 기존 동기식(serial.Serial) 구현을 QSerialPort 이벤트 구동형 구조로 변경.
+  - MFC 비동기 설계와 동일한 패턴(큐, 콜백, 타임아웃, 재시도, 워치독) 적용.
+"""
+from __future__ import annotations
+from typing import Callable, Optional, Tuple, List
+import re
+
+from PyQt6.QtCore import QObject, QTimer, QIODeviceBase, pyqtSignal as Signal, pyqtSlot as Slot
+from PyQt6.QtSerialPort import QSerialPort, QSerialPortInfo
+
+# --- 프로젝트 상수/설정 ---
 from lib.config import (
     FADUINO_PORT, FADUINO_BAUD, BUTTON_TO_PIN,
     RF_PARAM_ADC_TO_WATT, RF_OFFSET_ADC_TO_WATT,
     DC_PARAM_ADC_TO_VOLT, DC_OFFSET_ADC_TO_VOLT,
-    DC_PARAM_ADC_TO_AMP, DC_OFFSET_ADC_TO_AMP,
+    DC_PARAM_ADC_TO_AMP,  DC_OFFSET_ADC_TO_AMP,
     ADC_FULL_SCALE, ADC_INPUT_VOLT, RF_WATT_PER_VOLT,
-    DAC_FULL_SCALE
+    DAC_FULL_SCALE,
 )
 
+# 선택적 설정(없으면 기본값 적용)
+try:
+    from lib.config import (
+        FADUINO_POLLING_INTERVAL_MS,
+        FADUINO_WATCHDOG_INTERVAL_MS,
+        FADUINO_TIMEOUT_MS,
+        FADUINO_GAP_MS,
+        FADUINO_RECONNECT_BACKOFF_START_MS,
+        FADUINO_RECONNECT_BACKOFF_MAX_MS,
+    )
+except Exception:
+    FADUINO_POLLING_INTERVAL_MS = 1000
+    FADUINO_WATCHDOG_INTERVAL_MS = 1000
+    FADUINO_TIMEOUT_MS = 800
+    FADUINO_GAP_MS = 150
+    FADUINO_RECONNECT_BACKOFF_START_MS = 500
+    FADUINO_RECONNECT_BACKOFF_MAX_MS = 8000
+
+
 class FaduinoController(QObject):
-    # UI/상위 컨트롤러용 시그널
+    # UI/상위 컨트롤러용 시그널(기존과 동일)
     status_message = Signal(str, str)
     rf_power_updated = Signal(float, float)
     dc_power_updated = Signal(float, float, float)
     command_confirmed = Signal(str)
     command_failed = Signal(str, str)
 
+    # ------------- 초기화 -------------
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.serial_faduino = None
-        self.serial_lock = QMutex()
 
-        self.expected_relay_mask = 0 # 릴레이의 예상 상태를 정수 마스크로 저장
+        self.debug_print = True
+
+        # (1) QSerialPort 설정
+        self.serial_faduino = QSerialPort(self)
+        self.serial_faduino.setBaudRate(FADUINO_BAUD)
+        self.serial_faduino.setDataBits(QSerialPort.DataBits.Data8)
+        self.serial_faduino.setParity(QSerialPort.Parity.NoParity)
+        self.serial_faduino.setStopBits(QSerialPort.StopBits.OneStop)
+        self.serial_faduino.setFlowControl(QSerialPort.FlowControl.NoFlowControl)
+        self.serial_faduino.readyRead.connect(self._on_ready_read)
+        self.serial_faduino.errorOccurred.connect(self._on_serial_error)
+
+        # (2) 수신 버퍼(줄 단위 파싱)
+        self._rx = bytearray()
+
+        # (3) 명령 큐: (cmd_str, on_reply, timeout_ms, gap_ms, tag, retries_left, allow_no_reply)
+        self._cmd_q: List[Tuple[str, Callable[[Optional[str]], None], int, int, str, int, bool]] = []
+        self._inflight: Optional[Tuple[str, Callable[[Optional[str]], None], int, int, str, int, bool]] = None
+
+        # (4) 타이머: 명령 타임아웃/인터커맨드 간격/폴링/워치독
+        self._cmd_timer = QTimer(self); self._cmd_timer.setSingleShot(True)
+        self._gap_timer = QTimer(self); self._gap_timer.setSingleShot(True)
+        self._cmd_timer.timeout.connect(self._on_cmd_timeout)
+        self._gap_timer.timeout.connect(self._dequeue_and_send)
+
+        self.polling_timer = QTimer(self)
+        self.polling_timer.setInterval(FADUINO_POLLING_INTERVAL_MS)
+        self.polling_timer.timeout.connect(self._enqueue_poll_cycle)
+
+        self._watchdog = QTimer(self)
+        self._watchdog.setInterval(FADUINO_WATCHDOG_INTERVAL_MS)
+        self._watchdog.timeout.connect(self._watch_connection)
+
+        # (5) 연결/재연결 상태
+        self._want_connected = False
+        self._reconnect_backoff_ms = FADUINO_RECONNECT_BACKOFF_START_MS
+
+        # (6) 상태 값들
+        self.expected_relay_mask = 0
         self._is_first_poll = True
-
-        # (추가) 각 파워 컨트롤러의 활성 상태를 저장할 플래그
         self.is_rf_active = False
         self.is_dc_active = False
-
         self.rf_forward = 0.0
         self.rf_reflected = 0.0
         self.dc_voltage = 0.0
         self.dc_current = 0.0
 
-        # 폴링 주기를 1초로 변경
-        self.polling_timer = QTimer(self)
-        self.polling_timer.setInterval(1000)
-        self.polling_timer.timeout.connect(self.force_status_read)
+    # ------------- 내부 디버그 -------------
+    def _dprint(self, *args):
+        if self.debug_print:
+            try:
+                print(*args, flush=True)
+            except Exception:
+                pass
 
-    def connect_faduino(self):
-        """프로그램 시작 시 시리얼 포트 연결 시도"""
-        try:
-            self.serial_faduino = serial.Serial(FADUINO_PORT, FADUINO_BAUD, timeout=0.1)
-            self.status_message.emit("Faduino", f"{FADUINO_PORT} 연결 성공")
-            QThread.msleep(100) # 짧은 대기
-            if self.serial_faduino.in_waiting > 0: self.serial_faduino.read_all()
-            self.serial_faduino.reset_input_buffer()
-            self.serial_faduino.reset_output_buffer()
-            self.status_message.emit("Faduino", "입출력 버퍼를 리셋했습니다.")
+    # ------------- 연결/해제 & 워치독 -------------
+    def connect_faduino(self) -> bool:
+        """포트를 열고 워치독 시작. 실패해도 워치독이 재연결 시도."""
+        self._want_connected = True
+        ok = self._open_port()
+        self._watchdog.start()
+        return ok
+
+    def _open_port(self) -> bool:
+        if self.serial_faduino.isOpen():
             return True
-        except Exception as e:
-            self.status_message.emit("Faduino", f"{FADUINO_PORT} 연결 실패: {e}")
+
+        available = {p.portName() for p in QSerialPortInfo.availablePorts()}
+        if FADUINO_PORT not in available:
+            msg = f"{FADUINO_PORT} 존재하지 않음. 사용 가능 포트: {sorted(available)}"
+            self.status_message.emit("Faduino", msg); self._dprint(f"[FAD] {msg}")
             return False
-        
+
+        self.serial_faduino.setPortName(FADUINO_PORT)
+        if not self.serial_faduino.open(QIODeviceBase.OpenModeFlag.ReadWrite):
+            msg = f"{FADUINO_PORT} 연결 실패: {self.serial_faduino.errorString()}"
+            self.status_message.emit("Faduino", msg); self._dprint(f"[FAD] {msg}")
+            return False
+
+        # 라인 제어 및 버퍼 초기화
+        self.serial_faduino.setDataTerminalReady(True)
+        self.serial_faduino.setRequestToSend(False)
+        self.serial_faduino.clear(QSerialPort.Direction.AllDirections)
+        self._rx.clear()
+        self._reconnect_backoff_ms = FADUINO_RECONNECT_BACKOFF_START_MS
+        msg = f"{FADUINO_PORT} 연결 성공 (PyQt6 QSerialPort)"
+        self.status_message.emit("Faduino", msg); self._dprint(f"[FAD] {msg}")
+        return True
+
+    def _watch_connection(self):
+        if not self._want_connected:
+            return
+        if self.serial_faduino.isOpen():
+            return
+        msg = f"재연결 시도... ({self._reconnect_backoff_ms} ms)"
+        self.status_message.emit("Faduino", msg); self._dprint(f"[FAD] {msg}")
+        QTimer.singleShot(self._reconnect_backoff_ms, self._try_reconnect)
+
+    def _try_reconnect(self):
+        if self._open_port():
+            msg = "재연결 성공. 대기 중 명령 재개."
+            self.status_message.emit("Faduino", msg); self._dprint(f"[FAD] {msg}")
+            self._dequeue_and_send()
+            return
+        self._reconnect_backoff_ms = min(self._reconnect_backoff_ms * 2, FADUINO_RECONNECT_BACKOFF_MAX_MS)
+
+    @Slot()
+    def cleanup(self):
+        """안전 종료: 타이머/큐/포트 정리 + 베스트에포트로 출력 OFF."""
+        self.polling_timer.stop()
+        self._cmd_timer.stop(); self._gap_timer.stop(); self._watchdog.stop()
+        self._cmd_q.clear(); self._inflight = None
+
+        # 베스트에포트로 모든 릴레이/아날로그 0 (무응답 허용)
+        for pin in range(8):
+            self.enqueue(f"R,{pin},0\r", lambda _l: None, timeout_ms=FADUINO_TIMEOUT_MS, gap_ms=FADUINO_GAP_MS,
+                         tag=f"[CLEAN R {pin}]", retries_left=0, allow_no_reply=True)
+        self.enqueue("W,0\r", lambda _l: None, timeout_ms=FADUINO_TIMEOUT_MS, gap_ms=FADUINO_GAP_MS,
+                     tag="[CLEAN W]", retries_left=0, allow_no_reply=True)
+        self.enqueue("D,0\r", lambda _l: None, timeout_ms=FADUINO_TIMEOUT_MS, gap_ms=FADUINO_GAP_MS,
+                     tag="[CLEAN D]", retries_left=0, allow_no_reply=True)
+
+        # 잠시 후 포트 닫기
+        QTimer.singleShot(200, self._close_now)
+
+    def _close_now(self):
+        if self.serial_faduino.isOpen():
+            self.serial_faduino.close()
+        self.status_message.emit("Faduino", "연결 종료")
+
+    # ------------- 시리얼 이벤트 -------------
+    def _on_serial_error(self, err: QSerialPort.SerialPortError):
+        if err == QSerialPort.SerialPortError.NoError:
+            return
+        err_name = getattr(err, "name", str(err))
+        err_code = getattr(err, "value", "?")
+        msg = f"시리얼 오류: {self.serial_faduino.errorString()} (err={err_name}/{err_code})"
+        self.status_message.emit("Faduino", msg); self._dprint(f"[ERR] {msg}")
+
+        # 진행 중 명령 되돌리고 재시도 준비
+        if self._inflight is not None:
+            cmd_str, on_reply, timeout_ms, gap_ms, tag, retries_left, allow_no_reply = self._inflight
+            self._cmd_timer.stop(); self._inflight = None
+            if retries_left > 0:
+                self._cmd_q.insert(0, (cmd_str, on_reply, timeout_ms, gap_ms, tag, retries_left - 1, allow_no_reply))
+            else:
+                try: on_reply(None)
+                except Exception: pass
+
+        if self.serial_faduino.isOpen():
+            self.serial_faduino.close()
+        self._try_reconnect()
+
+    def _on_ready_read(self):
+        self._rx += self.serial_faduino.readAll().data()
+        # 줄 경계 탐색(\r/\n 모두 지원)
+        while True:
+            r = self._rx.find(b'\r')
+            n = self._rx.find(b'\n')
+            idxs = [i for i in (r, n) if i != -1]
+            if not idxs:
+                break
+            end = min(idxs)
+            line_bytes = self._rx[:end]
+            rest = self._rx[end+1:]
+            while rest[:1] in (b'\r', b'\n'):
+                rest = rest[1:]
+            self._rx = rest
+
+            try:
+                line = line_bytes.decode('ascii', errors='ignore').strip()
+            except Exception:
+                line = None
+
+            # 에코 라인(보낸 명령 그대로) 스킵
+            if self._inflight and line:
+                sent_cmd_str = self._inflight[0].strip()
+                if line == sent_cmd_str:
+                    self._dprint(f"[RECV] echo skipped: {repr(line)}")
+                    continue
+
+            self._dprint(f"[RECV] {repr(line)}")
+            self._finish_command(line)
+            return
+
+    # ------------- 명령 큐(완전 비동기) -------------
+    def enqueue(self, cmd_str: str, on_reply: Callable[[Optional[str]], None],
+                timeout_ms: int = FADUINO_TIMEOUT_MS, gap_ms: int = FADUINO_GAP_MS,
+                tag: str = "", retries_left: int = 3, allow_no_reply: bool = False):
+        if not cmd_str.endswith('\r'):
+            cmd_str += '\r'
+        self._cmd_q.append((cmd_str, on_reply, timeout_ms, gap_ms, tag, retries_left, allow_no_reply))
+        if (self._inflight is None) and (not self._gap_timer.isActive()):
+            self._dequeue_and_send()
+
+    def _dequeue_and_send(self):
+        if self._inflight is not None or not self._cmd_q:
+            return
+        if not self.serial_faduino.isOpen():
+            return
+        self._inflight = self._cmd_q.pop(0)
+        cmd_str, _, timeout_ms, _, tag, _, _ = self._inflight
+        self._rx.clear()
+        self._dprint(f"[SEND] {cmd_str.strip()} (tag={tag})")
+        self.status_message.emit("FAD > 전송", f"{tag or ''} {cmd_str.strip()}".strip())
+        self.serial_faduino.write(cmd_str.encode('ascii'))
+        self.serial_faduino.flush()
+        self._cmd_timer.start(timeout_ms)
+
+    def _on_cmd_timeout(self):
+        if self._inflight and self._inflight[6]:  # allow_no_reply
+            self._dprint("[NOTE] no-reply command; proceed after write")
+        else:
+            self._dprint("[TIMEOUT] command response timed out")
+        self._finish_command(None)
+
+    def _finish_command(self, line: Optional[str]):
+        if self._inflight is None:
+            return
+        cmd_str, on_reply, _timeout_ms, gap_ms, tag, retries_left, allow_no_reply = self._inflight
+        self._cmd_timer.stop(); self._inflight = None
+
+        if line is None:
+            if allow_no_reply:
+                self._dprint(f"[RECV] (no response allowed; proceed) tag={tag}")
+                try: on_reply(None)
+                except Exception as e:
+                    self.status_message.emit("Faduino", f"콜백 처리 예외: {e}")
+                self._gap_timer.start(gap_ms)
+                return
+            # 재시도/재연결
+            if retries_left > 0:
+                self._dprint(f"[RETRY] re-enqueue (left={retries_left-1}) tag={tag}")
+                self._cmd_q.insert(0, (cmd_str, on_reply, _timeout_ms, gap_ms, tag, retries_left - 1, allow_no_reply))
+                if self.serial_faduino.isOpen():
+                    self.serial_faduino.close()
+                self._try_reconnect()
+                return
+            else:
+                try: on_reply(None)
+                except Exception as e:
+                    self.status_message.emit("Faduino", f"콜백 처리 예외: {e}")
+                self._gap_timer.start(gap_ms)
+                return
+
+        # 정상 응답 → 콜백
+        try:
+            on_reply((line or '').strip())
+        except Exception as e:
+            self.status_message.emit("Faduino", f"콜백 처리 예외: {e}")
+        self._gap_timer.start(gap_ms)
+
+    # ------------- 폴링/프로세스 연동 -------------
     @Slot(bool)
     def set_process_status(self, should_poll: bool):
-        """'ProcessController'의 방송을 수신하여 자신의 스레드에서 폴링을 제어"""
         if should_poll:
-            self.start_polling()
-        else:
-            self.stop_polling()
-
-    # [신규] 폴링을 시작하는 헬퍼 메소드
-    def start_polling(self):
-        if not self.polling_timer.isActive():
-            self.status_message.emit("Faduino", "공정 감시 폴링 시작")
-            self.polling_timer.start()
-
-    # [신규] 폴링을 중지하는 헬퍼 메소드
-    def stop_polling(self):
-        if self.polling_timer.isActive():
-            self.polling_timer.stop()
-            self.status_message.emit("Faduino", "공정 감시 폴링 중지")
-
-    # '상태 읽기' 요청을 처리하는 슬롯
-    @Slot()
-    def force_status_read(self):
-        """'S' 명령으로 상태를 요청하고 응답을 파싱 (DCPowerController 또는 폴링 타이머에 의해 호출)"""
-        self.send_command("S\n", verify=False)
-        self._read_and_parse_status()
-
-    def send_command(self, cmd, verify=True):
-        """
-        명령어를 전송하고, verify=True일 경우 'OK' 응답을 기다림.
-        성공 시 True, 실패(타임아웃) 시 False 반환.
-        """
-        if not self.serial_faduino:
-            self.status_message.emit("Faduino", "시리얼 연결 안 됨, 명령 전송 실패")
-            return False
-        
-        self.serial_lock.lock()
-        is_polling_active = self.polling_timer.isActive()
-        if verify and is_polling_active:  # 검증이 필요한 명령('D', 'W')이면 폴링 잠시 중지
-            self.polling_timer.stop()
-            
-        try:
-            self.serial_faduino.reset_input_buffer()
-            self.serial_faduino.write(cmd.encode('ascii'))
-
-            if not verify:
-                return True # 검증이 필요 없는 명령(S)은 바로 성공 처리
-
-            # 'OK' 응답 대기 (최대 0.5초)
-            start_time = time.time()
-            while time.time() - start_time < 0.5:
-                if self.serial_faduino.in_waiting > 0:
-                    response = self.serial_faduino.readline().decode('ascii', errors='ignore').strip()
-                    if response == "OK":
-                        self.status_message.emit("Faduino", f"명령 성공: {cmd.strip()}")
-                        return True
-            
-            self.status_message.emit("Faduino", f"응답 시간 초과: {cmd.strip()}")
-            return False
-
-        except Exception as e:
-            self.status_message.emit("Faduino", f"명령 전송 실패: {e}")
-            return False
-        finally:
-            if verify and is_polling_active:
+            if not self.polling_timer.isActive():
+                self.status_message.emit("Faduino", "공정 감시 폴링 시작"); self._dprint("[RUN] POLL START")
                 self.polling_timer.start()
-            self.serial_lock.unlock()
-            time.sleep(1) # 명령 전송 후 1초 대기
-
-    @Slot(int, bool)
-    def set_relay(self, pin, state):
-        cmd = f"R,{pin},{1 if state else 0}\n"
-
-        # 명령 성공시 예상 상태 업데이트
-        if self.send_command(cmd):
-            if state:
-                self.expected_relay_mask |= (1 << pin)
-            else:
-                self.expected_relay_mask &= ~(1 << pin)
-
-            self.command_confirmed.emit(cmd.strip())
         else:
-            self.command_failed.emit("Faduino", f"Relay 제어 명령({cmd.strip()}) 실패")
+            if self.polling_timer.isActive():
+                self.polling_timer.stop()
+                self.status_message.emit("Faduino", "공정 감시 폴링 중지"); self._dprint("[RUN] POLL STOP")
 
+    def _enqueue_poll_cycle(self):
+        # 통합 상태 읽기: S → OK,mask,rf_for,rf_ref,dc_v,dc_c
+        def on_s(line: Optional[str]):
+            s = (line or '').strip()
+            if not s.startswith('OK'):
+                return
+            parts = s.split(',')
+            # OK 단독 ack 보호: len==1이면 상태라인 아님
+            if len(parts) == 1:
+                return
+            try:
+                relay_mask = int(parts[1])
+                if self._is_first_poll:
+                    self.expected_relay_mask = relay_mask
+                    self._is_first_poll = False
+                    self.status_message.emit("Faduino", f"초기 릴레이 상태 동기화 완료: {relay_mask}")
+                elif relay_mask != self.expected_relay_mask:
+                    msg = f"릴레이 상태 불일치! 예상: {self.expected_relay_mask}, 실제: {relay_mask}"
+                    self.status_message.emit("Faduino(경고)", msg)
+                    self.command_failed.emit("Faduino", f"Relay 상태 확인 {msg}")
+                # RF/DC 갱신
+                if self.is_rf_active and len(parts) >= 4:
+                    rf_for_raw = float(parts[2]); rf_ref_raw = float(parts[3])
+                    rf_for = max(0.0, (RF_PARAM_ADC_TO_WATT * rf_for_raw) + RF_OFFSET_ADC_TO_WATT)
+                    rf_ref_v = (rf_ref_raw / ADC_FULL_SCALE) * ADC_INPUT_VOLT
+                    rf_ref = max(0.0, rf_ref_v * RF_WATT_PER_VOLT)
+                    self.rf_forward, self.rf_reflected = rf_for, rf_ref
+                    self.rf_power_updated.emit(rf_for, rf_ref)
+                if self.is_dc_active and len(parts) >= 6:
+                    dc_v_raw = float(parts[4]); dc_c_raw = float(parts[5])
+                    dc_v = max(0.0, (DC_PARAM_ADC_TO_VOLT * dc_v_raw) + DC_OFFSET_ADC_TO_VOLT)
+                    dc_c = max(0.0, (DC_PARAM_ADC_TO_AMP  * dc_c_raw) + DC_OFFSET_ADC_TO_AMP)
+                    dc_p = dc_v * dc_c
+                    self.dc_voltage, self.dc_current = dc_v, dc_c
+                    self.dc_power_updated.emit(dc_p, dc_v, dc_c)
+            except Exception:
+                pass
+        self.enqueue('S\r', on_s, timeout_ms=FADUINO_TIMEOUT_MS, gap_ms=FADUINO_GAP_MS, tag='[POLL S]')
+
+    # ------------- 공개 API (상위에서 호출) -------------
     @Slot(str, bool)
-    def handle_named_command(self, name, state):
+    def handle_named_command(self, name: str, state: bool):
         if name not in BUTTON_TO_PIN:
             self.status_message.emit("Faduino", f"알 수 없는 버튼명: {name}")
             return
         pin = BUTTON_TO_PIN[name]
         self.set_relay(pin, state)
 
-    @Slot(int)
-    def set_rf_power(self, value):
-        v = self._clamp_dac(value)
-        cmd = f"W,{v}\n"
-        self.send_command(cmd)
+    @Slot(int, bool)
+    def set_relay(self, pin: int, state: bool):
+        cmd = f"R,{pin},{1 if state else 0}"  # ack: "OK"
+        def on_reply(line: Optional[str], pin=pin, state=state):
+            if (line or '').strip() == 'OK':
+                if state:
+                    self.expected_relay_mask |= (1 << pin)
+                else:
+                    self.expected_relay_mask &= ~(1 << pin)
+                self.command_confirmed.emit(f"R,{pin},{1 if state else 0}")
+                self.status_message.emit("Faduino", f"Relay({pin}) → {'ON' if state else 'OFF'}")
+            else:
+                self.command_failed.emit("R", f"Relay({pin}) 응답 불일치: {repr(line)}")
+        self.enqueue(cmd, on_reply, timeout_ms=FADUINO_TIMEOUT_MS, gap_ms=FADUINO_GAP_MS, tag=f"[R {pin}]")
 
     @Slot(int)
-    def set_dc_power(self, value):
+    def set_rf_power(self, value: int):
         v = self._clamp_dac(value)
-        cmd = f"D,{v}\n"
-        self.send_command(cmd)
-
-    # power off 는 검증 없이
-    @Slot(int)
-    def set_dc_power_unverified(self, value):
-        """'OK' 응답을 기다리지 않고 DC 파워를 설정합니다."""
-        v = self._clamp_dac(value)
-        cmd = f"D,{v}\n"
-        self.send_command(cmd, verify=False)
+        cmd = f"W,{v}"
+        def on_reply(line: Optional[str], v=v):
+            if (line or '').strip() == 'OK':
+                self.command_confirmed.emit("W")
+                self.status_message.emit("Faduino", f"RF DAC = {v}")
+            else:
+                self.command_failed.emit("W", f"응답 불일치: {repr(line)}")
+        self.enqueue(cmd, on_reply, timeout_ms=FADUINO_TIMEOUT_MS, gap_ms=FADUINO_GAP_MS, tag='[W]')
 
     @Slot(int)
-    def set_rf_power_unverified(self, value):
-        """'OK' 응답을 기다리지 않고 RF 파워를 설정합니다."""
+    def set_dc_power(self, value: int):
         v = self._clamp_dac(value)
-        cmd = f"W,{v}\n"
-        self.send_command(cmd, verify=False)
+        cmd = f"D,{v}"
+        def on_reply(line: Optional[str], v=v):
+            if (line or '').strip() == 'OK':
+                self.command_confirmed.emit("D")
+                self.status_message.emit("Faduino", f"DC DAC = {v}")
+            else:
+                self.command_failed.emit("D", f"응답 불일치: {repr(line)}")
+        self.enqueue(cmd, on_reply, timeout_ms=FADUINO_TIMEOUT_MS, gap_ms=FADUINO_GAP_MS, tag='[D]')
 
+    @Slot(int)
+    def set_dc_power_unverified(self, value: int):
+        v = self._clamp_dac(value)
+        self.enqueue(f"D,{v}", lambda _l: None, timeout_ms=FADUINO_TIMEOUT_MS, gap_ms=FADUINO_GAP_MS,
+                     tag='[Du]', allow_no_reply=True)
+
+    @Slot(int)
+    def set_rf_power_unverified(self, value: int):
+        v = self._clamp_dac(value)
+        self.enqueue(f"W,{v}", lambda _l: None, timeout_ms=FADUINO_TIMEOUT_MS, gap_ms=FADUINO_GAP_MS,
+                     tag='[Wu]', allow_no_reply=True)
+
+    @Slot()
+    def force_status_read(self):
+        # S는 통합 상태 응답("OK,mask,rf_for,rf_ref,dc_v,dc_c")
+        def on_s(line: Optional[str]):
+            s = (line or '').strip()
+            if not s.startswith('OK'):
+                return
+            parts = s.split(',')
+            if len(parts) < 2:
+                return
+            try:
+                relay_mask = int(parts[1])
+                if self._is_first_poll:
+                    self.expected_relay_mask = relay_mask; self._is_first_poll = False
+                    self.status_message.emit("Faduino", f"초기 릴레이 상태 동기화 완료: {relay_mask}")
+                elif relay_mask != self.expected_relay_mask:
+                    msg = f"릴레이 상태 불일치! 예상: {self.expected_relay_mask}, 실제: {relay_mask}"
+                    self.status_message.emit("Faduino(경고)", msg)
+                    self.command_failed.emit("Faduino", f"Relay 상태 확인 {msg}")
+                if self.is_rf_active and len(parts) >= 4:
+                    rf_for_raw = float(parts[2]); rf_ref_raw = float(parts[3])
+                    rf_for = max(0.0, (RF_PARAM_ADC_TO_WATT * rf_for_raw) + RF_OFFSET_ADC_TO_WATT)
+                    rf_ref_v = (rf_ref_raw / ADC_FULL_SCALE) * ADC_INPUT_VOLT
+                    rf_ref = max(0.0, rf_ref_v * RF_WATT_PER_VOLT)
+                    self.rf_forward, self.rf_reflected = rf_for, rf_ref
+                    self.rf_power_updated.emit(rf_for, rf_ref)
+                if self.is_dc_active and len(parts) >= 6:
+                    dc_v_raw = float(parts[4]); dc_c_raw = float(parts[5])
+                    dc_v = max(0.0, (DC_PARAM_ADC_TO_VOLT * dc_v_raw) + DC_OFFSET_ADC_TO_VOLT)
+                    dc_c = max(0.0, (DC_PARAM_ADC_TO_AMP  * dc_c_raw) + DC_OFFSET_ADC_TO_AMP)
+                    dc_p = dc_v * dc_c
+                    self.dc_voltage, self.dc_current = dc_v, dc_c
+                    self.dc_power_updated.emit(dc_p, dc_v, dc_c)
+            except Exception:
+                pass
+        self.enqueue('S\r', on_s, timeout_ms=FADUINO_TIMEOUT_MS, gap_ms=FADUINO_GAP_MS, tag='[FORCE S]')
+
+    @Slot()
+    def force_rf_read(self):
+        # r → "OK,rf_for_raw,rf_ref_raw"
+        def on_r(line: Optional[str]):
+            s = (line or '').strip()
+            if not s.startswith('OK'):
+                return
+            parts = s.split(',')
+            if len(parts) != 3:
+                return
+            try:
+                if self.is_rf_active:
+                    rf_for_raw = float(parts[1]); rf_ref_raw = float(parts[2])
+                    rf_for = max(0.0, (RF_PARAM_ADC_TO_WATT * rf_for_raw) + RF_OFFSET_ADC_TO_WATT)
+                    rf_ref_v = (rf_ref_raw / ADC_FULL_SCALE) * ADC_INPUT_VOLT
+                    rf_ref = max(0.0, rf_ref_v * RF_WATT_PER_VOLT)
+                    self.rf_forward, self.rf_reflected = rf_for, rf_ref
+                    self.rf_power_updated.emit(rf_for, rf_ref)
+            except Exception:
+                pass
+        self.enqueue('r\r', on_r, timeout_ms=FADUINO_TIMEOUT_MS, gap_ms=FADUINO_GAP_MS, tag='[FORCE r]')
+
+    @Slot()
+    def force_dc_read(self):
+        # d → "OK,dc_v_raw,dc_c_raw"
+        def on_d(line: Optional[str]):
+            s = (line or '').strip()
+            if not s.startswith('OK'):
+                return
+            parts = s.split(',')
+            if len(parts) != 3:
+                return
+            try:
+                if self.is_dc_active:
+                    dc_v_raw = float(parts[1]); dc_c_raw = float(parts[2])
+                    dc_v = max(0.0, (DC_PARAM_ADC_TO_VOLT * dc_v_raw) + DC_OFFSET_ADC_TO_VOLT)
+                    dc_c = max(0.0, (DC_PARAM_ADC_TO_AMP  * dc_c_raw) + DC_OFFSET_ADC_TO_AMP)
+                    dc_p = dc_v * dc_c
+                    self.dc_voltage, self.dc_current = dc_v, dc_c
+                    self.dc_power_updated.emit(dc_p, dc_v, dc_c)
+            except Exception:
+                pass
+        self.enqueue('d\r', on_d, timeout_ms=FADUINO_TIMEOUT_MS, gap_ms=FADUINO_GAP_MS, tag='[FORCE d]')
+
+    @Slot()
+    def force_pin_read(self):
+        # P → "OK,relay_mask"
+        def on_p(line: Optional[str]):
+            s = (line or '').strip()
+            if not s.startswith('OK'):
+                return
+            parts = s.split(',')
+            if len(parts) != 2:
+                return
+            try:
+                relay_mask = int(parts[1])
+                if self._is_first_poll:
+                    self.expected_relay_mask = relay_mask
+                    self._is_first_poll = False
+                    self.status_message.emit("Faduino", f"초기 릴레이 상태 동기화 완료: {relay_mask}")
+                elif relay_mask != self.expected_relay_mask:
+                    msg = f"릴레이 상태 불일치! 예상: {self.expected_relay_mask}, 실제: {relay_mask}"
+                    self.status_message.emit("Faduino(경고)", msg)
+                    self.command_failed.emit("Faduino", f"Relay 상태 확인 {msg}")
+            except Exception:
+                pass
+        self.enqueue('P\r', on_p, timeout_ms=FADUINO_TIMEOUT_MS, gap_ms=FADUINO_GAP_MS, tag='[FORCE P]')
+
+    # ------------- 상태 플래그 연동 -------------
+    @Slot(bool)
+    def on_rf_state_changed(self, is_active: bool):
+        self.is_rf_active = is_active
+        self.status_message.emit("Faduino", f"RF 컨트롤러 상태 감지: {'활성' if is_active else '비활성'}")
+
+    @Slot(bool)
+    def on_dc_state_changed(self, is_active: bool):
+        self.is_dc_active = is_active
+        self.status_message.emit("Faduino", f"DC 컨트롤러 상태 감지: {'활성' if is_active else '비활성'}")
+
+    # ------------- 유틸 -------------
     def _clamp_dac(self, value: int) -> int:
         try:
             v = int(round(value))
@@ -184,241 +549,3 @@ class FaduinoController(QObject):
         if v < 0: v = 0
         if v > DAC_FULL_SCALE: v = DAC_FULL_SCALE
         return v
-    
-    # === pin 상태 읽기 ===
-    @Slot()
-    def force_pin_read(self):
-        """'P' 명령으로 릴레이 마스크만 읽어옵니다."""
-        self.send_command("P\n", verify=False)
-        self._read_and_parse_pin()
-
-    def _read_and_parse_pin(self):
-        if not self.serial_faduino:
-            return
-        try:
-            start = time.time()
-            while time.time() - start < 0.5:
-                if self.serial_faduino.in_waiting > 0:
-                    line = self.serial_faduino.readline().decode('ascii', errors='ignore').strip()
-                    if not line.startswith("OK"):
-                        continue
-                    parts = line.split(',')   # ["OK", relay_mask]
-                    if len(parts) != 2:
-                        continue
-
-                    relay_mask = int(parts[1])
-
-                    # 기존 기대 마스크 검증 로직 유지
-                    if self._is_first_poll:
-                        self.expected_relay_mask = relay_mask
-                        self._is_first_poll = False
-                        self.status_message.emit("Faduino", f"초기 릴레이 상태 동기화 완료: {relay_mask}")
-                    elif relay_mask != self.expected_relay_mask:
-                        msg = f"릴레이 상태 불일치! 예상: {self.expected_relay_mask}, 실제: {relay_mask}"
-                        self.status_message.emit("Faduino(경고)", msg)
-                        self.command_failed.emit("Faduino", f"Relay 상태 확인 {msg}")
-                    return
-        except Exception as e:
-            self.status_message.emit("Faduino", f"핀 상태 파싱 오류: {e}")
-    # === pin 상태 읽기 ===
-
-    # === RF power 읽기 ===
-    @Slot()
-    def force_rf_read(self):
-        """'r' 명령으로 RF(Forward/Reflected)만 빠르게 읽습니다."""
-        self.send_command("r\n", verify=False)
-        self._read_and_parse_rf()
-
-    def _read_and_parse_rf(self):
-        if not self.serial_faduino:
-            return
-        try:
-            start = time.time()
-            while time.time() - start < 0.5:
-                if self.serial_faduino.in_waiting > 0:
-                    line = self.serial_faduino.readline().decode('ascii', errors='ignore').strip()
-                    if not line.startswith("OK"):
-                        continue
-                    parts = line.split(',')   # ["OK", rf_for_raw, rf_ref_raw]
-                    if len(parts) != 3:
-                        continue
-
-                    if self.is_rf_active:
-                        rf_for_raw = float(parts[1])
-                        rf_ref_raw = float(parts[2])
-
-                        # ADC → Watt 변환 (기존 스케일식 그대로)
-                        self.rf_forward = max(0.0, (RF_PARAM_ADC_TO_WATT * rf_for_raw) + RF_OFFSET_ADC_TO_WATT)
-                        rf_ref_voltage_at_adc = (rf_ref_raw / ADC_FULL_SCALE) * ADC_INPUT_VOLT
-                        self.rf_reflected = max(0.0, rf_ref_voltage_at_adc * RF_WATT_PER_VOLT)
-
-                        self.rf_power_updated.emit(self.rf_forward, self.rf_reflected)
-                    return
-        except Exception as e:
-            self.status_message.emit("Faduino", f"RF 상태 파싱 오류: {e}")
-    # === RF power 읽기 ===
-
-    # === DC power 읽기 ===
-    @Slot()
-    def force_dc_read(self):
-        """'d' 명령으로 DC(Voltage/Current)만 빠르게 읽습니다."""
-        self.send_command("d\n", verify=False)
-        self._read_and_parse_dc()
-
-    def _read_and_parse_dc(self):
-        if not self.serial_faduino:
-            return
-        try:
-            start = time.time()
-            while time.time() - start < 0.5:
-                if self.serial_faduino.in_waiting > 0:
-                    line = self.serial_faduino.readline().decode('ascii', errors='ignore').strip()
-                    if not line.startswith("OK"):
-                        continue
-                    parts = line.split(',')   # ["OK", dc_v_raw, dc_c_raw]
-                    if len(parts) != 3:
-                        continue
-
-                    if self.is_dc_active:
-                        dc_v_raw = float(parts[1])
-                        dc_c_raw = float(parts[2])
-
-                        # ADC → 물리값 변환 (기존 스케일식 그대로)
-                        self.dc_voltage = max(0.0, (DC_PARAM_ADC_TO_VOLT * dc_v_raw) + DC_OFFSET_ADC_TO_VOLT)
-                        self.dc_current = max(0.0, (DC_PARAM_ADC_TO_AMP * dc_c_raw) + DC_OFFSET_ADC_TO_AMP)
-                        self.dc_power   = self.dc_voltage * self.dc_current
-
-                        self.dc_power_updated.emit(self.dc_power, self.dc_voltage, self.dc_current)
-                    return
-        except Exception as e:
-            self.status_message.emit("Faduino", f"DC 상태 파싱 오류: {e}")
-    # === DC power 읽기 ===
-
-    def _read_and_parse_status(self):
-        """S(상태) 명령에 대한 응답을 파싱"""
-        if not self.serial_faduino:
-            return
-        
-        try:
-            start_time = time.time()
-            # 버퍼에 있는 모든 라인을 읽어 처리
-            while time.time() - start_time < 0.5:
-                if self.serial_faduino.in_waiting > 0:
-                    line = self.serial_faduino.readline().decode('ascii', errors='ignore').strip()
-                    if not line.startswith("OK"): # 'OK'로 시작하는 상태 응답만 처리
-                        continue
-                    
-                    parts = line.split(',') # 예: "OK,마스크,RF정,RF반,DC전압,DC전류"
-                    if len(parts) == 6:
-                        relay_mask = int(parts[1])
-                        if self._is_first_poll:
-                            self.expected_relay_mask = relay_mask
-                            self._is_first_poll = False
-                            self.status_message.emit("Faduino", f"초기 릴레이 상태 동기화 완료: {relay_mask}")
-                        elif relay_mask != self.expected_relay_mask:
-                            msg = f"릴레이 상태 불일치! 예상: {self.expected_relay_mask}, 실제: {relay_mask}"
-                            self.status_message.emit("Faduino(경고)", msg)
-                            self.command_failed.emit("Faduino", f"Relay 상태 확인 {msg}")
-                            return
-                        #self.status_message.emit("Faduino", "릴레이 모두 일치")
-
-                        if self.is_rf_active:
-                            rf_for_raw = float(parts[2])
-                            rf_ref_raw = float(parts[3])
-
-                            # --- RFpower 스케일 변환 ---
-                            # 수식: Watts = param * ADC_raw + offset
-                            # Forward: ADC → W
-                            self.rf_forward = max(0.0, (RF_PARAM_ADC_TO_WATT * rf_for_raw) + RF_OFFSET_ADC_TO_WATT)
-
-                            # Reflected: (ADC → Volt) → W
-                            rf_ref_voltage_at_adc = (rf_ref_raw / ADC_FULL_SCALE) * ADC_INPUT_VOLT
-                            self.rf_reflected = max(0.0, rf_ref_voltage_at_adc * RF_WATT_PER_VOLT)
-
-                            # 변환된 값을 신호로 보냄
-                            self.rf_power_updated.emit(self.rf_forward, self.rf_reflected)
-
-                        if self.is_dc_active:
-                            dc_v_raw = float(parts[4])
-                            dc_c_raw = float(parts[5])
-
-                            # --- DCpower 스케일 변환 ---
-                            # 1. DC Voltage 계산: 데이터 기반 보정 수식 적용
-                            # 수식: Voltage = param * ADC_v_raw + offset
-                            self.dc_voltage = max(0.0, (DC_PARAM_ADC_TO_VOLT * dc_v_raw) + DC_OFFSET_ADC_TO_VOLT)
-
-                            # 2. DC Current 계산: 데이터 기반 보정 수식 적용 (사용자 아이디어 반영)
-                            # 수식: Current = param * ADC_c_raw + offset
-                            self.dc_current = max(0.0, (DC_PARAM_ADC_TO_AMP * dc_c_raw) + DC_OFFSET_ADC_TO_AMP)
-                            
-                            # 3. 최종 DC Power는 보정된 전압과 전류를 곱하여 계산
-                            self.dc_power = self.dc_voltage * self.dc_current
-
-                            # dc_power_updated 시그널에 새로 계산된 파워, 전압, 전류를 함께 보냄
-                            self.dc_power_updated.emit(self.dc_power, self.dc_voltage, self.dc_current)
-
-                        return # 한줄 처리후 종료
-
-        except Exception as e:
-            self.status_message.emit("Faduino", f"응답 파싱 오류: {e}")
-
-    # (추가) RF 컨트롤러의 상태 변경을 수신할 슬롯
-    @Slot(bool)
-    def on_rf_state_changed(self, is_active: bool):
-        self.is_rf_active = is_active
-        self.status_message.emit("Faduino", f"RF 컨트롤러 상태 감지: {'활성' if is_active else '비활성'}")
-
-    # (추가) DC 컨트롤러의 상태 변경을 수신할 슬롯
-    @Slot(bool)
-    def on_dc_state_changed(self, is_active: bool):
-        self.is_dc_active = is_active
-        self.status_message.emit("Faduino", f"DC 컨트롤러 상태 감지: {'활성' if is_active else '비활성'}")
-
-    @Slot()
-    def cleanup(self):
-        # 폴링 중지 및 내부 플래그
-        self.stop_polling()  # 로그 포함해서 타이머 정지
-
-        if not (self.serial_faduino and self.serial_faduino.is_open):
-            return
-        
-        try:
-            # --- 1) 모든 릴레이 OFF (검증하며 끄기) ---
-            failed = []
-            for pin in range(8):  # 0~7
-                ok = self.send_command(f"R,{pin},0\n", verify=True)
-                if not ok:
-                    failed.append(pin)
-
-            # --- 2) 최종 상태 확인 (S 읽어서 마스크 0인지 확인) ---
-            self.send_command("S\n", verify=False)
-            self._read_and_parse_status()  # 여기서 마스크를 읽고, 필요하면 로그로 경고가 떠요.
-
-            # (선택) 남은 핀 재시도
-            for pin in failed:
-                self.send_command(f"R,{pin},0\n", verify=True)
-
-
-            # --- 2) 아날로그 출력도 0으로 ---
-            self.send_command("W,0\n", verify=False)  # RF 0
-            self.send_command("D,0\n", verify=False)  # DC 0
-
-            # --- 3) 내부 상태 동기화 초기화 ---
-            self.expected_relay_mask = 0
-            self._is_first_poll = True  # 다음 연결 때 하드웨어 마스크 재동기화
-
-            # --- 4) 잠깐 대기 후 버퍼 정리(선택) ---
-            QThread.msleep(50)
-            try:
-                self.serial_faduino.reset_input_buffer()
-                self.serial_faduino.reset_output_buffer()
-            except Exception:
-                pass
-
-        finally:
-            try:
-                self.serial_faduino.close()
-            finally:
-                self.serial_faduino = None
-                self.status_message.emit("Faduino", "연결 종료")
-

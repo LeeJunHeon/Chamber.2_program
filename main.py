@@ -332,14 +332,10 @@ class MainWindow(QWidget):
             # 다음 공정이 남아있을 경우
             params = self.process_queue[self.current_process_index]
 
-            # ▼▼▼ [수정] 현재 공정의 controll_process 값으로 시작 방식을 결정 ▼▼▼
-            # 'controll_process'가 'T' 또는 'True'이면 Cold Start, 아니면 Hot Start
-            is_cold_start = str(params.get('controll_process', 'True')).upper() in ['TRUE', 'T']
-
             self._update_ui_from_params(params)
             
             # 잠시 후 (UI가 업데이트될 시간을 준 뒤) 다음 공정 시작
-            QTimer.singleShot(100, lambda p=params, cs=is_cold_start: self.process_controller.start_process(p, cs))
+            QTimer.singleShot(100, lambda p=params: self.process_controller.start_process(p))
         else:
             # 모든 공정이 끝났을 경우
             self.append_log("MAIN", "모든 공정이 완료되었습니다.")
@@ -355,7 +351,7 @@ class MainWindow(QWidget):
                 return False
         
         # 2. MFC
-        if not self.mfc_controller.serial_mfc.is_open():
+        if not self.mfc_controller.serial_mfc.isOpen():
             self.mfc_controller.connect_mfc_device() # 성공/실패는 MFC의 워치독이 주기적으로 관리
             
         # 3. OES (main에서 쓰레드를 사용하니 보완필요)
@@ -463,7 +459,7 @@ class MainWindow(QWidget):
             }
 
             # ProcessController로 파라미터를 전달하여 단일 공정 시작
-            self.process_controller.start_process(params, is_cold_start=True)
+            self.process_controller.start_process(params)
 
     @Slot(str, str)
     def append_log(self, source: str, msg: str):

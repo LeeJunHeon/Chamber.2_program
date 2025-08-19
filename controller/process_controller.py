@@ -55,7 +55,7 @@ class ProcessController(QObject):
         self._countdown_remaining_ms = 0
         self._countdown_base_message = ""
 
-    def _create_process_sequence(self, params: dict, is_cold_start: bool) -> list:
+    def _create_process_sequence(self, params: dict) -> list:
         """
         UI 입력을 바탕으로 전체 공정 순서를 정의합니다.
         기존 _process_steps의 모든 로직(주석 포함)을 딕셔너리 스텝 방식으로 완벽하게 재구성했습니다.
@@ -90,21 +90,18 @@ class ProcessController(QObject):
         # ======================================================================
 
         # --- 2-1. 초기화 단계 ---
-        if is_cold_start:
-            self.log_message.emit("Process", "전체 공정 모드로 시작 (Base Pressure 대기 포함).")
-            steps.append({'action': 'IG_CMD', 'value': base_pressure, 'message': f'베이스 압력({base_pressure:.1e}) 도달 대기'})
-            #steps.append({'action': 'RGA_SCAN', 'message': 'RGA 측정 시작'})
-            
-            for gas, info in gas_info.items():
-                steps.append({'action': 'MFC_CMD', 'params': ('FLOW_OFF', {'channel': info["channel"]}), 'message': f'Ch{info["channel"]}({gas}) Flow Off'})
-            
-            steps.append({'action': 'MFC_CMD', 'params': ('VALVE_OPEN', {}), 'message': 'MFC Valve Open'})
-            steps.append({'action': 'MFC_CMD', 'params': ('PS_ZEROING', {}), 'message': '압력 센서 Zeroing'})
-            
-            for gas, info in gas_info.items():
-                steps.append({'action': 'MFC_CMD', 'params': ('MFC_ZEROING', {'channel': info["channel"]}), 'message': f'Ch{info["channel"]}({gas}) Zeroing'})
-        else:
-            self.log_message.emit("Process", "연속 공정 모드로 시작 (Base Pressure 대기 생략).")
+        self.log_message.emit("Process", "전체 공정 모드로 시작 (Base Pressure 대기 포함).")
+        steps.append({'action': 'IG_CMD', 'value': base_pressure, 'message': f'베이스 압력({base_pressure:.1e}) 도달 대기'})
+        #steps.append({'action': 'RGA_SCAN', 'message': 'RGA 측정 시작'})
+        
+        for gas, info in gas_info.items():
+            steps.append({'action': 'MFC_CMD', 'params': ('FLOW_OFF', {'channel': info["channel"]}), 'message': f'Ch{info["channel"]}({gas}) Flow Off'})
+        
+        steps.append({'action': 'MFC_CMD', 'params': ('VALVE_OPEN', {}), 'message': 'MFC Valve Open'})
+        steps.append({'action': 'MFC_CMD', 'params': ('PS_ZEROING', {}), 'message': '압력 센서 Zeroing'})
+        
+        for gas, info in gas_info.items():
+            steps.append({'action': 'MFC_CMD', 'params': ('MFC_ZEROING', {'channel': info["channel"]}), 'message': f'Ch{info["channel"]}({gas}) Zeroing'})
 
         # --- 2-2. 가스 주입 단계 ---
         # (추가) 개별 가스 밸브를 열기 전에 메인 밸브를 먼저 엽니다.
@@ -159,18 +156,16 @@ class ProcessController(QObject):
             #, 'polling': True, 'parallel': True 삭제
 
         # --- 2-6. 종료 단계 ---
-        shutdown_sequence = self._create_shutdown_sequence(is_full_shutdown=is_full_cycle, params=params)
+        shutdown_sequence = self._create_shutdown_sequence(params=params)
         steps.extend(shutdown_sequence)
 
         return steps
     
-    def _create_shutdown_sequence(self, is_full_shutdown: bool, params: dict) -> list:
+    def _create_shutdown_sequence(self, params: dict) -> list:
         """
         공정 종료 절차를 생성합니다. 모든 종료 시나리오를 이 함수에서 관리합니다.
 
         Args:
-            is_full_shutdown (bool): True이면 가스까지 모두 끄는 '전체 종료',
-                                    False이면 파워/셔터만 끄는 '부분 종료'.
             params (dict): 어떤 장비(DC, RF, MS)가 사용되었는지 확인하기 위한 공정 파라미터.
 
         Returns:
@@ -178,49 +173,43 @@ class ProcessController(QObject):
         """
         shutdown_steps = []
         common_info = self._get_common_process_info(params)
+        gun_shutters = common_info['gun_shutters']
+        gas_info = common_info['gas_info']
 
-        # --- 공통 종료 절차: 파워 및 메인 셔터 Off ---
-        # 이 부분은 '부분 종료'와 '전체 종료' 모두에 해당됩니다.
-        if common_info['use_ms']:
-            shutdown_steps.append({'action': 'FADUINO_CMD', 'params': ('MS', False), 'message': 'Main Shutter 닫기'})
+        # 1. Main Shutter close (항상)
+        shutdown_steps.append({'action': 'FADUINO_CMD', 'params': ('MS', False), 'message': 'Main Shutter 닫기'})
+
+        # 2. 사용한 Power off
         if common_info['use_dc']:
             shutdown_steps.append({'action': 'DC_POWER_STOP', 'message': 'DC Power Off'})
         if common_info['use_rf']:
             shutdown_steps.append({'action': 'RF_POWER_STOP', 'message': 'RF Power Off'})
 
-        # --- '전체 종료'일 경우에만 추가되는 절차 ---
-        if is_full_shutdown:
-            gun_shutters = common_info['gun_shutters']
-            gas_info = common_info['gas_info']
+        # 3. MFC Flow off (모든 flow)
+        for gas, info in gas_info.items():
+            # 사용 여부와 관계없이 모든 가스를 끄도록 설정
+            shutdown_steps.append({
+                'action': 'MFC_CMD',
+                'params': ('FLOW_OFF', {'channel': info["channel"]}),
+                'message': f'Ch{info["channel"]}({gas}) Flow Off'
+            })
 
-            for gas, info in gas_info.items():
-                # 사용 여부와 관계없이 모든 가스를 확실하게 끄도록 설정
-                shutdown_steps.append({
-                    'action': 'MFC_CMD',
-                    'params': ('FLOW_OFF', {'channel': info["channel"]}),
-                    'message': f'Ch{info["channel"]}({gas}) Flow Off'
-                })
+        # 4. MFC Valve open (항상)
+        shutdown_steps.append({'action': 'MFC_CMD', 'params': ('VALVE_OPEN', {}), 'message': '전체 MFC Valve Open'})
+        
+        # 5. Gun Shutter close (모든 건 셔터 닫기)
+        for shutter in gun_shutters:
+            if params.get(f"use_{shutter.lower()}", False):
+                shutdown_steps.append({'action': 'FADUINO_CMD', 'params': (shutter, False), 'message': f'Gun Shutter {shutter} 닫기'})
 
-            # 2. MFC Valve Open (전체 가스 밸브 열기)
-            shutdown_steps.append({'action': 'MFC_CMD', 'params': ('VALVE_OPEN', {}), 'message': '전체 MFC Valve Open'})
-            
-            # 3. Gun Shutter Close (모든 건 셔터 닫기)
-            for shutter in gun_shutters:
-                if params.get(f"use_{shutter.lower()}", False):
-                    shutdown_steps.append({'action': 'FADUINO_CMD', 'params': (shutter, False), 'message': f'Gun Shutter {shutter} 닫기'})
+        # 6. Faduino Gas Valve close (모든 가스 밸브 닫기)
+        for gas in gas_info:
+            shutdown_steps.append({'action': 'FADUINO_CMD', 'params': (gas, False), 'message': f'Faduino {gas} 밸브 닫기'})
 
-            # 4. Faduino Gas Valve Close (개별 가스 밸브 닫기)
-            for gas in gas_info:
-                if params.get(f"use_{gas.lower()}", False):
-                    shutdown_steps.append({'action': 'FADUINO_CMD', 'params': (gas, False), 'message': f'Faduino {gas} 밸브 닫기'})
-
-            # (추가) 모든 개별 가스 밸브를 닫은 후 메인 밸브를 닫습니다.
-            shutdown_steps.append({'action': 'FADUINO_CMD', 'params': ('MV', False), 'message': '메인 밸브 닫기'})
-                    
-
-            self.log_message.emit("Process", "전체 종료 절차가 생성되었습니다.")
-        else:
-            self.log_message.emit("Process", "부분 종료 절차가 생성되었습니다 (가스 유지).")
+        # 7. Faduino Main Gas close (항상)
+        shutdown_steps.append({'action': 'FADUINO_CMD', 'params': ('MV', False), 'message': '메인 밸브 닫기'})
+                
+        self.log_message.emit("Process", "종료 절차가 생성되었습니다.")
 
         return shutdown_steps
     
@@ -233,13 +222,12 @@ class ProcessController(QObject):
             'use_ms': bool(params.get("use_ms", False)),
             'use_dc': bool(params.get("use_dc_power", False)) and float(params.get("dc_power", 0)) > 0,
             'use_rf': bool(params.get("use_rf_power", False)) and float(params.get("rf_power", 0)) > 0,
-            'is_full_cycle': str(params.get('controll_process', 'True')).upper() in ['TRUE', 'T'],
             'gas_info': {"Ar": {"channel": 1}, "O2": {"channel": 2}, "N2": {"channel": 3}},
             'gun_shutters': ["G1", "G2", "G3"]
         }
         return info
 
-    def start_process(self, params: dict, is_cold_start: bool):
+    def start_process(self, params: dict):
         """UI 입력 기반으로 공정 시퀀스를 생성하고 실행을 시작합니다."""
         if self.is_running:
             self.log_message.emit("Process", "오류: 이미 다른 공정이 실행 중입니다.")
@@ -248,7 +236,7 @@ class ProcessController(QObject):
         self.current_params = params
 
         # 1. 공정 계획서(sequence) 생성
-        self.process_sequence = self._create_process_sequence(params, is_cold_start)
+        self.process_sequence = self._create_process_sequence(params)
         
         # 2. 공정 상태 초기화 및 시작
         self._current_step_idx = -1
@@ -506,7 +494,7 @@ class ProcessController(QObject):
         self._parallel_tasks_remaining = 0
 
         # 2. '전체 종료' 스텝을 생성하여 비상 종료 절차로 사용
-        emergency_steps = self._create_shutdown_sequence(is_full_shutdown=True, params=self.current_params)
+        emergency_steps = self._create_shutdown_sequence(params=self.current_params)
 
         # 3. 만약 생성된 종료 스텝이 없다면, 즉시 finish_process 호출
         if not emergency_steps:

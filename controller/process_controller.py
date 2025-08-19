@@ -91,7 +91,7 @@ class ProcessController(QObject):
         # --- 2-1. 초기화 단계 ---
         self.log_message.emit("Process", "전체 공정 모드로 시작 (Base Pressure 대기 포함).")
         steps.append({'action': 'IG_CMD', 'value': base_pressure, 'message': f'베이스 압력({base_pressure:.1e}) 도달 대기'})
-        #steps.append({'action': 'RGA_SCAN', 'message': 'RGA 측정 시작'})
+        steps.append({'action': 'RGA_SCAN', 'message': 'RGA 측정 시작'})
         
         for gas, info in gas_info.items():
             steps.append({'action': 'MFC_CMD', 'params': ('FLOW_OFF', {'channel': info["channel"]}), 'message': f'Ch{info["channel"]}({gas}) Flow Off'})

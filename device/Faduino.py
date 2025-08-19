@@ -19,7 +19,6 @@ import traceback
 from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Optional, Deque
-import re
 
 from PyQt6.QtCore import QObject, QTimer, QIODeviceBase, pyqtSignal as Signal, pyqtSlot as Slot
 from PyQt6.QtSerialPort import QSerialPort, QSerialPortInfo
@@ -34,7 +33,8 @@ from lib.config import (
     DAC_FULL_SCALE, FADUINO_POLLING_INTERVAL_MS,
     FADUINO_WATCHDOG_INTERVAL_MS, FADUINO_TIMEOUT_MS,
     FADUINO_GAP_MS, FADUINO_RECONNECT_BACKOFF_START_MS,
-    FADUINO_RECONNECT_BACKOFF_MAX_MS, DEBUG_PRINT
+    FADUINO_RECONNECT_BACKOFF_MAX_MS, DEBUG_PRINT,
+    CLEAN_TIMEOUT
 )
 
 @dataclass
@@ -61,6 +61,14 @@ class FaduinoController(QObject):
         super().__init__(parent)
 
         self.debug_print = DEBUG_PRINT
+        self._drain_depth = 0   # [DRAIN] residual CR/LF 재스케줄 깊이 카운터
+        self._closing = False   # 종료 진행 플래그
+        self._send_spin = False # [GUARD] _dequeue_and_send 재진입 가드
+
+        # 오류 발생시 재연결 관련
+        self._last_error_time = 0.0
+        self._error_debounce_s = 1.0  # 1.0~2.0 정도 권장
+        self._echo_window_s = 0.15    # 에코 스킵 타이밍 윈도우(환경 따라 0.10 ~ 0.20s 조정)
 
         # (1) QSerialPort 설정
         self.serial_faduino = QSerialPort(self)
@@ -75,14 +83,18 @@ class FaduinoController(QObject):
         # (2) 수신 버퍼(줄 단위 파싱) + 상한
         self._rx = bytearray()      # 반드시 bytearray 유지
         self._RX_MAX = 16 * 1024    # 상한(예: 16 KiB) — 필요하면 4/8/32 KiB로 조정
+        self._LINE_MAX = 512       # 1줄 최대 길이(환경에 따라 256~1024로 조정)
+        self._overflow_count = 0   # 오버플로우 발생 통계/알림 스로틀
 
         # (3) 명령 큐: (cmd_str, on_reply, timeout_ms, gap_ms, tag, retries_left, allow_no_reply)
         self._cmd_q: Deque[Command] = deque()
         self._inflight: Optional[Command] = None
 
         # (4) 타이머: 명령 타임아웃/인터커맨드 간격/폴링/워치독
-        self._cmd_timer = QTimer(self); self._cmd_timer.setSingleShot(True)
-        self._gap_timer = QTimer(self); self._gap_timer.setSingleShot(True)
+        self._cmd_timer = QTimer(self)
+        self._cmd_timer.setSingleShot(True)
+        self._gap_timer = QTimer(self)
+        self._gap_timer.setSingleShot(True)
         self._cmd_timer.timeout.connect(self._on_cmd_timeout)
         self._gap_timer.timeout.connect(self._dequeue_and_send)
 
@@ -131,13 +143,15 @@ class FaduinoController(QObject):
         available = {p.portName() for p in QSerialPortInfo.availablePorts()}
         if FADUINO_PORT not in available:
             msg = f"{FADUINO_PORT} 존재하지 않음. 사용 가능 포트: {sorted(available)}"
-            self.status_message.emit("Faduino", msg); self._dprint(f"[FAD] {msg}")
+            self.status_message.emit("Faduino", msg)
+            self._dprint(f"[FAD] {msg}")
             return False
 
         self.serial_faduino.setPortName(FADUINO_PORT)
         if not self.serial_faduino.open(QIODeviceBase.OpenModeFlag.ReadWrite):
             msg = f"{FADUINO_PORT} 연결 실패: {self.serial_faduino.errorString()}"
-            self.status_message.emit("Faduino", msg); self._dprint(f"[FAD] {msg}")
+            self.status_message.emit("Faduino", msg) 
+            self._dprint(f"[FAD] {msg}")
             return False
 
         # 라인 제어 및 버퍼 초기화
@@ -147,7 +161,8 @@ class FaduinoController(QObject):
         self._rx.clear()
         self._reconnect_backoff_ms = FADUINO_RECONNECT_BACKOFF_START_MS
         msg = f"{FADUINO_PORT} 연결 성공 (PyQt6 QSerialPort)"
-        self.status_message.emit("Faduino", msg); self._dprint(f"[FAD] {msg}")
+        self.status_message.emit("Faduino", msg) 
+        self._dprint(f"[FAD] {msg}")
         return True
 
     def _watch_connection(self):
@@ -156,34 +171,81 @@ class FaduinoController(QObject):
         if self.serial_faduino.isOpen():
             return
         msg = f"재연결 시도... ({self._reconnect_backoff_ms} ms)"
-        self.status_message.emit("Faduino", msg); self._dprint(f"[FAD] {msg}")
+        self.status_message.emit("Faduino", msg)
+        self._dprint(f"[FAD] {msg}")
         QTimer.singleShot(self._reconnect_backoff_ms, self._try_reconnect)
 
     def _try_reconnect(self):
         if self._open_port():
             msg = "재연결 성공. 대기 중 명령 재개."
-            self.status_message.emit("Faduino", msg); self._dprint(f"[FAD] {msg}")
-            self._dequeue_and_send()
+            self.status_message.emit("Faduino", msg) 
+            self._dprint(f"[FAD] {msg}")
+
+            if self._cmd_q:
+                QTimer.singleShot(0, self._dequeue_and_send)
             return
         self._reconnect_backoff_ms = min(self._reconnect_backoff_ms * 2, FADUINO_RECONNECT_BACKOFF_MAX_MS)
 
     @Slot()
     def cleanup(self):
         """안전 종료: 타이머/큐/포트 정리 + 베스트에포트로 출력 OFF."""
+        # 0) 중복 호출 가드 + 종료 진입 선언
+        if self._closing:
+            self._dprint("[CLOSE] cleanup already in progress")
+            return
+        self._closing = True
+        self._want_connected = False  # 워치독 재연결 의지 해제(선택)
+
+        # 1. 타이머 정지
         self.polling_timer.stop()
-        self._cmd_timer.stop(); self._gap_timer.stop(); self._watchdog.stop()
-        self._cmd_q.clear(); self._inflight = None
+        self._cmd_timer.stop() 
+        self._gap_timer.stop() 
+        self._watchdog.stop()
 
-        # 베스트에포트로 모든 릴레이/아날로그 0 (무응답 허용)
+        # 2) 진행 중(inflight) 명령에 '취소(None)' 통지
+        if self._inflight:
+            try:
+                # 타임아웃 타이머/상태 정리
+                self._cmd_timer.stop()
+                cmd = self._inflight
+                self._inflight = None
+                # 상위에 "응답 없음(취소)"로 알려 다음 로직을 풀어줌
+                self._safe_callback(cmd.callback, None)
+            except Exception as e:
+                self._dprint(f"[WARN] cleanup inflight-cb failed: {e}")
+
+        # 3) 큐에 대기 중인 모든 명령에도 '취소(None)' 통지
+        try:
+            while self._cmd_q:
+                cmd = self._cmd_q.popleft()
+                self._safe_callback(cmd.callback, None)
+        except Exception as e:
+            self._dprint(f"[WARN] cleanup queue-cb failed: {e}")
+
+        # 4) RX 버퍼/가드 등 로컬 상태 정리
+        try:
+            self._rx.clear()
+            self._drain_depth = 0
+            self._send_spin = False  # 가드가 걸려 있어도 종료 시점에는 풀어둠(선택)
+        except Exception:
+            pass
+
+        # 5) 베스트에포트로 모든 릴레이/아날로그 0 (무응답 허용)
         for pin in range(8):
-            self.enqueue(f"R,{pin},0\r", lambda _l: None, timeout_ms=FADUINO_TIMEOUT_MS, gap_ms=FADUINO_GAP_MS,
-                         tag=f"[CLEAN R {pin}]", retries_left=0, allow_no_reply=True)
-        self.enqueue("W,0\r", lambda _l: None, timeout_ms=FADUINO_TIMEOUT_MS, gap_ms=FADUINO_GAP_MS,
-                     tag="[CLEAN W]", retries_left=0, allow_no_reply=True)
-        self.enqueue("D,0\r", lambda _l: None, timeout_ms=FADUINO_TIMEOUT_MS, gap_ms=FADUINO_GAP_MS,
-                     tag="[CLEAN D]", retries_left=0, allow_no_reply=True)
+            self.enqueue(f"R,{pin},0\r", lambda _l: None,
+                        timeout_ms=CLEAN_TIMEOUT, gap_ms=FADUINO_GAP_MS,
+                        tag=f"[CLEAN R {pin}]", retries_left=0, 
+                        allow_no_reply=True, allow_when_closing=True)
+        self.enqueue("W,0\r", lambda _l: None,
+                    timeout_ms=CLEAN_TIMEOUT, gap_ms=FADUINO_GAP_MS,
+                    tag="[CLEAN W]", retries_left=0, 
+                    allow_no_reply=True, allow_when_closing=True)
+        self.enqueue("D,0\r", lambda _l: None,
+                    timeout_ms=CLEAN_TIMEOUT, gap_ms=FADUINO_GAP_MS,
+                    tag="[CLEAN D]", retries_left=0, 
+                    allow_no_reply=True, allow_when_closing=True)
 
-        # 잠시 후 포트 닫기
+        # 6) 잠시 후 포트 닫기
         QTimer.singleShot(200, self._close_now)
 
     def _close_now(self):
@@ -193,12 +255,21 @@ class FaduinoController(QObject):
 
     # ------------- 시리얼 이벤트 -------------
     def _on_serial_error(self, err: QSerialPort.SerialPortError):
-        if err == QSerialPort.SerialPortError.NoError:
+        if err == QSerialPort.SerialPortError.NoError or self._closing:
             return
+        
+        # 연속 오류 디바운스
+        now = time.monotonic()
+        if now - self._last_error_time < self._error_debounce_s:
+            self._dprint("[ERR] debounced serial error")
+            return
+        self._last_error_time = now
+
         err_name = getattr(err, "name", str(err))
         err_code = getattr(err, "value", "?")
         msg = f"시리얼 오류: {self.serial_faduino.errorString()} (err={err_name}/{err_code})"
-        self.status_message.emit("Faduino", msg); self._dprint(f"[ERR] {msg}")
+        self.status_message.emit("Faduino", msg) 
+        self._dprint(f"[ERR] {msg}")
 
         # 진행 중 명령 되돌리고 재시도 준비
         if self._inflight is not None:
@@ -212,47 +283,106 @@ class FaduinoController(QObject):
             else:
                 self._safe_callback(cmd.callback, None)
 
-            if self.serial_faduino.isOpen():
+        # 포트만 닫고, 재연결은 워치독에 맡김
+        if self.serial_faduino.isOpen():
+            try:
                 self.serial_faduino.close()
-            self._try_reconnect()
+            except Exception as e:
+                self._dprint(f"[WARN] close-on-error failed: {e}")
+
+        # 에러 직후 갭 타이머 정지
+        self._gap_timer.stop()
+
+        # 에러 직후 남은 RX 꼬리 정리
+        try:
+            self._rx.clear()
+            self._drain_depth = 0
+        except Exception:
+            pass
+
+        # 재연결은 워치독이 처리
+        return
 
     def _on_ready_read(self):
         ba = self.serial_faduino.readAll()
-        if not ba.isEmpty():
-            # 1) 새 데이터 뒤에 붙이기 (bytearray 확장)
-            self._rx.extend(bytes(ba))
+        if ba.isEmpty():
+            return
 
-            # 2) 상한 초과분만 앞에서 잘라내기(오래된 바이트 폐기, 최신 꼬리 유지)
-            if len(self._rx) > self._RX_MAX:
-                drop = len(self._rx) - self._RX_MAX
+        # 새 데이터가 들어오면 드레인 카운터 초기화
+        self._drain_depth = 0
+
+        # 1) 버퍼 누적
+        self._rx.extend(bytes(ba))
+
+        # RX 오버플로 시 '마지막 개행 이후'만 보존 → 라인 경계 일관성 유지
+        if len(self._rx) > self._RX_MAX:
+            last_cr = self._rx.rfind(b'\r')
+            last_lf = self._rx.rfind(b'\n')
+            last_nl = max(last_cr, last_lf)  # 마지막 개행(-1이면 없음)
+
+            if last_nl >= 0:
+                # 마지막 개행까지 버리면 그 뒤는 '완전한 라인의 시작'
+                drop = last_nl + 1
                 del self._rx[:drop]
-                # 선택: 디버그 로그
                 try:
-                    self._dprint(f"[WARN] RX overflow: dropped {drop}B, kept tail {self._RX_MAX}B")
+                    self._dprint(f"[WARN] RX overflow: dropped {drop}B up to last newline; keep {len(self._rx)}B")
+                except Exception:
+                    pass
+            else:
+                # 개행이 전혀 없으면 테일만 보존(절반 또는 LINE_MAX)
+                keep = min(len(self._rx) // 2, self._LINE_MAX)
+                if keep <= 0:
+                    self._rx.clear()
+                else:
+                    del self._rx[:-keep]
+                try:
+                    self._dprint(f"[WARN] RX overflow: no newline; kept tail {len(self._rx)}B")
                 except Exception:
                     pass
 
-        # 줄 경계 탐색(\r/\n 모두 지원)
+            # (선택) 과다 수신 알림 스로틀
+            try:
+                self._overflow_count += 1
+                if self._overflow_count % 5 == 1:
+                    self.status_message.emit("Faduino", "수신 버퍼 과다. 앞부분을 절단해 복구했습니다.")
+            except Exception:
+                pass
+
+        # 3) 줄 경계(\r/\n) 기준으로 라인 단위 파싱
         while True:
-            r = self._rx.find(b'\r')
-            n = self._rx.find(b'\n')
-            idxs = [i for i in (r, n) if i != -1]
-            if not idxs:
+            i_cr = self._rx.find(b'\r')
+            i_lf = self._rx.find(b'\n')
+            if i_cr == -1 and i_lf == -1:
                 break
-            end = min(idxs)
-            line_bytes = self._rx[:end]
-            rest = self._rx[end+1:]
-            while rest[:1] in (b'\r', b'\n'):
-                rest = rest[1:]
-            self._rx = rest
+
+            idx = i_cr if i_lf == -1 else (i_lf if i_cr == -1 else min(i_cr, i_lf))
+            line_bytes = self._rx[:idx]
+
+            # CRLF 또는 LFCR 쌍을 한 번에 건너뛰기
+            drop = idx + 1
+            if drop < len(self._rx):
+                ch = self._rx[idx]
+                nxt = self._rx[idx + 1]
+                if (ch == 13 and nxt == 10) or (ch == 10 and nxt == 13):
+                    drop += 1
+            del self._rx[:drop]
+
+            # 앞부분(토큰 포함)만 보존하고 긴 꼬리는 잘라서 파서 안정성 유지
+            over = len(line_bytes) - self._LINE_MAX
+            if over > 0:
+                self._dprint(f"[WARN] RX line too long (+{over}B), truncating tail; keep {self._LINE_MAX}B")
+                line_bytes = line_bytes[:self._LINE_MAX]
 
             try:
                 line = line_bytes.decode('ascii', errors='ignore').strip()
             except Exception:
                 line = None
 
-            # 에코 라인(보낸 명령 그대로) 스킵
-            if self._inflight and line:
+            if not line:
+                continue
+
+            # 에코 라인(보낸 명령 그대로) 스킵 — 타이밍 윈도우 사용
+            if self._inflight and (time.monotonic() - (self._inflight.sent_at or 0) < self._echo_window_s):
                 sent_cmd_str = self._inflight.cmd_str.strip()
                 if line == sent_cmd_str:
                     self._dprint(f"[RECV] echo skipped: {repr(line)}")
@@ -260,12 +390,38 @@ class FaduinoController(QObject):
 
             self._dprint(f"[RECV] {repr(line)}")
             self._finish_command(line)
+
+            # 응답 처리 후 버퍼에 라인 경계가 더 남아 있으면, 0ms로 한 번 더 돌려 꼬리만 비움
+            if b'\n' in self._rx or b'\r' in self._rx:
+                if self._drain_depth < 10:  # 최대 10번까지만
+                    self._drain_depth += 1
+                    self._dprint(f"[DRAIN] residual CR/LF detected; rescheduling _on_ready_read (depth: {self._drain_depth})")
+                    QTimer.singleShot(0, self._on_ready_read)
+                else:
+                    self._dprint("[DRAIN] max depth reached; dropping leading CR/LF only")
+                    # 전체 clear() 대신, 선행 CR/LF만 제거하여 유효 데이터 보존
+                    while self._rx[:1] in (b'\r', b'\n'):
+                        del self._rx[0:1]
+                    self._drain_depth = 0
+            else:
+                # 더 이상 드레인할 CR/LF 없음 → 카운터 초기화
+                self._drain_depth = 0
+
+            # 한 번에 한 라인만 처리하고 나머지는 0ms 재스케줄에 맡김
             return
 
     # ------------- 명령 큐(완전 비동기) -------------
     def enqueue(self, cmd_str: str, on_reply: Callable[[Optional[str]], None],
                 timeout_ms: int = FADUINO_TIMEOUT_MS, gap_ms: int = FADUINO_GAP_MS,
-                tag: str = "", retries_left: int = 3, allow_no_reply: bool = False):
+                tag: str = "", retries_left: int = 3, 
+                allow_no_reply: bool = False,
+                allow_when_closing: bool = False):
+        
+        # 종료 중이면 외부 enqueue 차단(단, cleanup 내부만 예외)
+        if self._closing and not allow_when_closing:
+            self._dprint("[CLOSE] enqueue blocked")
+            return
+        
         if not cmd_str.endswith('\r'):
             cmd_str += '\r'
         cmd = Command(
@@ -280,27 +436,109 @@ class FaduinoController(QObject):
         )
         self._cmd_q.append(cmd)
         if (self._inflight is None) and (not self._gap_timer.isActive()):
-            self._dequeue_and_send()
+            QTimer.singleShot(0, self._dequeue_and_send)
 
     def _dequeue_and_send(self):
+        # --- 사전 체크(빠른 리턴) ---
+        # 이미 보낸 명령이 대기 중이거나, 큐가 비었거나, 포트가 닫혀있거나,
+        # 인터커맨드 갭 타이머가 뛰는 중이면 보내지 않음.
         if self._inflight is not None or not self._cmd_q:
             return
         if not self.serial_faduino.isOpen():
             return
+        if self._gap_timer.isActive():
+            return
+        
+        # 새 송신 시작 → 드레인 카운터 초기화(이전 응답 꼬리 상태를 잊는다)
+        self._drain_depth = 0
 
-        cmd = self._cmd_q.popleft()
-        self._inflight = cmd
-        self._rx.clear()
+        # --- [GUARD] 재진입 차단 ---
+        if self._send_spin:
+            self._dprint("[GUARD] _dequeue_and_send re-enter blocked")
+            return
+        self._send_spin = True
 
-        self._dprint(f"[SEND] {cmd.cmd_str.strip()} (tag={cmd.tag})")
-        self.status_message.emit("FAD > 전송", f"{cmd.tag or ''} {cmd.cmd_str.strip()}".strip())
+        try:
+            # 1) 큐에서 한 건 꺼내 인플라이트로 설정
+            cmd = self._cmd_q.popleft()
+            self._inflight = cmd
+            self._rx.clear()
 
-        self.serial_faduino.write(cmd.cmd_str.encode('ascii'))
-        self.serial_faduino.flush()
-        cmd.sent_at = time.monotonic()  # 선택: 왕복시간 측정 등에 사용 가능
+            # 2) 로깅/상태
+            self._dprint(f"[SEND] {cmd.cmd_str.strip()} (tag={cmd.tag})")
+            self.status_message.emit("FAD > 전송", f"{cmd.tag or ''} {cmd.cmd_str.strip()}".strip())
 
-        self._cmd_timer.start(cmd.timeout_ms)
+            # 3) 페이로드 인코딩
+            payload = cmd.cmd_str.encode('ascii')
 
+            # 4) write 결과 확인 + 부분 쓰기(Partial write) 보강
+            n = self.serial_faduino.write(payload)
+
+            try:
+                n_int = int(n)
+            except Exception:
+                n_int = -1
+
+            if n_int <= 0:
+                raise IOError(f"serial write returned {n_int}")
+            
+            total = n_int
+            if total != len(payload):
+                # 남은 바이트 한 번 더 밀어 넣기(한 번 추가 시도로 충분)
+                remaining = payload[total:]
+                m = self.serial_faduino.write(remaining)
+                try:
+                    m_int = int(m)
+                except Exception:
+                    m_int = -1
+                if m_int > 0:
+                    total += m_int
+
+                if total != len(payload):
+                    # 여전히 모자라면 실패로 간주 → except로 넘어가 복구/재시도
+                    raise IOError(f"partial write: queued {total}/{len(payload)} bytes")
+
+            # 일부 드라이버는 flush()가 no-op일 수 있지만 호출해도 무방
+            self.serial_faduino.flush()
+
+            # 6) 전송 완료 시각 기록 후 타임아웃 타이머 시작(성공 경로에서만!)
+            cmd.sent_at = time.monotonic()
+
+            # 명시적으로 stop→start 하면 상태가 더 명확해진다(권장)
+            self._cmd_timer.stop()
+            self._cmd_timer.start(cmd.timeout_ms)
+
+        except Exception as e:
+            # ---- 전송 실패: 상태 복구 + 재시도/재연결 예약 ----
+            self._dprint(f"[ERROR] Send failed: {e}")
+
+            failed_cmd = self._inflight
+            self._inflight = None
+            self._cmd_timer.stop()
+
+            # 같은 명령을 다시 보내고 싶으면 맨 앞으로 재삽입
+            if failed_cmd:
+                self._cmd_q.appendleft(failed_cmd)
+
+            # 포트 상태에 따라 재연결 or 간격 후 재시도
+            try:
+                if not self.serial_faduino.isOpen():
+                    # 포트가 닫혀 있으면 재연결 루틴으로(0ms 지연으로 재진입 끊기)
+                    QTimer.singleShot(0, self._try_reconnect)
+                else:
+                    # 포트는 열려 있는데 write 실패면, 약간의 간격 후 다시 디큐 시도
+                    gap_ms = failed_cmd.gap_ms
+                    self._gap_timer.start(gap_ms)
+                    QTimer.singleShot(gap_ms + 1, self._dequeue_and_send)
+            except Exception as ee:
+                self._dprint(f"[WARN] reconnect/retry schedule failed: {ee}")
+
+            self.status_message.emit("Faduino", f"전송 오류: {e}")
+            return
+
+        finally:
+            # --- 가드 해제(성공/실패 모두) ---
+            self._send_spin = False
 
     def _on_cmd_timeout(self):
         if self._inflight and self._inflight.allow_no_reply:
@@ -330,7 +568,7 @@ class FaduinoController(QObject):
                 self._cmd_q.appendleft(cmd)
                 if self.serial_faduino.isOpen():
                     self.serial_faduino.close()
-                self._try_reconnect()
+                QTimer.singleShot(0, self._try_reconnect)
                 return
             else:
                 self._safe_callback(cmd.callback, None)
@@ -346,12 +584,14 @@ class FaduinoController(QObject):
     def set_process_status(self, should_poll: bool):
         if should_poll:
             if not self.polling_timer.isActive():
-                self.status_message.emit("Faduino", "공정 감시 폴링 시작"); self._dprint("[RUN] POLL START")
+                self.status_message.emit("Faduino", "공정 감시 폴링 시작")
+                self._dprint("[RUN] POLL START")
                 self.polling_timer.start()
         else:
             if self.polling_timer.isActive():
                 self.polling_timer.stop()
-                self.status_message.emit("Faduino", "공정 감시 폴링 중지"); self._dprint("[RUN] POLL STOP")
+                self.status_message.emit("Faduino", "공정 감시 폴링 중지")
+                self._dprint("[RUN] POLL STOP")
 
     def _enqueue_poll_cycle(self):
         # 통합 상태 읽기: S → OK_S,mask,rf_for,rf_ref,dc_v,dc_c
@@ -457,7 +697,8 @@ class FaduinoController(QObject):
             try:
                 relay_mask = p["relay_mask"]
                 if self._is_first_poll:
-                    self.expected_relay_mask = relay_mask; self._is_first_poll = False
+                    self.expected_relay_mask = relay_mask
+                    self._is_first_poll = False
                     self.status_message.emit("Faduino", f"초기 릴레이 상태 동기화 완료: {relay_mask}")
                 elif relay_mask != self.expected_relay_mask:
                     msg = f"릴레이 상태 불일치! 예상: {self.expected_relay_mask}, 실제: {relay_mask}"
@@ -603,14 +844,16 @@ class FaduinoController(QObject):
 
     # ------------- 공용 계산 함수 -------------
     def _compute_rf(self, rf_for_raw, rf_ref_raw):
-        rf_for_raw = float(rf_for_raw); rf_ref_raw = float(rf_ref_raw)
+        rf_for_raw = float(rf_for_raw)
+        rf_ref_raw = float(rf_ref_raw)
         rf_for = max(0.0, (RF_PARAM_ADC_TO_WATT * rf_for_raw) + RF_OFFSET_ADC_TO_WATT)
         rf_ref_v = (rf_ref_raw / ADC_FULL_SCALE) * ADC_INPUT_VOLT
         rf_ref = max(0.0, rf_ref_v * RF_WATT_PER_VOLT)
         return rf_for, rf_ref
 
     def _compute_dc(self, dc_v_raw, dc_c_raw):
-        dc_v_raw = float(dc_v_raw); dc_c_raw = float(dc_c_raw)
+        dc_v_raw = float(dc_v_raw)
+        dc_c_raw = float(dc_c_raw)
         dc_v = max(0.0, (DC_PARAM_ADC_TO_VOLT * dc_v_raw) + DC_OFFSET_ADC_TO_VOLT)
         dc_c = max(0.0, (DC_PARAM_ADC_TO_AMP  * dc_c_raw) + DC_OFFSET_ADC_TO_AMP)
         dc_p = dc_v * dc_c

@@ -116,7 +116,6 @@ MFC_GAP_MS    = 1000         # 모든 인터커맨드 간격(gap)
 MFC_DELAY_MS  = 1000         # 모든 검증/재시도 지연
 MFC_DELAY_MS_VALVE = 5000    # 밸브 이동/재전송 대기(5초)
 
-
 # [신규] 채널별 유량 스케일 팩터 정의
 MFC_SCALE_FACTORS = {
     1: 1.0,     # Channel 1 (Ar): 1:1 스케일

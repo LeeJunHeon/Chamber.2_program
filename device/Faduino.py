@@ -14,7 +14,8 @@ Faduino.py — PyQt6 QSerialPort(완전 비동기) 기반 Faduino 컨트롤러 (
   - MFC 비동기 설계와 동일한 패턴(큐, 콜백, 타임아웃, 재시도, 워치독) 적용.
 """
 from __future__ import annotations
-from typing import Callable, Optional, Tuple, List
+from collections import deque
+from typing import Callable, Optional, Tuple, Deque
 import re
 
 from PyQt6.QtCore import QObject, QTimer, QIODeviceBase, pyqtSignal as Signal, pyqtSlot as Slot
@@ -30,7 +31,7 @@ from lib.config import (
     DAC_FULL_SCALE, FADUINO_POLLING_INTERVAL_MS,
     FADUINO_WATCHDOG_INTERVAL_MS, FADUINO_TIMEOUT_MS,
     FADUINO_GAP_MS, FADUINO_RECONNECT_BACKOFF_START_MS,
-    FADUINO_RECONNECT_BACKOFF_MAX_MS,
+    FADUINO_RECONNECT_BACKOFF_MAX_MS, DEBUG_PRINT
 )
 
 class FaduinoController(QObject):
@@ -45,7 +46,7 @@ class FaduinoController(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        self.debug_print = True
+        self.debug_print = DEBUG_PRINT
 
         # (1) QSerialPort 설정
         self.serial_faduino = QSerialPort(self)
@@ -57,11 +58,12 @@ class FaduinoController(QObject):
         self.serial_faduino.readyRead.connect(self._on_ready_read)
         self.serial_faduino.errorOccurred.connect(self._on_serial_error)
 
-        # (2) 수신 버퍼(줄 단위 파싱)
-        self._rx = bytearray()
+        # (2) 수신 버퍼(줄 단위 파싱) + 상한
+        self._rx = bytearray()      # 반드시 bytearray 유지
+        self._RX_MAX = 16 * 1024    # 상한(예: 16 KiB) — 필요하면 4/8/32 KiB로 조정
 
         # (3) 명령 큐: (cmd_str, on_reply, timeout_ms, gap_ms, tag, retries_left, allow_no_reply)
-        self._cmd_q: List[Tuple[str, Callable[[Optional[str]], None], int, int, str, int, bool]] = []
+        self._cmd_q: Deque[Tuple[str, Callable[[Optional[str]], None], int, int, str, int, bool]] = deque()
         self._inflight: Optional[Tuple[str, Callable[[Optional[str]], None], int, int, str, int, bool]] = None
 
         # (4) 타이머: 명령 타임아웃/인터커맨드 간격/폴링/워치독
@@ -189,7 +191,7 @@ class FaduinoController(QObject):
             cmd_str, on_reply, timeout_ms, gap_ms, tag, retries_left, allow_no_reply = self._inflight
             self._cmd_timer.stop(); self._inflight = None
             if retries_left > 0:
-                self._cmd_q.insert(0, (cmd_str, on_reply, timeout_ms, gap_ms, tag, retries_left - 1, allow_no_reply))
+                self._cmd_q.appendleft((cmd_str, on_reply, timeout_ms, gap_ms, tag, retries_left - 1, allow_no_reply))
             else:
                 try: on_reply(None)
                 except Exception: pass
@@ -199,7 +201,21 @@ class FaduinoController(QObject):
         self._try_reconnect()
 
     def _on_ready_read(self):
-        self._rx += self.serial_faduino.readAll().data()
+        ba = self.serial_faduino.readAll()
+        if not ba.isEmpty():
+            # 1) 새 데이터 뒤에 붙이기 (bytearray 확장)
+            self._rx.extend(bytes(ba))
+
+            # 2) 상한 초과분만 앞에서 잘라내기(오래된 바이트 폐기, 최신 꼬리 유지)
+            if len(self._rx) > self._RX_MAX:
+                drop = len(self._rx) - self._RX_MAX
+                del self._rx[:drop]
+                # 선택: 디버그 로그
+                try:
+                    self._dprint(f"[WARN] RX overflow: dropped {drop}B, kept tail {self._RX_MAX}B")
+                except Exception:
+                    pass
+
         # 줄 경계 탐색(\r/\n 모두 지원)
         while True:
             r = self._rx.find(b'\r')
@@ -245,7 +261,7 @@ class FaduinoController(QObject):
             return
         if not self.serial_faduino.isOpen():
             return
-        self._inflight = self._cmd_q.pop(0)
+        self._inflight = self._cmd_q.popleft()
         cmd_str, _, timeout_ms, _, tag, _, _ = self._inflight
         self._rx.clear()
         self._dprint(f"[SEND] {cmd_str.strip()} (tag={tag})")
@@ -278,7 +294,7 @@ class FaduinoController(QObject):
             # 재시도/재연결
             if retries_left > 0:
                 self._dprint(f"[RETRY] re-enqueue (left={retries_left-1}) tag={tag}")
-                self._cmd_q.insert(0, (cmd_str, on_reply, _timeout_ms, gap_ms, tag, retries_left - 1, allow_no_reply))
+                self._cmd_q.appendleft((cmd_str, on_reply, _timeout_ms, gap_ms, tag, retries_left - 1, allow_no_reply))
                 if self.serial_faduino.isOpen():
                     self.serial_faduino.close()
                 self._try_reconnect()

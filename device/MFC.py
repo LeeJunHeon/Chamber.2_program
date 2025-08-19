@@ -39,6 +39,7 @@ from lib.config import (
     MFC_GAP_MS,
     MFC_DELAY_MS,
     MFC_DELAY_MS_VALVE,
+    DEBUG_PRINT
     )
 
 class MFCController(QObject):
@@ -54,7 +55,7 @@ class MFCController(QObject):
         super().__init__(parent)
 
         # (디버그 프린트 on/off)
-        self.debug_print = True
+        self.debug_print = DEBUG_PRINT
 
         # (1) QSerialPort 준비
         self.serial_mfc = QSerialPort(self)

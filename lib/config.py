@@ -1,6 +1,9 @@
 # lib/config.py
 from pathlib import Path
 
+# === 디버그 프린트 여부 ===
+DEBUG_PRINT = True
+
 # === 시리얼 포트 설정 ===
 IG_PORT = "COM11"
 IG_BAUD = 9600

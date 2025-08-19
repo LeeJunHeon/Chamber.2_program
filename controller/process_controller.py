@@ -438,7 +438,6 @@ class ProcessController(QObject):
         if self._countdown_base_message:
             self.update_process_state.emit(f"{self._countdown_base_message} (남은 {mm:02d}:{ss:02d})")
 
-
     def _finish_process(self, was_successful: bool):
         """공정 완료 또는 중단 시 호출됩니다."""
 

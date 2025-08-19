@@ -519,7 +519,7 @@
     <set>Qt::AlignmentFlag::AlignLeading|Qt::AlignmentFlag::AlignLeft|Qt::AlignmentFlag::AlignVCenter</set>
    </property>
   </widget>
-  <widget class="QCheckBox" name="Main_shuter_checkbox">
+  <widget class="QCheckBox" name="Main_shutter_checkbox">
    <property name="geometry">
     <rect>
      <x>30</x>

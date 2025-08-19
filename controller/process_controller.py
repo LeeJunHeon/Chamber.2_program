@@ -68,7 +68,6 @@ class ProcessController(QObject):
         use_dc = common_info['use_dc']
         use_rf = common_info['use_rf']
         use_ms = common_info['use_ms']
-        is_full_cycle = common_info['is_full_cycle']
         gas_info = common_info['gas_info']
         gun_shutters = common_info['gun_shutters']
 
@@ -463,7 +462,8 @@ class ProcessController(QObject):
 
         # [추가] 모든 작업(정상/비정상 종료 포함)이 끝났음을 알린 후,
         # main.py에 연결된 모든 장비의 cleanup을 호출하도록 신호를 보냅니다.
-        self.process_aborted.emit()
+        if not was_successful:
+            self.process_aborted.emit()
 
         # main.py의 공정 큐가 다음 공정을 진행할지 결정하도록 결과를 보고합니다.
         self.process_finished.emit(was_successful)

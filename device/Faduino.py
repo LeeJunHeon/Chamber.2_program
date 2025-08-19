@@ -1,4 +1,4 @@
-# Faduino.py
+# Faduino.py 기존 serial 방식
 
 import serial
 import time

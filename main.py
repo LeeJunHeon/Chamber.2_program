@@ -351,7 +351,7 @@ class MainWindow(QWidget):
                 return False
         
         # 2. MFC
-        if not self.mfc_controller.serial_mfc.isOpen():
+        if not getattr(self.mfc_controller, "serial_mfc", None) or not self.mfc_controller.serial_mfc.isOpen():
             self.mfc_controller.connect_mfc_device() # 성공/실패는 MFC의 워치독이 주기적으로 관리
             
         # 3. OES (main에서 쓰레드를 사용하니 보완필요)

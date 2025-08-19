@@ -14,8 +14,11 @@ Faduino.py — PyQt6 QSerialPort(완전 비동기) 기반 Faduino 컨트롤러 (
   - MFC 비동기 설계와 동일한 패턴(큐, 콜백, 타임아웃, 재시도, 워치독) 적용.
 """
 from __future__ import annotations
+import time
+import traceback
 from collections import deque
-from typing import Callable, Optional, Tuple, Deque
+from dataclasses import dataclass
+from typing import Callable, Optional, Deque
 import re
 
 from PyQt6.QtCore import QObject, QTimer, QIODeviceBase, pyqtSignal as Signal, pyqtSlot as Slot
@@ -33,6 +36,17 @@ from lib.config import (
     FADUINO_GAP_MS, FADUINO_RECONNECT_BACKOFF_START_MS,
     FADUINO_RECONNECT_BACKOFF_MAX_MS, DEBUG_PRINT
 )
+
+@dataclass
+class Command:
+    cmd_str: str
+    callback: Callable[[Optional[str]], None]
+    timeout_ms: int
+    gap_ms: int
+    tag: str
+    retries_left: int
+    allow_no_reply: bool
+    sent_at: Optional[float] = None
 
 class FaduinoController(QObject):
     # UI/상위 컨트롤러용 시그널(기존과 동일)
@@ -63,8 +77,8 @@ class FaduinoController(QObject):
         self._RX_MAX = 16 * 1024    # 상한(예: 16 KiB) — 필요하면 4/8/32 KiB로 조정
 
         # (3) 명령 큐: (cmd_str, on_reply, timeout_ms, gap_ms, tag, retries_left, allow_no_reply)
-        self._cmd_q: Deque[Tuple[str, Callable[[Optional[str]], None], int, int, str, int, bool]] = deque()
-        self._inflight: Optional[Tuple[str, Callable[[Optional[str]], None], int, int, str, int, bool]] = None
+        self._cmd_q: Deque[Command] = deque()
+        self._inflight: Optional[Command] = None
 
         # (4) 타이머: 명령 타임아웃/인터커맨드 간격/폴링/워치독
         self._cmd_timer = QTimer(self); self._cmd_timer.setSingleShot(True)
@@ -188,17 +202,19 @@ class FaduinoController(QObject):
 
         # 진행 중 명령 되돌리고 재시도 준비
         if self._inflight is not None:
-            cmd_str, on_reply, timeout_ms, gap_ms, tag, retries_left, allow_no_reply = self._inflight
-            self._cmd_timer.stop(); self._inflight = None
-            if retries_left > 0:
-                self._cmd_q.appendleft((cmd_str, on_reply, timeout_ms, gap_ms, tag, retries_left - 1, allow_no_reply))
+            cmd = self._inflight
+            self._cmd_timer.stop()
+            self._inflight = None
+            if cmd.retries_left > 0:
+                cmd.retries_left -= 1
+                cmd.sent_at = None
+                self._cmd_q.appendleft(cmd)
             else:
-                try: on_reply(None)
-                except Exception: pass
+                self._safe_callback(cmd.callback, None)
 
-        if self.serial_faduino.isOpen():
-            self.serial_faduino.close()
-        self._try_reconnect()
+            if self.serial_faduino.isOpen():
+                self.serial_faduino.close()
+            self._try_reconnect()
 
     def _on_ready_read(self):
         ba = self.serial_faduino.readAll()
@@ -237,7 +253,7 @@ class FaduinoController(QObject):
 
             # 에코 라인(보낸 명령 그대로) 스킵
             if self._inflight and line:
-                sent_cmd_str = self._inflight[0].strip()
+                sent_cmd_str = self._inflight.cmd_str.strip()
                 if line == sent_cmd_str:
                     self._dprint(f"[RECV] echo skipped: {repr(line)}")
                     continue
@@ -252,7 +268,17 @@ class FaduinoController(QObject):
                 tag: str = "", retries_left: int = 3, allow_no_reply: bool = False):
         if not cmd_str.endswith('\r'):
             cmd_str += '\r'
-        self._cmd_q.append((cmd_str, on_reply, timeout_ms, gap_ms, tag, retries_left, allow_no_reply))
+        cmd = Command(
+            cmd_str=cmd_str,
+            callback=on_reply,
+            timeout_ms=timeout_ms,
+            gap_ms=gap_ms,
+            tag=tag,
+            retries_left=retries_left,
+            allow_no_reply=allow_no_reply,
+            sent_at=None,
+        )
+        self._cmd_q.append(cmd)
         if (self._inflight is None) and (not self._gap_timer.isActive()):
             self._dequeue_and_send()
 
@@ -261,17 +287,23 @@ class FaduinoController(QObject):
             return
         if not self.serial_faduino.isOpen():
             return
-        self._inflight = self._cmd_q.popleft()
-        cmd_str, _, timeout_ms, _, tag, _, _ = self._inflight
+
+        cmd = self._cmd_q.popleft()
+        self._inflight = cmd
         self._rx.clear()
-        self._dprint(f"[SEND] {cmd_str.strip()} (tag={tag})")
-        self.status_message.emit("FAD > 전송", f"{tag or ''} {cmd_str.strip()}".strip())
-        self.serial_faduino.write(cmd_str.encode('ascii'))
+
+        self._dprint(f"[SEND] {cmd.cmd_str.strip()} (tag={cmd.tag})")
+        self.status_message.emit("FAD > 전송", f"{cmd.tag or ''} {cmd.cmd_str.strip()}".strip())
+
+        self.serial_faduino.write(cmd.cmd_str.encode('ascii'))
         self.serial_faduino.flush()
-        self._cmd_timer.start(timeout_ms)
+        cmd.sent_at = time.monotonic()  # 선택: 왕복시간 측정 등에 사용 가능
+
+        self._cmd_timer.start(cmd.timeout_ms)
+
 
     def _on_cmd_timeout(self):
-        if self._inflight and self._inflight[6]:  # allow_no_reply
+        if self._inflight and self._inflight.allow_no_reply:
             self._dprint("[NOTE] no-reply command; proceed after write")
         else:
             self._dprint("[TIMEOUT] command response timed out")
@@ -280,38 +312,34 @@ class FaduinoController(QObject):
     def _finish_command(self, line: Optional[str]):
         if self._inflight is None:
             return
-        cmd_str, on_reply, _timeout_ms, gap_ms, tag, retries_left, allow_no_reply = self._inflight
-        self._cmd_timer.stop(); self._inflight = None
+        cmd = self._inflight
+        self._cmd_timer.stop()
+        self._inflight = None
 
         if line is None:
-            if allow_no_reply:
-                self._dprint(f"[RECV] (no response allowed; proceed) tag={tag}")
-                try: on_reply(None)
-                except Exception as e:
-                    self.status_message.emit("Faduino", f"콜백 처리 예외: {e}")
-                self._gap_timer.start(gap_ms)
+            if cmd.allow_no_reply:
+                self._dprint(f"[RECV] (no response allowed; proceed) tag={cmd.tag}")
+                self._safe_callback(cmd.callback, None)
+                self._gap_timer.start(cmd.gap_ms)
                 return
-            # 재시도/재연결
-            if retries_left > 0:
-                self._dprint(f"[RETRY] re-enqueue (left={retries_left-1}) tag={tag}")
-                self._cmd_q.appendleft((cmd_str, on_reply, _timeout_ms, gap_ms, tag, retries_left - 1, allow_no_reply))
+
+            if cmd.retries_left > 0:
+                self._dprint(f"[RETRY] re-enqueue (left={cmd.retries_left-1}) tag={cmd.tag}")
+                cmd.retries_left -= 1
+                cmd.sent_at = None
+                self._cmd_q.appendleft(cmd)
                 if self.serial_faduino.isOpen():
                     self.serial_faduino.close()
                 self._try_reconnect()
                 return
             else:
-                try: on_reply(None)
-                except Exception as e:
-                    self.status_message.emit("Faduino", f"콜백 처리 예외: {e}")
-                self._gap_timer.start(gap_ms)
+                self._safe_callback(cmd.callback, None)
+                self._gap_timer.start(cmd.gap_ms)
                 return
 
-        # 정상 응답 → 콜백
-        try:
-            on_reply((line or '').strip())
-        except Exception as e:
-            self.status_message.emit("Faduino", f"콜백 처리 예외: {e}")
-        self._gap_timer.start(gap_ms)
+        # 정상 응답
+        self._safe_callback(cmd.callback, (line or '').strip())
+        self._gap_timer.start(cmd.gap_ms)
 
     # ------------- 폴링/프로세스 연동 -------------
     @Slot(bool)
@@ -326,17 +354,18 @@ class FaduinoController(QObject):
                 self.status_message.emit("Faduino", "공정 감시 폴링 중지"); self._dprint("[RUN] POLL STOP")
 
     def _enqueue_poll_cycle(self):
-        # 통합 상태 읽기: S → OK,mask,rf_for,rf_ref,dc_v,dc_c
+        # 통합 상태 읽기: S → OK_S,mask,rf_for,rf_ref,dc_v,dc_c
         def on_s(line: Optional[str]):
-            s = (line or '').strip()
-            if not s.startswith('OK'):
+            p = self._parse_ok_and_compute(line or "")
+            if p and p.get("type") == "ERROR":
+                self.command_failed.emit("Faduino", p.get("msg", "ERROR"))
                 return
-            parts = s.split(',')
-            # OK 단독 ack 보호: len==1이면 상태라인 아님
-            if len(parts) == 1:
+            
+            if not p or p.get("type") != "OK_S":
                 return
             try:
-                relay_mask = int(parts[1])
+                relay_mask = p["relay_mask"]
+                # 릴레이 동기화
                 if self._is_first_poll:
                     self.expected_relay_mask = relay_mask
                     self._is_first_poll = False
@@ -346,20 +375,10 @@ class FaduinoController(QObject):
                     self.status_message.emit("Faduino(경고)", msg)
                     self.command_failed.emit("Faduino", f"Relay 상태 확인 {msg}")
                 # RF/DC 갱신
-                if self.is_rf_active and len(parts) >= 4:
-                    rf_for_raw = float(parts[2]); rf_ref_raw = float(parts[3])
-                    rf_for = max(0.0, (RF_PARAM_ADC_TO_WATT * rf_for_raw) + RF_OFFSET_ADC_TO_WATT)
-                    rf_ref_v = (rf_ref_raw / ADC_FULL_SCALE) * ADC_INPUT_VOLT
-                    rf_ref = max(0.0, rf_ref_v * RF_WATT_PER_VOLT)
-                    self.rf_forward, self.rf_reflected = rf_for, rf_ref
-                    self.rf_power_updated.emit(rf_for, rf_ref)
-                if self.is_dc_active and len(parts) >= 6:
-                    dc_v_raw = float(parts[4]); dc_c_raw = float(parts[5])
-                    dc_v = max(0.0, (DC_PARAM_ADC_TO_VOLT * dc_v_raw) + DC_OFFSET_ADC_TO_VOLT)
-                    dc_c = max(0.0, (DC_PARAM_ADC_TO_AMP  * dc_c_raw) + DC_OFFSET_ADC_TO_AMP)
-                    dc_p = dc_v * dc_c
-                    self.dc_voltage, self.dc_current = dc_v, dc_c
-                    self.dc_power_updated.emit(dc_p, dc_v, dc_c)
+                if self.is_rf_active and "rf" in p:
+                    self._update_rf(*p["rf"])
+                if self.is_dc_active and "dc" in p:
+                    self._update_dc(*p["dc"])
             except Exception:
                 pass
         self.enqueue('S\r', on_s, timeout_ms=FADUINO_TIMEOUT_MS, gap_ms=FADUINO_GAP_MS, tag='[POLL S]')
@@ -375,9 +394,9 @@ class FaduinoController(QObject):
 
     @Slot(int, bool)
     def set_relay(self, pin: int, state: bool):
-        cmd = f"R,{pin},{1 if state else 0}"  # ack: "OK"
+        cmd = f"R,{pin},{1 if state else 0}"  # ack: "ACK_R"
         def on_reply(line: Optional[str], pin=pin, state=state):
-            if (line or '').strip() == 'OK':
+            if (line or '').strip() == 'ACK_R':
                 if state:
                     self.expected_relay_mask |= (1 << pin)
                 else:
@@ -393,7 +412,7 @@ class FaduinoController(QObject):
         v = self._clamp_dac(value)
         cmd = f"W,{v}"
         def on_reply(line: Optional[str], v=v):
-            if (line or '').strip() == 'OK':
+            if (line or '').strip() == 'ACK_W':
                 self.command_confirmed.emit("W")
                 self.status_message.emit("Faduino", f"RF DAC = {v}")
             else:
@@ -405,7 +424,7 @@ class FaduinoController(QObject):
         v = self._clamp_dac(value)
         cmd = f"D,{v}"
         def on_reply(line: Optional[str], v=v):
-            if (line or '').strip() == 'OK':
+            if (line or '').strip() == 'ACK_D':
                 self.command_confirmed.emit("D")
                 self.status_message.emit("Faduino", f"DC DAC = {v}")
             else:
@@ -426,16 +445,17 @@ class FaduinoController(QObject):
 
     @Slot()
     def force_status_read(self):
-        # S는 통합 상태 응답("OK,mask,rf_for,rf_ref,dc_v,dc_c")
+        # S는 통합 상태 응답("OK_S,mask,rf_for,rf_ref,dc_v,dc_c")
         def on_s(line: Optional[str]):
-            s = (line or '').strip()
-            if not s.startswith('OK'):
+            p = self._parse_ok_and_compute(line or "")
+            if p and p.get("type") == "ERROR":
+                self.command_failed.emit("Faduino", p.get("msg", "ERROR"))
                 return
-            parts = s.split(',')
-            if len(parts) < 2:
+            
+            if not p or p.get("type") != "OK_S":
                 return
             try:
-                relay_mask = int(parts[1])
+                relay_mask = p["relay_mask"]
                 if self._is_first_poll:
                     self.expected_relay_mask = relay_mask; self._is_first_poll = False
                     self.status_message.emit("Faduino", f"초기 릴레이 상태 동기화 완료: {relay_mask}")
@@ -443,80 +463,64 @@ class FaduinoController(QObject):
                     msg = f"릴레이 상태 불일치! 예상: {self.expected_relay_mask}, 실제: {relay_mask}"
                     self.status_message.emit("Faduino(경고)", msg)
                     self.command_failed.emit("Faduino", f"Relay 상태 확인 {msg}")
-                if self.is_rf_active and len(parts) >= 4:
-                    rf_for_raw = float(parts[2]); rf_ref_raw = float(parts[3])
-                    rf_for = max(0.0, (RF_PARAM_ADC_TO_WATT * rf_for_raw) + RF_OFFSET_ADC_TO_WATT)
-                    rf_ref_v = (rf_ref_raw / ADC_FULL_SCALE) * ADC_INPUT_VOLT
-                    rf_ref = max(0.0, rf_ref_v * RF_WATT_PER_VOLT)
-                    self.rf_forward, self.rf_reflected = rf_for, rf_ref
-                    self.rf_power_updated.emit(rf_for, rf_ref)
-                if self.is_dc_active and len(parts) >= 6:
-                    dc_v_raw = float(parts[4]); dc_c_raw = float(parts[5])
-                    dc_v = max(0.0, (DC_PARAM_ADC_TO_VOLT * dc_v_raw) + DC_OFFSET_ADC_TO_VOLT)
-                    dc_c = max(0.0, (DC_PARAM_ADC_TO_AMP  * dc_c_raw) + DC_OFFSET_ADC_TO_AMP)
-                    dc_p = dc_v * dc_c
-                    self.dc_voltage, self.dc_current = dc_v, dc_c
-                    self.dc_power_updated.emit(dc_p, dc_v, dc_c)
+
+                if self.is_rf_active and "rf" in p:
+                    self._update_rf(*p["rf"])
+                if self.is_dc_active and "dc" in p:
+                    self._update_dc(*p["dc"])
             except Exception:
                 pass
         self.enqueue('S\r', on_s, timeout_ms=FADUINO_TIMEOUT_MS, gap_ms=FADUINO_GAP_MS, tag='[FORCE S]')
 
     @Slot()
     def force_rf_read(self):
-        # r → "OK,rf_for_raw,rf_ref_raw"
+        # r → "OK_r,rf_for_raw,rf_ref_raw"
         def on_r(line: Optional[str]):
-            s = (line or '').strip()
-            if not s.startswith('OK'):
+            p = self._parse_ok_and_compute(line or "")
+            if p and p.get("type") == "ERROR":
+                self.command_failed.emit("Faduino", p.get("msg", "ERROR"))
                 return
-            parts = s.split(',')
-            if len(parts) != 3:
+            
+            if not p or p.get("type") != "OK_r":
                 return
             try:
-                if self.is_rf_active:
-                    rf_for_raw = float(parts[1]); rf_ref_raw = float(parts[2])
-                    rf_for = max(0.0, (RF_PARAM_ADC_TO_WATT * rf_for_raw) + RF_OFFSET_ADC_TO_WATT)
-                    rf_ref_v = (rf_ref_raw / ADC_FULL_SCALE) * ADC_INPUT_VOLT
-                    rf_ref = max(0.0, rf_ref_v * RF_WATT_PER_VOLT)
-                    self.rf_forward, self.rf_reflected = rf_for, rf_ref
-                    self.rf_power_updated.emit(rf_for, rf_ref)
+                if self.is_rf_active and "rf" in p:
+                    self._update_rf(*p["rf"])
             except Exception:
                 pass
         self.enqueue('r\r', on_r, timeout_ms=FADUINO_TIMEOUT_MS, gap_ms=FADUINO_GAP_MS, tag='[FORCE r]')
 
     @Slot()
     def force_dc_read(self):
-        # d → "OK,dc_v_raw,dc_c_raw"
+        # d → "OK_d,dc_v_raw,dc_c_raw"
         def on_d(line: Optional[str]):
-            s = (line or '').strip()
-            if not s.startswith('OK'):
+            p = self._parse_ok_and_compute(line or "")
+            if p and p.get("type") == "ERROR":
+                self.command_failed.emit("Faduino", p.get("msg", "ERROR"))
                 return
-            parts = s.split(',')
-            if len(parts) != 3:
+            
+            if not p or p.get("type") != "OK_d":
                 return
             try:
-                if self.is_dc_active:
-                    dc_v_raw = float(parts[1]); dc_c_raw = float(parts[2])
-                    dc_v = max(0.0, (DC_PARAM_ADC_TO_VOLT * dc_v_raw) + DC_OFFSET_ADC_TO_VOLT)
-                    dc_c = max(0.0, (DC_PARAM_ADC_TO_AMP  * dc_c_raw) + DC_OFFSET_ADC_TO_AMP)
-                    dc_p = dc_v * dc_c
-                    self.dc_voltage, self.dc_current = dc_v, dc_c
-                    self.dc_power_updated.emit(dc_p, dc_v, dc_c)
+                if self.is_dc_active and "dc" in p:
+                    self._update_dc(*p["dc"])
             except Exception:
                 pass
         self.enqueue('d\r', on_d, timeout_ms=FADUINO_TIMEOUT_MS, gap_ms=FADUINO_GAP_MS, tag='[FORCE d]')
 
     @Slot()
     def force_pin_read(self):
-        # P → "OK,relay_mask"
+        # P → "OK_P,relay_mask"
         def on_p(line: Optional[str]):
-            s = (line or '').strip()
-            if not s.startswith('OK'):
+            p = self._parse_ok_and_compute(line or "")
+            if p and p.get("type") == "ERROR":
+                self.command_failed.emit("Faduino", p.get("msg", "ERROR"))
                 return
-            parts = s.split(',')
-            if len(parts) != 2:
+
+            if not p or p.get("type") != "OK_P":
                 return
             try:
-                relay_mask = int(parts[1])
+                relay_mask = p["relay_mask"]
                 if self._is_first_poll:
                     self.expected_relay_mask = relay_mask
                     self._is_first_poll = False
@@ -528,6 +532,98 @@ class FaduinoController(QObject):
             except Exception:
                 pass
         self.enqueue('P\r', on_p, timeout_ms=FADUINO_TIMEOUT_MS, gap_ms=FADUINO_GAP_MS, tag='[FORCE P]')
+
+    # ------------- 통합 파싱 + 계산 (OK_* 전용) -------------
+    def _parse_ok_and_compute(self, response: str):
+        """
+        한 줄 응답을 파싱하고, RF/DC는 self._compute_*()를 호출해 계산까지 수행.
+        반환 예:
+          {"type":"OK_S","relay_mask":int,"rf":(rf_for_w,rf_ref_w),"dc":(dc_p_w,dc_v_v,dc_c_a)}
+          {"type":"OK_r","rf":(rf_for_w,rf_ref_w)}
+          {"type":"OK_d","dc":(dc_p_w,dc_v_v,dc_c_a)}
+          {"type":"OK_P","relay_mask":int}
+          {"type":"ACK_R"} / {"type":"ACK_W"} / {"type":"ACK_D"}
+          {"type":"ERROR","msg":str}
+        포맷 불일치/변환 실패 시 None
+        """
+        s = (response or "").strip()
+
+        # ---- 전체 상태: OK_S,<relay>,<rf_for>,<rf_ref>,<dc_v>,<dc_c>
+        if s.startswith("OK_S,"):
+            parts = s.split(",")
+            if len(parts) != 6:
+                return None
+            try:
+                relay_mask = int(parts[1])
+                rf_for, rf_ref = self._compute_rf(parts[2], parts[3])
+                dc_p, dc_v, dc_c = self._compute_dc(parts[4], parts[5])
+                return {"type": "OK_S", "relay_mask": relay_mask, "rf": (rf_for, rf_ref), "dc": (dc_p, dc_v, dc_c)}
+            except Exception:
+                return None
+
+        # ---- 릴레이 상태만: OK_P,<relay_mask>
+        if s.startswith("OK_P,"):
+            parts = s.split(",")
+            if len(parts) != 2:
+                return None
+            try:
+                return {"type": "OK_P", "relay_mask": int(parts[1])}
+            except Exception:
+                return None
+
+        # ---- RF만: OK_r,<rf_for>,<rf_ref>
+        if s.startswith("OK_r,"):
+            parts = s.split(",")
+            if len(parts) != 3:
+                return None
+            try:
+                rf_for, rf_ref = self._compute_rf(parts[1], parts[2])
+                return {"type": "OK_r", "rf": (rf_for, rf_ref)}
+            except Exception:
+                return None
+
+        # ---- DC만: OK_d,<dc_v>,<dc_c>
+        if s.startswith("OK_d,"):
+            parts = s.split(",")
+            if len(parts) != 3:
+                return None
+            try:
+                dc_p, dc_v, dc_c = self._compute_dc(parts[1], parts[2])
+                return {"type": "OK_d", "dc": (dc_p, dc_v, dc_c)}
+            except Exception:
+                return None
+
+        # ---- ACK / ERROR
+        if s in ("ACK_R", "ACK_W", "ACK_D"):
+            return {"type": s}
+        if s.startswith("ERROR"):
+            return {"type": "ERROR", "msg": s}
+
+        return None
+
+    # ------------- 공용 계산 함수 -------------
+    def _compute_rf(self, rf_for_raw, rf_ref_raw):
+        rf_for_raw = float(rf_for_raw); rf_ref_raw = float(rf_ref_raw)
+        rf_for = max(0.0, (RF_PARAM_ADC_TO_WATT * rf_for_raw) + RF_OFFSET_ADC_TO_WATT)
+        rf_ref_v = (rf_ref_raw / ADC_FULL_SCALE) * ADC_INPUT_VOLT
+        rf_ref = max(0.0, rf_ref_v * RF_WATT_PER_VOLT)
+        return rf_for, rf_ref
+
+    def _compute_dc(self, dc_v_raw, dc_c_raw):
+        dc_v_raw = float(dc_v_raw); dc_c_raw = float(dc_c_raw)
+        dc_v = max(0.0, (DC_PARAM_ADC_TO_VOLT * dc_v_raw) + DC_OFFSET_ADC_TO_VOLT)
+        dc_c = max(0.0, (DC_PARAM_ADC_TO_AMP  * dc_c_raw) + DC_OFFSET_ADC_TO_AMP)
+        dc_p = dc_v * dc_c
+        return dc_p, dc_v, dc_c
+    
+    # ------------- 공용 업데이트 함수 -------------
+    def _update_rf(self, rf_for, rf_ref):
+        self.rf_forward, self.rf_reflected = rf_for, rf_ref
+        self.rf_power_updated.emit(rf_for, rf_ref)
+
+    def _update_dc(self, dc_p, dc_v, dc_c):
+        self.dc_voltage, self.dc_current = dc_v, dc_c
+        self.dc_power_updated.emit(dc_p, dc_v, dc_c)
 
     # ------------- 상태 플래그 연동 -------------
     @Slot(bool)
@@ -549,3 +645,13 @@ class FaduinoController(QObject):
         if v < 0: v = 0
         if v > DAC_FULL_SCALE: v = DAC_FULL_SCALE
         return v
+    
+    def _safe_callback(self, callback: Callable, *args):
+        """안전한 콜백 실행"""
+        try:
+            callback(*args)
+        except Exception as e:
+            self._dprint(traceback.format_exc())
+            self._dprint(f"[ERROR] Callback failed: {e}")
+            self.status_message.emit("Faduino", f"콜백 오류: {e}")
+

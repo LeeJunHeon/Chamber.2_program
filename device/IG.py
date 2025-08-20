@@ -461,7 +461,8 @@ class IGController(QObject):
     # =================================================
     # 외부 API
     # =================================================
-    @Slot(float, int)
+    @Slot(float)        # Signal(float)과 호환
+    @Slot(float, int)   # 필요 시 명시적 interval로도 호출 가능
     def start_wait_for_pressure(self, base_pressure: float, interval_ms: int = IG_POLLING_INTERVAL_MS):
         """
         총 대기시간(IG_WAIT_TIMEOUT) 내 목표 압력(base_pressure)에 도달할 때까지

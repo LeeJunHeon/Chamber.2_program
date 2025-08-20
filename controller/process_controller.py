@@ -322,6 +322,7 @@ class ProcessController(QObject):
             return
             
     @Slot()
+    @Slot(bool)
     def on_step_completed(self):
         """
         한 스텝이 완료되면 다음 스텝을 준비하고 실행합니다.
@@ -468,6 +469,7 @@ class ProcessController(QObject):
         self.process_finished.emit(was_successful)
 
     @Slot()
+    @Slot(bool)
     def abort_process(self):
         """[수정됨] 외부에서 공정을 강제 중단시킬 때, 안전 종료 절차를 '시작'합니다."""
 

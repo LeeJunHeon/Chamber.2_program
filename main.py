@@ -257,6 +257,7 @@ class MainWindow(QWidget):
         self.ui.Stop_button.setEnabled(running)
 
     @Slot()
+    @Slot(bool)
     def on_process_list_button_clicked(self):
         """파일 선택 버튼을 눌렀을 때 CSV 파일을 열고 파싱 + UI 갱신"""
         file_path, _ = QFileDialog.getOpenFileName(
@@ -355,24 +356,24 @@ class MainWindow(QWidget):
     def _check_and_connect_devices(self):
         """모든 장비의 연결을 확인하고, 끊겨있으면 연결을 시도합니다. 하나라도 실패하면 False를 반환합니다."""
 
-        # Faduino (QSerialPort)
+        # Faduino (QSerialPort + 워치독: 즉시 실패해도 백그라운드 재시도)
         if not getattr(self.faduino_controller, "serial_faduino", None) \
         or not self.faduino_controller.serial_faduino.isOpen():
             self.faduino_controller.connect_faduino()  # 성공/실패는 Faduino 워치독이 재시도
         
-        # MFC (QSerialPort)
+        # MFC (QSerialPort + 워치독: 즉시 실패해도 백그라운드 재시도)
         if not getattr(self.mfc_controller, "serial_mfc", None) \
         or not self.mfc_controller.serial_mfc.isOpen():
             self.mfc_controller.connect_mfc_device()  # 성공/실패는 MFC 워치독이 재시도
+
+        # 3. IG (QSerialPort + 워치독: 즉시 실패해도 백그라운드 재시도)
+        if not getattr(self.ig_controller, "serial_ig", None) \
+        or not self.ig_controller.serial_ig.isOpen():
+            self.ig_controller.connect_ig_device()  # 성공/실패는 IG 워치독이 재시도
             
-        # 3. OES (main에서 쓰레드를 사용하니 보완필요)
+        # 4. OES (main에서 쓰레드를 사용하니 보완필요)
         if self.oes_controller.sChannel < 0:
             if not self.oes_controller.initialize_device(): 
-                return False
-            
-        # 4. IG
-        if not self.ig_controller.serial_ig:
-            if not self.ig_controller.connect_device(): 
                 return False
         
         self.append_log("MAIN", "모든 장비가 성공적으로 연결되었습니다.")
@@ -533,6 +534,7 @@ class MainWindow(QWidget):
         }
 
     @Slot()
+    @Slot(bool)
     def on_start_button_clicked(self):
         """
         Start 버튼 클릭 시:

@@ -11,7 +11,10 @@ MFC.py — PyQt6 QSerialPort(완전 비동기) 기반 MFC 컨트롤러
 """
 
 from __future__ import annotations
-from typing import Callable, Optional, Tuple, List
+import traceback
+from collections import deque
+from dataclasses import dataclass
+from typing import Deque, Callable, Optional
 import re
 
 from PyQt6.QtCore import QObject, QTimer, QIODeviceBase, pyqtSignal as Signal, pyqtSlot as Slot
@@ -23,6 +26,17 @@ from PyQt6.QtSerialPort import QSerialPort, QSerialPortInfo
 #  - MFC_COMMANDS: 장비별 명령 포맷 람다/함수 맵
 #  - FLOW_ERROR_TOLERANCE, FLOW_ERROR_MAX_COUNT: 안정화/경고 기준
 #  - MFC_SCALE_FACTORS: 채널별 스케일(예: {1:1.0, 2:10.0, 3:10.0})
+
+@dataclass
+class Command:
+    cmd_str: str
+    callback: Callable[[Optional[str]], None]
+    timeout_ms: int
+    gap_ms: int
+    tag: str
+    retries_left: int
+    allow_no_reply: bool
+
 from lib.config import (
     MFC_PORT,
     MFC_BAUD,
@@ -72,8 +86,8 @@ class MFCController(QObject):
         self._rx = bytearray()
 
         # (3) 명령 큐: (cmd_str, on_reply, timeout_ms, gap_ms, tag, retries_left, allow_no_reply)
-        self._cmd_q: List[Tuple[str, Callable[[Optional[str]], None], int, int, str, int, bool]] = []
-        self._inflight: Optional[Tuple[str, Callable[[Optional[str]], None], int, int, str, int, bool]] = None
+        self._cmd_q: Deque[Command] = deque()
+        self._inflight: Optional[Command] = None
 
         # (4) 타이머: 명령 타임아웃/인터커맨드 간격/폴링/안정화/워치독
         self._cmd_timer = QTimer(self); self._cmd_timer.setSingleShot(True)
@@ -112,6 +126,11 @@ class MFCController(QObject):
         self._stabilizing_channel = None
         self._stabilizing_target  = 0.0     # 장비 단위
         self._pending_cmd_for_timer = None  # "FLOW_ON" 고정 보고용
+
+        self._RX_MAX = 16 * 1024   # 최대 16 KiB
+        self._LINE_MAX = 512       # 한 줄 최대 길이
+        self._overflow_count = 0
+        self._reconnect_pending = False
 
     # ---------- 내부 디버그 프린트 ----------
     def _dprint(self, *args):
@@ -157,16 +176,6 @@ class MFCController(QObject):
         try: return [float(x) for x in nums]
         except Exception: return None
 
-    # def _bits_to_list(self, bits: str) -> list[int]:
-    #     return [i+1 for i, b in enumerate(bits[:4]) if b == '1']
-
-    # def _list_to_bits(self, on_list: list[int], ch_cnt: int = 4) -> str:
-    #     bits = ['0'] * ch_cnt
-    #     for ch in on_list:
-    #         if 1 <= ch <= ch_cnt:
-    #             bits[ch-1] = '1'
-    #     return ''.join(bits)
-
     # ---------- 연결/해제 & 워치독 ----------
     def connect_mfc_device(self) -> bool:
         """포트를 열고 워치독 시작. 실패해도 워치독이 재연결 시도."""
@@ -197,26 +206,39 @@ class MFCController(QObject):
         self.serial_mfc.clear(QSerialPort.Direction.AllDirections)
         self._rx.clear()
         self._reconnect_backoff_ms = MFC_RECONNECT_BACKOFF_START_MS
+        self._reconnect_pending = False   # ← 추가
         msg = f"{MFC_PORT} 연결 성공 (PyQt6 QSerialPort)"
         self.status_message.emit("MFC", msg); self._dprint(f"[MFC] {msg}")
         return True
 
     def _watch_connection(self):
         """주기적으로 연결 상태 확인. 끊겨 있으면 백오프로 재연결."""
-        if not self._want_connected:
+        if not self._want_connected or self.serial_mfc.isOpen():
             return
-        if self.serial_mfc.isOpen():
-            return
+        if self._reconnect_pending:
+            return # ▼ 이미 예약되어 있으면 중복 예약 금지
+        self._reconnect_pending = True
         msg = f"재연결 시도... ({self._reconnect_backoff_ms} ms)"
         self.status_message.emit("MFC", msg); self._dprint(f"[MFC] {msg}")
         QTimer.singleShot(self._reconnect_backoff_ms, self._try_reconnect)
 
     def _try_reconnect(self):
+        # ▼ 예약 상태 해제 (이 호출이 실행됐으니 새 예약 허용)
+        self._reconnect_pending = False
+
+        # 연결 의사 없거나 이미 열려 있으면 중단  ← 추가
+        if not self._want_connected or self.serial_mfc.isOpen():
+            return
+
         if self._open_port():
             msg = "재연결 성공. 대기 중 명령 재개."
             self.status_message.emit("MFC", msg); self._dprint(f"[MFC] {msg}")
             self._dequeue_and_send()   # 재연결 즉시 전송 재개
+            # 성공 시 백오프 초기화
+            self._reconnect_backoff_ms = MFC_RECONNECT_BACKOFF_START_MS
             return
+        
+        # 실패 시 백오프 확장
         self._reconnect_backoff_ms = min(self._reconnect_backoff_ms * 2, MFC_RECONNECT_BACKOFF_MAX_MS)
 
     @Slot()
@@ -228,11 +250,22 @@ class MFCController(QObject):
         self._cmd_timer.stop()
         self._gap_timer.stop()
         self._watchdog.stop()
-        self._cmd_q.clear()
-        self._inflight = None
+        self._reconnect_pending = False   # ← 추가
+
+        # ▼ inflight 취소 통지
+        if self._inflight is not None:
+            self._safe_callback(self._inflight.callback, None)
+            self._inflight = None
+
+        # ▼ 대기 큐도 모두 취소 통지
+        while self._cmd_q:
+            pending = self._cmd_q.popleft()
+            self._safe_callback(pending.callback, None)
+
         self._stabilizing_channel = None
         self._stabilizing_target = 0.0
         self._pending_cmd_for_timer = None
+
         if self.serial_mfc.isOpen():
             self.serial_mfc.close()
             msg = "시리얼 포트를 안전하게 닫았습니다."
@@ -242,92 +275,140 @@ class MFCController(QObject):
     def _on_serial_error(self, err: QSerialPort.SerialPortError):
         if err == QSerialPort.SerialPortError.NoError:
             return
+        
         err_name = getattr(err, "name", str(err))
         err_code = getattr(err, "value", "?")
         msg = f"시리얼 오류: {self.serial_mfc.errorString()} (err={err_name}/{err_code})"
         self.status_message.emit("MFC", msg); self._dprint(f"[MFC] {msg}")
-        # 진행 중 명령을 되돌리고 재연결 준비
+
+        # 진행 중 명령 되돌리기(필드 사용)
         if self._inflight is not None:
-            cmd_str, on_reply, timeout_ms, gap_ms, tag, retries_left, allow_no_reply = self._inflight
+            cmd = self._inflight
             self._cmd_timer.stop()
             self._inflight = None
-            if retries_left > 0:
-                self._cmd_q.insert(0, (cmd_str, on_reply, timeout_ms, gap_ms, tag, retries_left - 1, allow_no_reply))
+            if cmd.retries_left > 0:
+                cmd.retries_left -= 1
+                self._cmd_q.appendleft(cmd)  # 그대로 되돌림
             else:
-                try:
-                    on_reply(None)
-                except Exception:
-                    pass
+                self._safe_callback(cmd.callback, None)
 
-        # 포트 닫고 재연결 시도
+        # 포트 재연결
         if self.serial_mfc.isOpen():
             self.serial_mfc.close()
+
+        self._rx.clear()    # 수신 버퍼도 즉시 초기화
         self._try_reconnect()
 
     def _on_ready_read(self):
-        """줄(\r/\n) 단위 수신 → 에코 라인은 건너뛰고, 실제 응답 한 줄을 전달"""
-        self._rx += self.serial_mfc.readAll().data()
+        """줄(\r/\n) 단위 수신 → 에코 라인은 건너뛰고, 실제 응답 한 줄을 전달 (단순 모드)"""
+        ba = self.serial_mfc.readAll()
+        if ba.isEmpty():
+            return
 
+        # 1) 버퍼 누적
+        self._rx.extend(bytes(ba))
+
+        # RX 오버플로우: 최근 RX_MAX 바이트만 유지(테일 보존, in-place)
+        if len(self._rx) > self._RX_MAX:
+            del self._rx[:-self._RX_MAX]  # 앞부분 통으로 버리고 꼬리만 보존
+            self._overflow_count += 1
+            if self._overflow_count % 5 == 1:
+                try:
+                    self.status_message.emit("MFC", f"수신 버퍼 과다(RX>{self._RX_MAX}); 최근 {self._RX_MAX}B만 보존.")
+                except Exception:
+                    pass
+            try:
+                self._dprint(f"[WARN] RX overflow: keep tail {len(self._rx)}B")
+            except Exception:
+                pass
+
+        # 3) 줄 경계(\r/\n) 기준으로 라인 단위 파싱
         while True:
-            r = self._rx.find(b'\r')
-            n = self._rx.find(b'\n')
-            idxs = [i for i in (r, n) if i != -1]
-            if not idxs:
+            i_cr = self._rx.find(b'\r')
+            i_lf = self._rx.find(b'\n')
+            if i_cr == -1 and i_lf == -1:
                 break
-            end = min(idxs)
 
-            line_bytes = self._rx[:end]
-            rest = self._rx[end+1:]
-            # 연속 CR/LF 제거
-            while rest[:1] in (b'\r', b'\n'):
-                rest = rest[1:]
-            self._rx = rest
+            idx = i_cr if i_lf == -1 else (i_lf if i_cr == -1 else min(i_cr, i_lf))
+            line_bytes = self._rx[:idx]
+
+            # CRLF 또는 LFCR 쌍을 한 번에 건너뛰기
+            drop = idx + 1
+            if drop < len(self._rx):
+                ch = self._rx[idx]
+                nxt = self._rx[idx + 1]
+                if (ch == 13 and nxt == 10) or (ch == 10 and nxt == 13):
+                    drop += 1
+            del self._rx[:drop]
+
+            # 라인 길이 제한(앞부분만 보존: 토큰/프리픽스 유지)
+            if len(line_bytes) > self._LINE_MAX:
+                over = len(line_bytes) - self._LINE_MAX
+                self._dprint(f"[WARN] RX line too long (+{over}B), truncating tail; keep {self._LINE_MAX}B")
+                line_bytes = line_bytes[:self._LINE_MAX]
 
             try:
                 line = line_bytes.decode('ascii', errors='ignore').strip()
             except Exception:
                 line = None
 
-            # 에코 라인(보낸 명령과 동일) 무시
-            if self._inflight and line:
-                sent_cmd_str = self._inflight[0].strip()  # ex) "R61\r" -> "R61"
+            if not line:
+                # 빈 줄은 패스하고 다음 라인 검사
+                continue
+
+            # 에코 라인(보낸 명령 그대로) 스킵 — 문자열만 비교
+            if self._inflight:
+                sent_cmd_str = (self._inflight.cmd_str or "").strip()
                 if line == sent_cmd_str:
                     self._dprint(f"[RECV] echo skipped: {repr(line)}")
+                    # 유효 응답을 아직 못 받았으므로 계속 다음 라인 검사
                     continue
 
+            # === 여기서 유효 응답 1줄만 처리하고 종료 ===
             self._dprint(f"[RECV] {repr(line)}")
             self._finish_command(line)
-            return
+            break  # 한 번의 readyRead에서 유효 응답은 1줄만 처리
+
+        # 4) 앞쪽에 남은 연속 CR/LF만 정리(빈 라인 재처리 방지)
+        while self._rx[:1] in (b'\r', b'\n'):
+            del self._rx[0:1]
 
     # ---------- 명령 큐(완전 비동기) ----------
     def enqueue(self, cmd_str: str, on_reply: Callable[[Optional[str]], None],
-                timeout_ms: int = MFC_TIMEOUT, gap_ms: int = MFC_GAP_MS, tag: str = "", retries_left: int = 5,
+                timeout_ms: int = MFC_TIMEOUT, gap_ms: int = MFC_GAP_MS,
+                tag: str = "", retries_left: int = 5,
                 allow_no_reply: bool = False):
+        
         """명령을 큐에 넣고, inflight가 비었으면 즉시 송신."""
         if not cmd_str.endswith('\r'):
             cmd_str += '\r'
-        self._cmd_q.append((cmd_str, on_reply, timeout_ms, gap_ms, tag, retries_left, allow_no_reply))
+
+        self._cmd_q.append(Command(cmd_str, on_reply, timeout_ms, gap_ms, tag, retries_left, allow_no_reply))
+        
         if (self._inflight is None) and (not self._gap_timer.isActive()):
-            self._dequeue_and_send()
+            # ✅ 다음 이벤트 루프 틱에 송신 → 재진입/중첩 호출 방지(Faduino와 통일)
+            QTimer.singleShot(0, self._dequeue_and_send)
 
     def _dequeue_and_send(self):
-        if self._inflight is not None or not self._cmd_q:
+        if self._inflight is not None or not self._cmd_q or not self.serial_mfc.isOpen():
             return
-        if not self.serial_mfc.isOpen():
-            return  # 워치독이 재연결 후 다시 시도
-        self._inflight = self._cmd_q.pop(0)
-        cmd_str, _, timeout_ms, _, tag, _, _allow_no_reply = self._inflight
+        self._inflight = self._cmd_q.popleft()
+        cmd = self._inflight
         self._rx.clear()
         # 전송 직전 프린트
-        self._dprint(f"[SEND] {cmd_str.strip()} (tag={tag})")
-        self.status_message.emit("MFC > 전송", f"{tag or ''} {cmd_str.strip()}".strip())
-        self.serial_mfc.write(cmd_str.encode('ascii'))
+        self._dprint(f"[SEND] {cmd.cmd_str.strip()} (tag={cmd.tag})")
+        self.status_message.emit("MFC > 전송", f"{cmd.tag or ''} {cmd.cmd_str.strip()}".strip())
+
+        self.serial_mfc.write(cmd.cmd_str.encode('ascii'))
         self.serial_mfc.flush()
-        self._cmd_timer.start(timeout_ms)
+        self._cmd_timer.start(cmd.timeout_ms)
 
     def _on_cmd_timeout(self):
         """타임아웃 → 콜백에 None (allow_no_reply에 따라 처리)"""
-        if self._inflight and self._inflight[6]:  # allow_no_reply
+        if not self._inflight:
+            return
+        cmd = self._inflight
+        if cmd.allow_no_reply:
             self._dprint("[NOTE] no-reply command; proceeding after write")
         else:
             self._dprint("[TIMEOUT] command response timed out")
@@ -336,46 +417,30 @@ class MFCController(QObject):
     def _finish_command(self, line: Optional[str]):
         if self._inflight is None:
             return
-        cmd_str, on_reply, _timeout_ms, gap_ms, tag, retries_left, allow_no_reply = self._inflight
+        cmd = self._inflight
         self._cmd_timer.stop()
         self._inflight = None
 
         # 응답 없음 처리
         if line is None:
-            if allow_no_reply:
-                self._dprint(f"[RECV] (no response allowed; proceed) tag={tag}")
-                # 응답이 없어도 되는 명령 → 성공 흐름으로 콜백을 호출하고 진행
-                try:
-                    on_reply(None)
-                except Exception as e:
-                    self.status_message.emit("MFC", f"콜백 처리 예외: {e}"); self._dprint(f"[ERR] callback: {e}")
-                self._gap_timer.start(gap_ms)
+            if cmd.allow_no_reply:
+                self._safe_callback(cmd.callback, None)
+                self._gap_timer.start(cmd.gap_ms)
                 return
-
-            # 그 외에는 재연결/재전송 시도
-            if retries_left > 0:
-                self._dprint(f"[RETRY] re-enqueue (left={retries_left-1}) tag={tag}")
-                self._cmd_q.insert(0, (cmd_str, on_reply, _timeout_ms, gap_ms, tag, retries_left - 1, allow_no_reply))
+            if cmd.retries_left > 0:
+                cmd.retries_left -= 1
+                self._cmd_q.appendleft(cmd)
                 if self.serial_mfc.isOpen():
                     self.serial_mfc.close()
                 self._try_reconnect()
                 return
-            else:
-                self._dprint(f"[FAIL] retries exhausted tag={tag}")
-                try:
-                    on_reply(None)
-                except Exception as e:
-                    self.status_message.emit("MFC", f"콜백 처리 예외: {e}"); self._dprint(f"[ERR] callback: {e}")
-                self._gap_timer.start(gap_ms)
-                return
+            self._safe_callback(cmd.callback, None)
+            self._gap_timer.start(cmd.gap_ms)
+            return
 
-        # 정상 응답이면 기존처럼 콜백
-        try:
-            on_reply((line or "").strip())
-        except Exception as e:
-            self.status_message.emit("MFC", f"콜백 처리 예외: {e}"); self._dprint(f"[ERR] callback: {e}")
-
-        self._gap_timer.start(gap_ms)
+        # 정상 응답
+        self._safe_callback(cmd.callback, line)
+        self._gap_timer.start(cmd.gap_ms)
 
     # ---------- 폴링(큐로 통합: 충돌 제거) ----------
     @Slot(bool)
@@ -406,22 +471,33 @@ class MFCController(QObject):
     @Slot()
     def abort_current_command(self):
         """현재 진행 중인 명령/안정화/큐를 중단(상위 stop_process와 연동)."""
-        if not self._is_aborted:
-            self._is_aborted = True
-            self._cmd_q.clear()
-            if self._inflight:
-                _, on_reply, _t, _g, tag, _r, _anr = self._inflight
-                self._inflight = None
-                try:
-                    on_reply(None)
-                except Exception:
-                    pass
-                self.status_message.emit("MFC", f"현재 명령({tag}) 중단"); self._dprint(f"[RUN] abort {tag}")
-            if self.stabilization_timer.isActive():
-                self.stabilization_timer.stop()
-            self._stabilizing_channel = None
-            self._stabilizing_target = 0.0
-            self._pending_cmd_for_timer = None
+        if self._is_aborted:
+            return
+
+        self._is_aborted = True
+
+        # ▼ 추가: 타이머 먼저 정지
+        self._cmd_timer.stop()
+        self._gap_timer.stop()
+
+        # 대기 큐: 모두 취소 통지
+        while self._cmd_q:
+            pending = self._cmd_q.popleft()
+            self._safe_callback(pending.callback, None)
+
+        # 진행 중 명령: 취소 통지
+        if self._inflight:
+            tag = self._inflight.tag
+            self._safe_callback(self._inflight.callback, None)
+            self._inflight = None
+            self.status_message.emit("MFC", f"현재 명령({tag}) 중단"); self._dprint(f"[RUN] abort {tag}")
+
+        # 안정화 정리
+        if self.stabilization_timer.isActive():
+            self.stabilization_timer.stop()
+        self._stabilizing_channel = None
+        self._stabilizing_target = 0.0
+        self._pending_cmd_for_timer = None
 
     @Slot(str, dict)
     def handle_command(self, cmd: str, params: dict):
@@ -679,72 +755,6 @@ class MFCController(QObject):
             tag="[VERIFY R69]",
         )
 
-
-    # def _check_channel_on_async(self, ch: int, attempt: int = 1, max_attempts: int = 5, delay_ms: int = 1000):
-    #     cmd = MFC_COMMANDS['READ_MFC_ON_OFF_STATUS']
-    #     def on_reply(line: Optional[str], ch=ch, attempt=attempt):
-    #         bits = self._parse_r69_bits((line or "").strip())
-    #         is_on = (1 <= ch <= len(bits)) and (bits[ch-1] == '1')
-    #         if is_on:
-    #             self._stabilizing_channel = ch
-    #             self._stabilizing_target  = float(self.last_setpoints.get(ch, 0.0))
-    #             self._pending_cmd_for_timer = "FLOW_ON"
-    #             msg = f"Ch{ch} Flow ON 확인. 유량 안정화 시작..."
-    #             self.status_message.emit("MFC < 확인", msg); self._dprint(f"[OK ] {msg}")
-    #             self.stabilization_attempts = 0
-    #             self.stabilization_timer.start()
-    #             self.command_confirmed.emit("FLOW_ON")
-    #         else:
-    #             if attempt < max_attempts:
-    #                 # ✅ (추가) 짝수 차수(2,4번째) 재시도에서 원 명령을 한 번 더 보냄
-    #                 if attempt in (2, 4):
-    #                     resend_cmd = MFC_COMMANDS['FLOW_ON'](channel=ch)
-    #                     self.enqueue(
-    #                         resend_cmd,
-    #                         lambda _l: None,
-    #                         timeout_ms=1000,
-    #                         gap_ms=200,
-    #                         tag=f"[RE-ON ch{ch}]",
-    #                         allow_no_reply=True,   # SET류와 유사하게 무응답 허용
-    #                     )
-    #                     self.status_message.emit("MFC", f"FLOW_ON 재전송 (시도 {attempt}/{max_attempts})")
-
-    #                 self.status_message.emit("WARN", f"[FLOW_ON 검증 재시도] ch{ch} (시도 {attempt}/{max_attempts})")
-    #                 QTimer.singleShot(delay_ms, lambda: self._check_channel_on_async(ch, attempt+1, max_attempts, delay_ms))
-    #             else:
-    #                 self.command_failed.emit("FLOW_ON", f"Ch{ch} ON 상태 미확인"); self._dprint(f"[FAIL] FLOW_ON verify ch{ch}")
-    #     self.enqueue(cmd, on_reply, timeout_ms=1000, gap_ms=200, tag=f"[VERIFY ON ch{ch}]")
-
-    # def _check_channel_off_async(self, ch: int,  attempt: int = 1, max_attempts: int = 5, delay_ms: int = 1000):
-    #     cmd = MFC_COMMANDS['READ_MFC_ON_OFF_STATUS']
-    #     def on_reply(line: Optional[str], ch=ch, attempt=attempt):
-    #         bits = self._parse_r69_bits((line or "").strip())
-    #         is_off = not ((1 <= ch <= len(bits)) and (bits[ch-1] == '1'))
-    #         if is_off:
-    #             msg = f"Ch{ch} Flow OFF 확인."
-    #             self.status_message.emit("MFC < 확인", msg); self._dprint(f"[OK ] {msg}")
-    #             self.command_confirmed.emit("FLOW_OFF")
-    #         else:
-    #             if attempt < max_attempts:
-    #                 # ✅ (추가) 짝수 차수에 원 명령 재전송
-    #                 if attempt in (2, 4):
-    #                     resend_cmd = MFC_COMMANDS['FLOW_OFF'](channel=ch)
-    #                     self.enqueue(
-    #                         resend_cmd,
-    #                         lambda _l: None,
-    #                         timeout_ms=1000,
-    #                         gap_ms=200,
-    #                         tag=f"[RE-OFF ch{ch}]",
-    #                         allow_no_reply=True,
-    #                     )
-    #                     self.status_message.emit("MFC", f"FLOW_OFF 재전송 (시도 {attempt}/{max_attempts})")
-
-    #                 self.status_message.emit("WARN", f"[FLOW_OFF 검증 재시도] ch{ch} (시도 {attempt}/{max_attempts})")
-    #                 QTimer.singleShot(delay_ms, lambda: self._check_channel_off_async(ch, attempt+1, max_attempts, delay_ms))
-    #             else:
-    #                 self.command_failed.emit("FLOW_OFF", f"Ch{ch} OFF 상태 미확인"); self._dprint(f"[FAIL] FLOW_OFF verify ch{ch}")
-    #     self.enqueue(cmd, on_reply, timeout_ms=1000, gap_ms=200, tag=f"[VERIFY OFF ch{ch}]")
-
     def _check_valve_position_async(
         self, 
         origin_cmd: str,
@@ -870,8 +880,7 @@ class MFCController(QObject):
                 else:
                     # 상위 로직에 "이번 틱 실패"만 통지
                     if on_done:
-                        try: on_done(None)
-                        except Exception: pass
+                        self._safe_callback(on_done, None)
                 return
 
             for ch, name in self.gas_map.items():
@@ -886,40 +895,10 @@ class MFCController(QObject):
                         pass
 
             if on_done:
-                try: on_done(vals)
-                except Exception: pass
+                self._safe_callback(on_done, vals)
 
         self.enqueue(MFC_COMMANDS['READ_FLOW_ALL'], on_reply,
                     timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS, tag=tag)
-
-    # def _read_flow_async(self, ch: int, tag: str = ""):
-    #     cmd = MFC_COMMANDS['READ_FLOW'](channel=ch)          # 1→R61, 2→R62, 3→R63, 4→R64
-    #     expected = self._q_prefixes_for('READ_FLOW', ch)     # ('Q{ch}',)
-
-
-    #     def on_reply(line: Optional[str]):
-    #         line = (line or "").strip()
-    #         val = self._parse_q_value_with_prefixes(line, expected)
-
-    #         # Q 접두사인데 Q{ch}가 아니면(오채널/잡음) 짧게 재시도(시도 카운트 증가 X)
-    #         if val is None and line.startswith('Q'):
-    #             self.status_message.emit("DBG", f"[READ_FLOW] 접두사 불일치: 기대 {expected}, 응답 {repr(line)}")
-    #             QTimer.singleShot(150, lambda: self._read_flow_async(ch, tag))
-    #             return
-
-    #         if val is None:
-    #             self.status_message.emit("MFC(DBG)", f"READ_FLOW raw[{ch}]: {repr(line)}")
-    #             self.command_failed.emit("READ_FLOW", "응답 없음/포맷 불일치")
-    #             return
-
-    #         try:
-    #             sf = MFC_SCALE_FACTORS.get(ch, 1.0)
-    #             self.update_flow.emit(self.gas_map.get(ch, f"Ch{ch}"), val / sf)
-    #             self.command_confirmed.emit("READ_FLOW")
-    #         except Exception:
-    #             self.command_failed.emit("READ_FLOW", "파싱 실패")
-
-    #     self.enqueue(cmd, on_reply, timeout_ms=1000, gap_ms=150, tag=tag or f"[READ_FLOW ch{ch}]")
 
     def _read_pressure_async(self, tag: str = ""):
         cmd = MFC_COMMANDS['READ_PRESSURE']
@@ -1010,3 +989,12 @@ class MFCController(QObject):
             payload = s
         bits = "".join(ch for ch in payload if ch in "01")
         return bits[:4]
+    
+    def _safe_callback(self, callback: Callable, *args):
+        try:
+            callback(*args)
+        except Exception as e:
+            self._dprint(traceback.format_exc())
+            self._dprint(f"[ERROR] Callback failed: {e}")
+            self.status_message.emit("MFC", f"콜백 오류: {e}")
+

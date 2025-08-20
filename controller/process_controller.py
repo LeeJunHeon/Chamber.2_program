@@ -1,34 +1,7 @@
 # process_controller.py
 
-from typing import Optional, Tuple
-from dataclasses import dataclass
-from enum import Enum, auto
+from typing import Optional
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal as Signal, pyqtSlot as Slot
-
-# 프로세스 리스트를 만들기 위한 Enum 및 Dataclass 정의
-class ActionType(Enum):
-    """공정 단계에서 사용될 모든 Action의 종류를 정의합니다."""
-    IG_CMD = auto()
-    RGA_SCAN = auto()
-    MFC_CMD = auto()
-    FADUINO_CMD = auto()
-    DELAY = auto()
-    DC_POWER_SET = auto()
-    RF_POWER_SET = auto()
-    DC_POWER_STOP = auto()
-    RF_POWER_STOP = auto()
-    OES_RUN = auto() 
-
-@dataclass
-class ProcessStep:
-    """하나의 공정 단계를 정의하는 데이터클래스입니다."""
-    action: ActionType
-    message: str
-    value: Optional[float] = None
-    params: Optional[Tuple] = None
-    duration: Optional[int] = None
-    parallel: bool = False
-    polling: bool = False
 
 # 병렬처리를 위한 클래스
 class ParallelExecution:
@@ -124,7 +97,7 @@ class ProcessController(QObject):
         dc_power = float(params.get("dc_power", 0))
         rf_power = float(params.get("rf_power", 0))
         
-        steps: list[ProcessStep] = []
+        steps = []
 
         # ======================================================================
         # 2. 공정 단계 리스트 생성 (딕셔너리 방식으로 재구성)

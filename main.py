@@ -175,7 +175,7 @@ class MainWindow(QWidget):
 
         # ProcessController -> 비상 종료: process_aborted 신호 하나로 모든 장비의 cleanup을 실행
         self.process_controller.process_aborted.connect(self.mfc_controller.cleanup)
-        self.process_controller.process_aborted.connect(self.mfc_controller.abort_current_command)
+        #self.process_controller.process_aborted.connect(self.mfc_controller.abort_current_command)
         self.process_controller.process_aborted.connect(self.ig_controller.cleanup)
         self.process_controller.process_aborted.connect(self.faduino_controller.cleanup)
         self.process_controller.process_aborted.connect(self.oes_controller.cleanup)

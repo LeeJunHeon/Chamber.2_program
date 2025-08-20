@@ -131,6 +131,7 @@ class MFCController(QObject):
         self._LINE_MAX = 512       # 한 줄 최대 길이
         self._overflow_count = 0
         self._reconnect_pending = False
+        self._send_spin = False # [GUARD] _dequeue_and_send 재진입 가드
 
     # ---------- 내부 디버그 프린트 ----------
     def _dprint(self, *args):
@@ -292,12 +293,15 @@ class MFCController(QObject):
             else:
                 self._safe_callback(cmd.callback, None)
 
-        # 포트 재연결
+        # 포트 닫기
         if self.serial_mfc.isOpen():
             self.serial_mfc.close()
+        # 타이머/버퍼 정리
+        self._gap_timer.stop()
+        self._rx.clear()
 
-        self._rx.clear()    # 수신 버퍼도 즉시 초기화
-        self._try_reconnect()
+        # 재연결은 워치독이 담당(중복 예약 방지)
+        QTimer.singleShot(0, self._watch_connection)
 
     def _on_ready_read(self):
         """줄(\r/\n) 단위 수신 → 에코 라인은 건너뛰고, 실제 응답 한 줄을 전달 (단순 모드)"""
@@ -390,18 +394,68 @@ class MFCController(QObject):
             QTimer.singleShot(0, self._dequeue_and_send)
 
     def _dequeue_and_send(self):
-        if self._inflight is not None or not self._cmd_q or not self.serial_mfc.isOpen():
+        # 빠른 리턴
+        if self._inflight is not None or not self._cmd_q:
             return
-        self._inflight = self._cmd_q.popleft()
-        cmd = self._inflight
-        self._rx.clear()
-        # 전송 직전 프린트
-        self._dprint(f"[SEND] {cmd.cmd_str.strip()} (tag={cmd.tag})")
-        self.status_message.emit("MFC > 전송", f"{cmd.tag or ''} {cmd.cmd_str.strip()}".strip())
+        if not self.serial_mfc.isOpen():
+            return
+        if self._gap_timer.isActive():
+            return
+        
+        # 재진입 가드
+        if self._send_spin:
+            self._dprint("[GUARD] _dequeue_and_send re-enter blocked")
+            return
+        self._send_spin = True
 
-        self.serial_mfc.write(cmd.cmd_str.encode('ascii'))
-        self.serial_mfc.flush()
-        self._cmd_timer.start(cmd.timeout_ms)
+        try:
+            cmd = self._cmd_q.popleft()
+            self._inflight = cmd
+            self._rx.clear()
+            self._dprint(f"[SEND] {cmd.cmd_str.strip()} (tag={cmd.tag})")
+            self.status_message.emit("MFC > 전송", f"{cmd.tag or ''} {cmd.cmd_str.strip()}".strip())
+            
+            payload = cmd.cmd_str.encode('ascii')
+
+            n = self.serial_mfc.write(payload)
+            n_int = int(n) if isinstance(n, int) or hasattr(n, "__int__") else -1
+            if n_int <= 0:
+                raise IOError(f"serial write returned {n_int}")
+            
+            total = n_int
+            if total != len(payload):
+                remain = payload[total:]
+                m = self.serial_mfc.write(remain)
+                m_int = int(m) if isinstance(m, int) or hasattr(m, "__int__") else -1
+                if m_int > 0:
+                    total += m_int
+                if total != len(payload):
+                    raise IOError(f"partial write: queued {total}/{len(payload)} bytes")
+                
+            self.serial_mfc.flush()
+            self._cmd_timer.stop()
+            self._cmd_timer.start(cmd.timeout_ms)
+
+        except Exception as e:
+            self._dprint(f"[ERROR] Send failed: {e}")
+            failed = self._inflight
+            self._inflight = None
+            self._cmd_timer.stop()
+            if failed:
+                self._cmd_q.appendleft(failed)
+            try:
+                if not self.serial_mfc.isOpen():
+                    QTimer.singleShot(0, self._try_reconnect)
+                else:
+                    gap_ms = failed.gap_ms if failed else 100
+                    self._gap_timer.start(gap_ms)
+                    QTimer.singleShot(gap_ms + 1, self._dequeue_and_send)
+            except Exception as ee:
+                self._dprint(f"[WARN] reconnect/retry schedule failed: {ee}")
+            self.status_message.emit("MFC", f"전송 오류: {e}")
+            return
+        finally:
+            self._send_spin = False
 
     def _on_cmd_timeout(self):
         """타임아웃 → 콜백에 None (allow_no_reply에 따라 처리)"""
@@ -468,36 +522,36 @@ class MFCController(QObject):
         self.enqueue(cmdp, on_p, timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS, tag="[POLL PRESS]")
 
     # ---------- 상위에서 호출하는 공개 API ----------
-    @Slot()
-    def abort_current_command(self):
-        """현재 진행 중인 명령/안정화/큐를 중단(상위 stop_process와 연동)."""
-        if self._is_aborted:
-            return
+    # @Slot()
+    # def abort_current_command(self):
+    #     """현재 진행 중인 명령/안정화/큐를 중단(상위 stop_process와 연동)."""
+    #     if self._is_aborted:
+    #         return
 
-        self._is_aborted = True
+    #     self._is_aborted = True
 
-        # ▼ 추가: 타이머 먼저 정지
-        self._cmd_timer.stop()
-        self._gap_timer.stop()
+    #     # ▼ 추가: 타이머 먼저 정지
+    #     self._cmd_timer.stop()
+    #     self._gap_timer.stop()
 
-        # 대기 큐: 모두 취소 통지
-        while self._cmd_q:
-            pending = self._cmd_q.popleft()
-            self._safe_callback(pending.callback, None)
+    #     # 대기 큐: 모두 취소 통지
+    #     while self._cmd_q:
+    #         pending = self._cmd_q.popleft()
+    #         self._safe_callback(pending.callback, None)
 
-        # 진행 중 명령: 취소 통지
-        if self._inflight:
-            tag = self._inflight.tag
-            self._safe_callback(self._inflight.callback, None)
-            self._inflight = None
-            self.status_message.emit("MFC", f"현재 명령({tag}) 중단"); self._dprint(f"[RUN] abort {tag}")
+    #     # 진행 중 명령: 취소 통지
+    #     if self._inflight:
+    #         tag = self._inflight.tag
+    #         self._safe_callback(self._inflight.callback, None)
+    #         self._inflight = None
+    #         self.status_message.emit("MFC", f"현재 명령({tag}) 중단"); self._dprint(f"[RUN] abort {tag}")
 
-        # 안정화 정리
-        if self.stabilization_timer.isActive():
-            self.stabilization_timer.stop()
-        self._stabilizing_channel = None
-        self._stabilizing_target = 0.0
-        self._pending_cmd_for_timer = None
+    #     # 안정화 정리
+    #     if self.stabilization_timer.isActive():
+    #         self.stabilization_timer.stop()
+    #     self._stabilizing_channel = None
+    #     self._stabilizing_target = 0.0
+    #     self._pending_cmd_for_timer = None
 
     @Slot(str, dict)
     def handle_command(self, cmd: str, params: dict):
@@ -998,3 +1052,209 @@ class MFCController(QObject):
             self._dprint(f"[ERROR] Callback failed: {e}")
             self.status_message.emit("MFC", f"콜백 오류: {e}")
 
+# if __name__ == "__main__":
+#     # ---- 콘솔 기반 테스트 하네스 ----
+#     import sys
+#     from threading import Thread
+#     from PyQt6.QtCore import QCoreApplication, QObject, pyqtSignal as Signal, QTimer
+
+#     class ConsoleInput(QObject):
+#         line_received = Signal(str)
+
+#         def start(self):
+#             t = Thread(target=self._run, daemon=True)
+#             t.start()
+
+#         def _run(self):
+#             #print_menu()
+#             for line in sys.stdin:
+#                 self.line_received.emit(line.strip())
+
+#     def print_menu():
+#         print("\n=== MFC 테스트 메뉴 ===")
+#         print(" 0) Connect MFC (포트 열기)")
+#         print(" 1) Start Polling")
+#         print(" 2) Stop  Polling")
+#         print(" 3) READ_FLOW <ch>")
+#         print(" 4) READ_PRESSURE")
+#         print(" 5) FLOW_SET <ch> <sccm>")
+#         print(" 6) FLOW_ON  <ch>")
+#         print(" 7) FLOW_OFF <ch>")
+#         print(" 8) VALVE_OPEN")
+#         print(" 9) VALVE_CLOSE")
+#         print("10) PS_ZEROING")
+#         print("11) MFC_ZEROING <ch>")
+#         print("12) RAW <cmd>            (예: RAW R60)")
+#         print("99) Cleanup & Quit")
+#         print("======================= 입력 예) 5 1 10.0  (Ch1, 10 sccm 설정)\n", flush=True)
+
+#     def parse_int(x, default=None):
+#         try:
+#             return int(x)
+#         except Exception:
+#             return default
+
+#     def parse_float(x, default=None):
+#         try:
+#             return float(x)
+#         except Exception:
+#             return default
+
+#     app = QCoreApplication(sys.argv)
+
+#     ctr = MFCController()
+#     ctr.debug_print = False
+
+#     # ---- 시그널 로깅: 터미널로 바로 출력 ----
+#     def on_status(section, msg):
+#         print(f"[{section}] {msg}", flush=True)
+
+#     def on_flow(name, sccm):
+#         try:
+#             print(f"[FLOW] {name}: {sccm:.3f} sccm", flush=True)
+#         except Exception:
+#             print(f"[FLOW] {name}: {sccm}", flush=True)
+
+#     def on_pressure(s):
+#         print(f"[PRES] {s}", flush=True)
+
+#     def on_confirmed(cmd):
+#         print(f"[OK] {cmd}", flush=True)
+
+#     def on_failed(cmd, why):
+#         print(f"[FAIL] {cmd} - {why}", flush=True)
+
+#     ctr.status_message.connect(on_status)
+#     ctr.update_flow.connect(on_flow)
+#     ctr.update_pressure.connect(on_pressure)
+#     ctr.command_confirmed.connect(on_confirmed)
+#     ctr.command_failed.connect(on_failed)
+
+#     # ---- 콘솔 입력 → 명령 실행 ----
+#     console = ConsoleInput()
+
+#     def handle_line(line: str):
+#         if not line:
+#             print_menu()
+#             return
+#         parts = line.split()
+#         sel = parts[0].lower()
+
+#         # 숫자 선택지
+#         if sel.isdigit():
+#             n = int(sel)
+
+#             if n == 0:
+#                 ok = ctr.connect_mfc_device()
+#                 print(f"[APP] connect_mfc_device() -> {ok}", flush=True)
+
+#             elif n == 1:
+#                 ctr.set_process_status(True)
+
+#             elif n == 2:
+#                 ctr.set_process_status(False)
+
+#             elif n == 3:
+#                 # READ_FLOW <ch>
+#                 if len(parts) < 2:
+#                     print("사용법: 3 <ch>", flush=True)
+#                 else:
+#                     ch = parse_int(parts[1])
+#                     if ch is None:
+#                         print("ch 정수 필요", flush=True)
+#                     else:
+#                         ctr.handle_command("READ_FLOW", {"channel": ch})
+
+#             elif n == 4:
+#                 ctr.handle_command("READ_PRESSURE", {})
+
+#             elif n == 5:
+#                 # FLOW_SET <ch> <sccm>
+#                 if len(parts) < 3:
+#                     print("사용법: 5 <ch> <sccm>", flush=True)
+#                 else:
+#                     ch = parse_int(parts[1])
+#                     val = parse_float(parts[2])
+#                     if ch is None or val is None:
+#                         print("ch 정수, sccm 실수 필요", flush=True)
+#                     else:
+#                         ctr.handle_command("FLOW_SET", {"channel": ch, "value": val})
+
+#             elif n == 6:
+#                 # FLOW_ON <ch>
+#                 if len(parts) < 2:
+#                     print("사용법: 6 <ch>", flush=True)
+#                 else:
+#                     ch = parse_int(parts[1])
+#                     if ch is None:
+#                         print("ch 정수 필요", flush=True)
+#                     else:
+#                         ctr.handle_command("FLOW_ON", {"channel": ch})
+
+#             elif n == 7:
+#                 # FLOW_OFF <ch>
+#                 if len(parts) < 2:
+#                     print("사용법: 7 <ch>", flush=True)
+#                 else:
+#                     ch = parse_int(parts[1])
+#                     if ch is None:
+#                         print("ch 정수 필요", flush=True)
+#                     else:
+#                         ctr.handle_command("FLOW_OFF", {"channel": ch})
+
+#             elif n == 8:
+#                 ctr.handle_command("VALVE_OPEN", {})
+
+#             elif n == 9:
+#                 ctr.handle_command("VALVE_CLOSE", {})
+
+#             elif n == 10:
+#                 ctr.handle_command("PS_ZEROING", {})
+
+#             elif n == 11:
+#                 # MFC_ZEROING <ch>
+#                 if len(parts) < 2:
+#                     print("사용법: 11 <ch>", flush=True)
+#                 else:
+#                     ch = parse_int(parts[1])
+#                     if ch is None:
+#                         print("ch 정수 필요", flush=True)
+#                     else:
+#                         ctr.handle_command("MFC_ZEROING", {"channel": ch})
+
+#             elif n == 12:
+#                 print("사용법: 12 RAW <cmd>", flush=True)
+
+#             elif n == 99:
+#                 print("[APP] cleanup & quit...", flush=True)
+#                 ctr.cleanup()
+#                 QTimer.singleShot(300, app.quit)
+
+#             else:
+#                 print_menu()
+
+#         else:
+#             # RAW <cmd> 지원: "RAW R60" 또는 "raw L00011" 등
+#             if sel in ("raw",):
+#                 if len(parts) < 2:
+#                     print("사용법: RAW <cmd>  예) RAW R60", flush=True)
+#                 else:
+#                     raw_cmd = " ".join(parts[1:])
+#                     def on_raw_reply(line):
+#                         print(f"[RAW RECV] {repr(line)}", flush=True)
+#                     ctr.enqueue(raw_cmd, on_raw_reply, timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS, tag="[RAW]")
+#             elif sel in ("h", "help", "?"):
+#                 print_menu()
+#             else:
+#                 print_menu()
+
+#         # 다음 입력 유도
+#         print("> ", end="", flush=True)
+
+#     console.line_received.connect(handle_line)
+#     console.start()
+
+#     print_menu()
+#     print("> ", end="", flush=True)
+
+#     sys.exit(app.exec())

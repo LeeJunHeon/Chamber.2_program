@@ -394,7 +394,7 @@ class FaduinoController(QObject):
     # ------------- 명령 큐(완전 비동기) -------------
     def enqueue(self, cmd_str: str, on_reply: Callable[[Optional[str]], None],
                 timeout_ms: int = FADUINO_TIMEOUT_MS, gap_ms: int = FADUINO_GAP_MS,
-                tag: str = "", retries_left: int = 3, 
+                tag: str = "", retries_left: int = 5, 
                 allow_no_reply: bool = False,
                 allow_when_closing: bool = False):
         

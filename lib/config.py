@@ -9,7 +9,7 @@ IG_PORT = "COM11"
 IG_BAUD = 9600
 
 #MFC_PORT = "COM12"
-MFC_PORT = "COM8"
+MFC_PORT = "COM12"
 MFC_BAUD = 9600
 
 FADUINO_PORT = "COM13"
@@ -28,11 +28,16 @@ RGA_CSV_PATH = Path(RGA_CSV_PATH)
 # OES_BAUD = 9600w
 
 # === IG ===
-IG_WAIT_TIMEOUT = 600  # IG 대기 최대 시간 (초). 예: 600초 = 10분
+IG_WAIT_TIMEOUT = 600              # 목표 압력 대기 총 한도(초). 예: 10분
 
-# IG 컨트롤러의 세부 타이머 설정 (초 단위)
-MAX_READ_RETRIES = 3
-RESPONSE_TIMEOUT_SEC = 5.0
+IG_TIMEOUT_MS = 1500               # 명령 응답 타임아웃(ms). 예: 1.5초
+IG_GAP_MS = 1000                   # 명령 간 인터커맨드 gap(ms). RDI 반복 간격 등
+IG_POLLING_INTERVAL_MS = 10_000    # 주기 폴링 간격(ms). 요구사항 기본 10초
+IG_WATCHDOG_INTERVAL_MS = 2_000    # 연결 상태 감시 주기(ms)
+IG_RECONNECT_BACKOFF_START_MS = 1000   # 재연결 백오프 시작값(ms)
+IG_RECONNECT_BACKOFF_MAX_MS = 20_000   # 재연결 백오프 최대(ms)
+
+DEBUG_PRINT = True                 # 콘솔 디버그 출력 on/off
 
 # === Faduino ===
 FADUINO_POLLING_INTERVAL_MS = 1000

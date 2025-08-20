@@ -28,7 +28,7 @@ class DCPowerController(QObject):
 
     # 공정 컨트롤러에게 목표 파워에 도달했음을 알리는 신호
     target_reached = Signal()
-    target_failed = Signal(str, str)
+    #target_failed = Signal(str, str)
     power_off_finished = Signal()   # 출력 off 완료
 
     # Faduino 상태 읽기 요청 시그널

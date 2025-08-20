@@ -156,7 +156,7 @@ class MainWindow(QWidget):
         self.oes_controller.oes_finished.connect(self.process_controller.on_step_completed)
         self.oes_controller.oes_failed.connect(self.process_controller.on_step_failed)
         self.dc_power_controller.target_reached.connect(self.process_controller.on_step_completed)
-        self.dc_power_controller.target_failed.connect(self.process_controller.on_step_failed)
+        #self.dc_power_controller.target_failed.connect(self.process_controller.on_step_failed)
         self.dc_power_controller.power_off_finished.connect(self.process_controller.on_step_completed)
         self.rf_power_controller.target_failed.connect(self.process_controller.on_step_failed)
         self.rf_power_controller.power_off_finished.connect(self.process_controller.on_step_completed)
@@ -179,6 +179,10 @@ class MainWindow(QWidget):
         self.process_controller.process_aborted.connect(self.ig_controller.cleanup)
         self.process_controller.process_aborted.connect(self.faduino_controller.cleanup)
         self.process_controller.process_aborted.connect(self.oes_controller.cleanup)
+        # 파워도 추가하는게 맞는지?
+        self.process_controller.process_aborted.connect(self.rf_power_controller.stop_process)
+        self.process_controller.process_aborted.connect(self.dc_power_controller.stop_process)
+
 
         # (추가) 파워 컨트롤러의 상태 변경 신호를 Faduino의 새 슬롯에 연결
         self.rf_power_controller.state_changed.connect(self.faduino_controller.on_rf_state_changed)
@@ -208,7 +212,8 @@ class MainWindow(QWidget):
         
         # UI 버튼 연결
         self.ui.Start_button.clicked.connect(self.on_start_button_clicked)
-        self.ui.Stop_button.clicked.connect(self.process_controller.abort_process)
+        #self.ui.Stop_button.clicked.connect(self.process_controller.abort_process)
+        self.ui.Stop_button.clicked.connect(self.on_stop_button_clicked)
         self.ui.Process_list_button.clicked.connect(self.on_process_list_button_clicked)
         self.process_controller.process_status_changed.connect(self._on_process_status_changed)
         # 초기 UI Stop button 비활성화
@@ -258,7 +263,7 @@ class MainWindow(QWidget):
 
     @Slot()
     @Slot(bool)
-    def on_process_list_button_clicked(self):
+    def on_process_list_button_clicked(self, _checked: bool=False):
         """파일 선택 버튼을 눌렀을 때 CSV 파일을 열고 파싱 + UI 갱신"""
         file_path, _ = QFileDialog.getOpenFileName(
             self,
@@ -302,6 +307,16 @@ class MainWindow(QWidget):
 
     def _update_ui_from_params(self, params: dict):
         """파라미터 딕셔너리를 기반으로 UI의 모든 위젯 값을 업데이트합니다."""
+
+        if self.process_queue:
+            total = len(self.process_queue)
+            current = self.current_process_index + 1
+            progress_text = f"자동 공정 ({current}/{total}): '{params.get('Process_name', '이름없음')}' 준비 중..."
+            self.append_log("UI", progress_text)
+        else:
+            self.append_log("UI", f"단일 공정 '{params.get('process_note', '이름없음')}'의 파라미터로 UI를 업데이트합니다.")
+
+
         self.append_log("UI", f"다음 공정 '{params['Process_name']}'의 파라미터로 UI를 업데이트합니다.")
 
         self.ui.RF_power_edit.setPlainText(params.get('rf_power', '0'))
@@ -328,6 +343,11 @@ class MainWindow(QWidget):
     @Slot(bool)
     def _start_next_process_from_queue(self, was_successful: bool):
         """공정 큐에서 다음 공정을 가져와 UI를 업데이트하고 시작합니다."""
+
+        if self.process_controller.is_running and self.current_process_index > -1:
+            # 첫 시작(index=-1)이 아닌, 공정 전환 중에 이미 다른 공정이 실행되고 있다면 무시
+            self.append_log("MAIN", "경고: 다음 공정 자동 전환 시점에 이미 다른 공정이 실행 중입니다.")
+            return
         
         if not was_successful:
             self.append_log("MAIN", "이전 공정이 실패하여 자동 시퀀스를 중단합니다.")
@@ -345,13 +365,26 @@ class MainWindow(QWidget):
             self._update_ui_from_params(params)
             
             # 잠시 후 (UI가 업데이트될 시간을 준 뒤) 다음 공정 시작
-            QTimer.singleShot(100, lambda p=params: self.process_controller.start_process(p))
+            QTimer.singleShot(100, lambda p=params: self._safe_start_process(p))
         else:
             # 모든 공정이 끝났을 경우
             self.append_log("MAIN", "모든 공정이 완료되었습니다.")
             self.process_queue = []
             self.current_process_index = -1
             self._reset_ui_after_process()
+
+    def _safe_start_process(self, params: dict):
+        """예외 처리를 포함하여 안전하게 공정을 시작합니다."""
+        if self.process_controller.is_running:
+            self.append_log("MAIN", "경고: 이미 다른 공정이 실행 중이므로 새 공정을 시작하지 않습니다.")
+            return
+
+        try:
+            self.process_controller.start_process(params)
+        except Exception as e:
+            self.append_log("MAIN", f"오류: '{params.get('Process_name', '알 수 없는')} 공정' 시작에 실패했습니다. ({e})")
+            # 실패를 알려서 전체 자동 시퀀스를 중단시킴
+            self._start_next_process_from_queue(False)
 
     def _check_and_connect_devices(self):
         """모든 장비의 연결을 확인하고, 끊겨있으면 연결을 시도합니다. 하나라도 실패하면 False를 반환합니다."""
@@ -535,7 +568,7 @@ class MainWindow(QWidget):
 
     @Slot()
     @Slot(bool)
-    def on_start_button_clicked(self):
+    def on_start_button_clicked(self, _checked: bool=False):
         """
         Start 버튼 클릭 시:
         - 모든 장비 연결을 시도하고, 성공하면 공정을 시작합니다.
@@ -590,6 +623,23 @@ class MainWindow(QWidget):
             self.append_log("MAIN", "입력 검증 통과 → 공정 시작")
             # ProcessController로 파라미터를 전달하여 단일 공정 시작
             self.process_controller.start_process(params)
+
+    @Slot()
+    def on_stop_button_clicked(self, _checked: bool=False):
+        """사용자가 Stop 버튼을 눌렀을 때 호출됩니다."""
+        if not self.process_controller.is_running and not self.process_queue:
+            self.append_log("MAIN", "중단할 공정이 없습니다.")
+            return
+
+        self.process_controller.abort_process()
+
+        # 만약 큐에 대기중인 자동 공정이 있었다면 모두 취소합니다.
+        if self.process_queue:
+            self.append_log("MAIN", "자동 시퀀스가 사용자에 의해 중단되었습니다.")
+            self.process_queue = []
+            self.current_process_index = -1
+            # UI는 abort_process -> _finish_process -> _reset_ui_after_process를 통해
+            # 자동으로 정리되므로 여기서는 큐만 비워줍니다.
 
     @Slot(str, str)
     def append_log(self, source: str, msg: str):
@@ -698,7 +748,7 @@ class MainWindow(QWidget):
             if thread and thread.isRunning():
                 thread.quit()   # 1. 스레드의 이벤트 루프에 종료 요청
                 thread.wait()   # 2. 스레드가 완전히 종료될 때까지 대기
-                self.append_log("main", f"{thread} 종료 완료.")
+                self.append_log("Main", f"{thread.objectName() or type(thread).__name__} 종료 완료.")
 
         self.append_log("Main", "모든 스레드 종료. 프로그램을 닫습니다.")
         super().closeEvent(event)

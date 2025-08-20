@@ -1,6 +1,45 @@
 # process_controller.py
 
+from typing import Optional, Tuple
+from dataclasses import dataclass
+from enum import Enum, auto
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal as Signal, pyqtSlot as Slot
+
+# 프로세스 리스트를 만들기 위한 Enum 및 Dataclass 정의
+class ActionType(Enum):
+    """공정 단계에서 사용될 모든 Action의 종류를 정의합니다."""
+    IG_CMD = auto()
+    RGA_SCAN = auto()
+    MFC_CMD = auto()
+    FADUINO_CMD = auto()
+    DELAY = auto()
+    DC_POWER_SET = auto()
+    RF_POWER_SET = auto()
+    DC_POWER_STOP = auto()
+    RF_POWER_STOP = auto()
+    OES_RUN = auto() 
+
+@dataclass
+class ProcessStep:
+    """하나의 공정 단계를 정의하는 데이터클래스입니다."""
+    action: ActionType
+    message: str
+    value: Optional[float] = None
+    params: Optional[Tuple] = None
+    duration: Optional[int] = None
+    parallel: bool = False
+    polling: bool = False
+
+# 병렬처리를 위한 클래스
+class ParallelExecution:
+    def __init__(self, steps: list[dict], end_index: int):
+        self.steps = steps          # 병렬로 돌릴 step dict 리스트
+        self.completed = 0          # 완료 개수
+        self.end_index = end_index  # 병렬 블록의 마지막 인덱스
+
+    def mark_completed(self) -> bool:
+        self.completed += 1
+        return self.completed >= len(self.steps)
 
 class ProcessController(QObject):
     """
@@ -38,14 +77,17 @@ class ProcessController(QObject):
         self.is_running = False
         self.current_params = {} # abort시 사용될 현재 공정 파라미터 저장
         self._aborting = False
+
+        self._accept_completions = True   # ← 전환 창구 가드: 완료 신호 임시 차단/해제용
+        self._in_emergency = False        # ← 선택: 디버깅용 플래그(비상 시퀀스 진행 중 표시)
         
         # 스텝 사이의 Delay 타이머
         self.step_timer = QTimer(self)
         self.step_timer.setSingleShot(True)
         self.step_timer.timeout.connect(self.on_step_completed)
 
-        # 완료해야 할 병렬 작업 수를 세는 카운터
-        self._parallel_tasks_remaining = 0
+        # 병렬 블록 상태(있을 때만 활성)
+        self._px: Optional[ParallelExecution] = None  # type: Optional[ParallelExecution]
 
         # UI timer를 위한 코드
         self._countdown_timer = QTimer(self)
@@ -82,7 +124,7 @@ class ProcessController(QObject):
         dc_power = float(params.get("dc_power", 0))
         rf_power = float(params.get("rf_power", 0))
         
-        steps = []
+        steps: list[ProcessStep] = []
 
         # ======================================================================
         # 2. 공정 단계 리스트 생성 (딕셔너리 방식으로 재구성)
@@ -328,18 +370,27 @@ class ProcessController(QObject):
         한 스텝이 완료되면 다음 스텝을 준비하고 실행합니다.
         병렬 처리('parallel': True) 스텝을 인식하여 동시에 실행합니다.
         """
-
         sender = self.sender()
         # ✅ Delay(= self.step_timer) 종료일 때만 카운트다운 중지
         if sender is self.step_timer:
             self._stop_countdown()
 
+        # ✅ 추가: 전환 가드 — 전환 중에는 어떤 완료 신호도 소비하지 않음
+        if not self._accept_completions:
+            return
+
         # --- 1. 병렬 작업이 진행 중이었는지 먼저 확인 ---
-        if self._parallel_tasks_remaining > 0:
-            self._parallel_tasks_remaining -= 1
-            if self._parallel_tasks_remaining > 0:
+        if self._px is not None:
+            # 아직 병렬 블록을 수행 중이면 완료 카운트만 올리고 반환
+            if not self._px.mark_completed():
                 return
-        
+            # 여기까지 오면 병렬 블록 전체 완료
+            # 다음 라인의 인덱스 증가(+1)는 '병렬 블록 마지막'에서 '그 다음 스텝'으로 정확히 이동시킴
+            # (아래의 self._current_step_idx += 1 로직과 맞물림)
+            # 별도 조정 불필요하지만, 안전을 위해 self._current_step_idx = self._px.end_index를 한 번 더 보장해도 됨
+            self._current_step_idx = self._px.end_index
+            self._px = None
+
         if not self.is_running: 
             return
         
@@ -355,22 +406,20 @@ class ProcessController(QObject):
         first_step = self.process_sequence[self._current_step_idx]
 
         if first_step.get('parallel', False):
-            # ✅ 연속된 parallel=True 스텝만 수집 (비병렬 스텝은 포함하지 않음)
-            parallel_steps_to_run = []
+            steps_to_run = []
             temp_idx = self._current_step_idx
             while temp_idx < len(self.process_sequence) and self.process_sequence[temp_idx].get('parallel', False):
-                parallel_steps_to_run.append((self.process_sequence[temp_idx], temp_idx))
+                steps_to_run.append((self.process_sequence[temp_idx], temp_idx))
                 temp_idx += 1
 
-            # ✅ 현재 인덱스를 '마지막 병렬 스텝'으로 고정
-            #    → 모든 병렬 작업이 완료되어(_parallel_tasks_remaining==0) on_step_completed가 다시 호출되면
-            #      _current_step_idx += 1 로 첫 비병렬 스텝으로 정확히 이동
-            self._current_step_idx = temp_idx - 1
+            # 병렬 블록 상태 생성: 마지막 인덱스를 명시적으로 보관
+            self._px = ParallelExecution([s for (s, _) in steps_to_run], end_index=temp_idx - 1)
 
-            self.log_message.emit("Process", f"병렬 작업 {len(parallel_steps_to_run)}개 동시 시작...")
-            self._parallel_tasks_remaining = len(parallel_steps_to_run)
+            # 기존과 동일하게 '병렬 블록의 마지막'으로 현재 인덱스 고정
+            self._current_step_idx = self._px.end_index
 
-            for step, step_idx in parallel_steps_to_run:
+            self.log_message.emit("Process", f"병렬 작업 {len(steps_to_run)}개 동시 시작...")
+            for step, step_idx in steps_to_run:
                 if step.get('polling', False):
                     self.set_polling.emit(True)
                 self._run_next_step(step, step_idx)
@@ -448,13 +497,20 @@ class ProcessController(QObject):
             was_successful = False      # ← 중단은 실패로 보고
             self._aborting = False
 
-        if not self.is_running:
-            return
-            
+        # ❗ 기존에는 여기서 not self.is_running 이면 return 했습니다.
+        # abort 중 'is_running=False' 상태에서 _finish_process(False) 호출 시
+        # process_finished / process_aborted 신호가 '안 나가고' 조용히 끝나는 문제가 생길 수 있어 guard를 제거합니다.
+        # if not self.is_running:
+        #     return
+        
+        # 병렬 상태 클리어(안전)
+        self._px = None
         self.step_timer.stop()
         self.set_polling.emit(False) # 확실하게 폴링 종료
         
+        # 상태 종료
         self.is_running = False
+        self._in_emergency = False
         self.process_status_changed.emit(False)
         
         status_msg = "성공적으로 완료" if was_successful else "실패 또는 중단"
@@ -481,30 +537,42 @@ class ProcessController(QObject):
         self._aborting = True
 
         # 이미 중단 절차가 시작되었거나 공정이 실행 중이 아니면 아무것도 하지 않음
+        # 실행 중이 아니면: 여기서도 '실패 종료'를 보장해야 함
         if not self.is_running:
+            # 바로 finish 호출(아래 4번 수정과 함께 안전하게 동작)
+            self._finish_process(was_successful=False)
             return
 
         self.log_message.emit("Process", "비상 정지 요청됨. 안전 종료 시퀀스를 시작합니다.")
 
-        # 1. 현재 진행 중인 모든 타이머와 상태를 정지
+        # ✅ 1) 전환 창구 닫기: 이전 시퀀스의 늦은 완료 신호를 잠시 차단
+        self._accept_completions = False
+
+        # 2) 현재 시퀀스 완전 정지
         self.is_running = False
         self.step_timer.stop()
         self.set_polling.emit(False)
             
-        # ✅ 추가: 이전 병렬 작업 카운터 초기화
-        self._parallel_tasks_remaining = 0
+        # 병렬 블록 상태 폐기(중단 시 진행 중 병렬은 더 이상 유효하지 않음)
+        self._px = None
 
-        # 2. '전체 종료' 스텝을 생성하여 비상 종료 절차로 사용
+        # 3) 비상 시퀀스 생성
         emergency_steps = self._create_shutdown_sequence(params=self.current_params)
-
-        # 3. 만약 생성된 종료 스텝이 없다면, 즉시 finish_process 호출
         if not emergency_steps:
+            # 비상 시퀀스가 비어도 '실패 종료'를 보장
             self._finish_process(was_successful=False)
+            # ✅ 전환 창구 다시 열기
+            self._accept_completions = True
             return
 
-        # 4. 현재 공정 시퀀스를 '비상 종료 시퀀스'로 교체하고 실행
+        # 4) 비상 시퀀스로 '원자적' 교체
         self.process_sequence = emergency_steps
         self._current_step_idx = -1
         self.is_running = True # 비상 종료 시퀀스를 실행하기 위해 잠시 True로 설정
+        self._in_emergency = True
+
+        # ✅ 5) 전환 창구 다시 열기: 이제부터의 완료 신호는 비상 시퀀스의 것으로만 처리
+        self._accept_completions = True
+
         self.process_status_changed.emit(True)
         self.on_step_completed()

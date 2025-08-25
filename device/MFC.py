@@ -696,7 +696,13 @@ class MFCController(QObject):
         start_stab_for_ch: int | None = None,
         confirm_cmd: str | None = None,
     ):
-        # 1) L0 전송
+        """
+        L0(ON/OFF 마스크) 적용 → R69로 검증.
+        - 켜는 경우(해당 ch 비트가 '1')에만 유량 안정화(timer) 시작.
+        - FLOW_ON confirm 은 '안정화 성공 시점(_check_flow_stabilization)'에서만 emit.
+        - FLOW_OFF 등 안정화가 불필요한 경우는 여기서 즉시 confirm.
+        """
+        # 1) L0 전송 (no-reply)
         self.enqueue(
             MFC_COMMANDS['SET_ONOFF_MASK'](bits_target),
             lambda _l: None,
@@ -710,32 +716,49 @@ class MFCController(QObject):
         def make_verify(cur_attempt: int):
             def _verify(line: Optional[str]):
                 now = self._parse_r69_bits((line or "").strip())
+
                 if now == bits_target:
+                    # (a) 배치(L0) 적용 성공 알림은 즉시
                     self.command_confirmed.emit("FLOW_ONOFF_BATCH")
-                    if confirm_cmd:
-                        self.command_confirmed.emit(confirm_cmd)
                     self.status_message.emit("MFC < 확인", f"L0 적용 확인: {bits_target}")
 
-                    # 안정화 시작(필요 시)
+                    # (b) 켜는 경우에만 유량 안정화 시작 (FLOW_ON confirm 지연)
+                    started_stab = False
                     if start_stab_for_ch:
                         ch = start_stab_for_ch
+                        # 지정 채널이 실제로 '1'(켜짐)인 경우만 안정화
                         if 1 <= ch <= len(bits_target) and bits_target[ch - 1] == '1':
+                            # 기존 안정화 타이머/상태 정리
                             if self.stabilization_timer and self.stabilization_timer.isActive():
                                 self.stabilization_timer.stop()
                             self._stabilizing_channel = None
                             self._stabilizing_target = 0.0
                             self._pending_cmd_for_timer = None
 
+                            # 새 안정화 대상/목표 설정
                             self._stabilizing_channel = ch
                             self._stabilizing_target = float(self.last_setpoints.get(ch, 0.0))
 
+                            # 목표가 유효하면 타이머 시작
                             if (self._stabilizing_target > 0) and self.stabilization_timer:
                                 self.stabilization_attempts = 0
                                 self._pending_cmd_for_timer = "FLOW_ON"
                                 self.stabilization_timer.start()
-                    return
+                                started_stab = True
+                                # ⚠️ 주의: 여기서는 FLOW_ON을 emit 하지 않음
+                                #  → _check_flow_stabilization() 성공 분기에서 emit 됨
+                                #     (self.command_confirmed.emit("FLOW_ON"))
 
+                    # (c) 안정화를 시작하지 않은 경우(= OFF이거나, ON이어도 목표 0 등)에는 즉시 confirm
+                    if (not started_stab) and confirm_cmd:
+                        # FLOW_OFF 등은 여기서 바로 확정
+                        self.command_confirmed.emit(confirm_cmd)
+
+                    return  # 성공 처리 끝
+
+                # --- 재시도 로직 (그대로 유지) ---
                 if cur_attempt < max_attempts:
+                    # L0 재적용(무응답) 후 일정 지연 뒤 다시 R69 확인
                     self.enqueue(
                         MFC_COMMANDS['SET_ONOFF_MASK'](bits_target),
                         lambda _l: None,
@@ -755,9 +778,13 @@ class MFCController(QObject):
                         ),
                     )
                 else:
-                    self.command_failed.emit("FLOW_ONOFF_BATCH", f"L0 적용 불일치(now={now}, want={bits_target})")
+                    self.command_failed.emit(
+                        "FLOW_ONOFF_BATCH",
+                        f"L0 적용 불일치(now={now}, want={bits_target})"
+                    )
             return _verify
 
+        # 최초 검증 요청
         self.enqueue(
             MFC_COMMANDS['READ_MFC_ON_OFF_STATUS'],
             make_verify(attempt),

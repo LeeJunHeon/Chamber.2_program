@@ -225,6 +225,11 @@ class MainWindow(QWidget):
             self.process_controller.on_device_step_ok,
             type=Qt.ConnectionType.QueuedConnection
         )
+        # ⬇︎ 추가: DC 파워 정지 완료 → 공정 진행
+        self.dc_power_controller.power_off_finished.connect(
+            self.process_controller.on_device_step_ok,
+            type=Qt.ConnectionType.QueuedConnection
+        )
 
         # RF 파워 목표 도달/실패 → 공정 진행/실패
         self.rf_power_controller.target_reached.connect(
@@ -233,6 +238,10 @@ class MainWindow(QWidget):
         )
         self.rf_power_controller.target_failed.connect(
             lambda why: self.process_controller.on_step_failed("RF Power", why),
+            type=Qt.ConnectionType.QueuedConnection
+        )
+        self.rf_power_controller.power_off_finished.connect(
+            self.process_controller.on_device_step_ok,
             type=Qt.ConnectionType.QueuedConnection
         )
 

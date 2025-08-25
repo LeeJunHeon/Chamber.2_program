@@ -97,6 +97,7 @@ class ProcessController(QObject):
         self._aborting = False
         self._accept_completions = True
         self._in_emergency = False
+        self._countdown_active = False
 
         # 스텝 타이머
         self.step_timer = QTimer(self)
@@ -378,6 +379,9 @@ class ProcessController(QObject):
             self._finish_process(False)
 
     def _run_next_step(self, step: ProcessStep, step_index: int):
+        if not (self._countdown_active and step.action != ActionType.DELAY):
+            self.update_process_state.emit(step.message)
+    
         if not self.is_running or self._aborting:
             return
 
@@ -485,13 +489,19 @@ class ProcessController(QObject):
         if not self.is_running:
             return
 
+        if self._px is not None:
+            # 병렬 블록 안에 해당 cmd를 기대하는 MFC_CMD가 있으면 1개 완료로 카운트
+            if any(s.action == ActionType.MFC_CMD and s.params and s.params[0] == cmd for s in self._px.steps):
+                self.on_device_step_ok()
+            else:
+                self.log_message.emit("MFC", f"확인 무시: '{cmd}' (현재 병렬 블록 기대와 불일치)")
+            return
+
+        # 단일 스텝 로직(기존 유지)
         step = self.current_step
-        # 현재 스텝이 MFC_CMD가 아니면 무시
         if not step or step.action != ActionType.MFC_CMD:
             self.log_message.emit("MFC", f"확인 무시: '{cmd}' (현재 스텝: {step.action.name if step else '없음'})")
             return
-
-        # 이 스텝이 기대하는 명령과 정확히 일치할 때만 완료 처리
         expected_cmd = step.params[0] if (step.params and len(step.params) >= 1) else None
         if cmd == expected_cmd:
             self.on_step_completed()
@@ -507,8 +517,20 @@ class ProcessController(QObject):
         """FaduinoController.command_confirmed(cmd) 연결용"""
         if not self.is_running:
             return
-        # Faduino 폴링은 ACK를 발생시키지 않도록 구현되어 있음 → 바로 완료 처리
-        self.on_step_completed()
+
+        if self._px is not None:
+            # 병렬 블록에 FADUINO_CMD가 포함되어 있을 때만 1개 완료로 카운트
+            if any(s.action == ActionType.FADUINO_CMD for s in self._px.steps):
+                self.on_device_step_ok()
+            else:
+                self.log_message.emit("Faduino", f"확인 무시: '{cmd}' (현재 병렬 블록에 FADUINO_CMD 없음)")
+            return
+
+        # 단일 스텝 상황
+        if self.current_step and self.current_step.action == ActionType.FADUINO_CMD:
+            self.on_device_step_ok()
+        else:
+            self.log_message.emit("Faduino", f"확인 무시: '{cmd}' (현재 스텝: {self.current_step.action.name if self.current_step else '없음'})")
 
     @Slot(str, str)
     def on_faduino_failed(self, cmd: str, why: str):
@@ -542,6 +564,32 @@ class ProcessController(QObject):
         # 실패는 표준 실패 핸들러로 전달
         self.on_step_failed(src or "RGA", why)
 
+    @Slot()
+    def on_dc_target_reached(self):
+        """DCPowerController.target_reached → DC_POWER_SET 스텝 완료"""
+        if not self.is_running:
+            return
+        # 병렬 블록: 현재 병렬 셋에 DC_POWER_SET가 있으면 1개 완료로 카운트
+        if self._px is not None:
+            if any(s.action == ActionType.DC_POWER_SET for s in self._px.steps):
+                self.on_device_step_ok()
+            return
+        # 단일 스텝: 현재 스텝이 DC_POWER_SET일 때만 완료
+        if self.current_step and self.current_step.action == ActionType.DC_POWER_SET:
+            self.on_device_step_ok()
+
+    @Slot()
+    def on_rf_target_reached(self):
+        """RFPowerController.target_reached → RF_POWER_SET 스텝 완료"""
+        if not self.is_running:
+            return
+        if self._px is not None:
+            if any(s.action == ActionType.RF_POWER_SET for s in self._px.steps):
+                self.on_device_step_ok()
+            return
+        if self.current_step and self.current_step.action == ActionType.RF_POWER_SET:
+            self.on_device_step_ok()
+
     # ---------------- 실패 처리 ----------------
     @Slot(str, str)
     def on_step_failed(self, source: str, reason: str):
@@ -559,6 +607,7 @@ class ProcessController(QObject):
 
     # ---------------- 카운트다운 ----------------
     def _start_countdown(self, duration_ms: int, base_message: str):
+        self._countdown_active = True
         self._countdown_remaining_ms = duration_ms
         self._countdown_base_message = base_message
         self._countdown_timer.start()
@@ -569,6 +618,7 @@ class ProcessController(QObject):
         self._countdown_remaining_ms = 0
         self._countdown_base_message = ""
         self._countdown_timer.stop()
+        self._countdown_active = False
 
     def _on_countdown_tick(self):
         if self._countdown_remaining_ms <= 0:

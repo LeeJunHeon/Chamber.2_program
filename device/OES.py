@@ -44,27 +44,44 @@ class OESController(QObject):
         self.measured_data_list = [] # 측정된 모든 intensity 데이터를 저장할 리스트
         self.start_time_str = ""
 
+    def _safe_close_channel(self):
+        """TEC OFF + 채널 클로즈(있으면) + sChannel 리셋."""
+        try:
+            if self.sp_dll and self.sChannel >= 0:
+                try:
+                    self.sp_dll.spSetTEC(0, self.sChannel)
+                except Exception:
+                    pass
+                try:
+                    self.sp_dll.spCloseGivenChannel(self.sChannel)
+                except Exception:
+                    pass
+        finally:
+            self.sChannel = -1
+
     def _end_measurement(self, was_successful: bool, reason: str = ""):
-        """모든 측정 종료 시나리오(성공, 실패, 중단)를 처리하는 내부 함수"""
+        """모든 측정 종료 시나리오(성공, 실패, 중단) 공통 처리"""
         if not self.is_running:
             return
 
-        # 1. 모든 타이머 중지
-        self.acquisition_timer.stop()
-        self.process_timer.stop()
-        
-        # 2. 성공한 경우에만 데이터 저장
-        if was_successful:
+        # 1) 타이머 정지
+        try:
+            self.acquisition_timer.stop()
+            self.process_timer.stop()
+        except Exception:
+            pass
+
+        # 2) 성공 시에만 CSV 저장
+        if was_successful and self.measured_data_list:
             self._save_data_to_csv_wide()
-        
-        # 3. 장비 리소스 해제
-        self.sp_dll.spSetTEC(0, self.sChannel)
-        self.sp_dll.spCloseGivenChannel(self.sChannel)
-        
-        # 4. 상태 변수 업데이트
+
+        # 3) 장비 리소스 해제(안전)
+        self._safe_close_channel()
+
+        # 4) 상태 업데이트
         self.is_running = False
 
-        # 5. 결과에 따라 적절한 신호 발생
+        # 5) 알림
         if was_successful:
             self.status_message.emit("OES", "측정 완료 및 장비 연결 종료")
             self.oes_finished.emit()
@@ -75,6 +92,9 @@ class OESController(QObject):
     @Slot()
     def initialize_device(self):
         try:
+            # 혹시 반쯤 열린 채널이 있으면 정리
+            self._safe_close_channel()
+
             self.sp_dll = ctypes.CDLL(self.dll_path)
             self._setup_dll_functions()
             
@@ -86,18 +106,35 @@ class OESController(QObject):
             self.sChannel = sChannel
             
             result = self.sp_dll.spSetupGivenChannel(self.sChannel)
+            if result < 0:
+                self.status_message.emit("OES", f"채널 설정 실패: {result}")
+                self._safe_close_channel()
+                return False
+
             result_model, model = self._get_model(self.sChannel)
+            if result_model < 0:
+                self.status_message.emit("OES", f"모델 조회 실패: {result_model}")
+                self._safe_close_channel()
+                return False
+
             result = self.sp_dll.spInitGivenChannel(model, self.sChannel)
+            if result < 0:
+                self.status_message.emit("OES", f"채널 초기화 실패: {result}")
+                self._safe_close_channel()
+                return False
             
             result, self.wl_table = self._get_wavelength_table(self.sChannel)
             if result < 0:
                 self.status_message.emit("OES", "파장 테이블 로드 실패.")
+                self._safe_close_channel()
                 return False
 
             self.status_message.emit("OES", "초기화 성공")
             return True
+
         except Exception as e:
             self.status_message.emit("OES", f"초기화 중 예외 발생: {e}")
+            self._safe_close_channel()
             return False
 
     @Slot(float, int)
@@ -131,39 +168,53 @@ class OESController(QObject):
 
     @Slot()
     def cleanup(self):
-        """[수정] abort 신호를 받으면 실패로 간주하고 _end_measurement를 호출합니다."""
+        """abort/종료 시 안전 정리"""
         if self.is_running:
             reason = "사용자 요청으로 중단됨"
             self.status_message.emit("OES", reason)
             self._end_measurement(was_successful=False, reason=reason)
         else:
+            # 실행 중이 아니어도 열린 채널이 있을 수 있으니 정리
+            self._safe_close_channel()
             self.status_message.emit("OES", "중단 요청 수신됨 (실행 중이 아님)")
 
     def _acquire_data_slice(self):
-        if not self.is_running:
+        if not self.is_running or self.sChannel < 0:
             return
 
         try:
-            intensity_sum = np.zeros(3680)
+            # 평균용 누적 버퍼 + 유효 프레임 카운트
+            intensity_sum = np.zeros(3680, dtype=float)
+            valid = 0
+
             for _ in range(OES_AVG_COUNT):
                 res, temp_intensity = self._read_data_ex(self.sChannel)
-                if res > 0:
-                    intensity_sum += temp_intensity
-            
-            avg_intensity = intensity_sum / OES_AVG_COUNT
-            
+                if res > 0 and temp_intensity is not None:
+                    arr = np.asarray(temp_intensity, dtype=float)
+                    if arr.size >= 1034:  # 최소 길이 가드
+                        intensity_sum += arr
+                        valid += 1
+
+            # 이번 틱에서 유효 프레임이 하나도 없으면 그냥 스킵(연속 오류는 타이머 틱마다 자연히 재시도)
+            if valid == 0:
+                return
+
+            avg_intensity = intensity_sum / float(valid)
+
+            # 파장 테이블 유효성 확인 후 구간 슬라이스
+            if self.wl_table is None or len(self.wl_table) < 1034:
+                raise RuntimeError("파장 테이블이 유효하지 않습니다.")
             x_data = self.wl_table[10:1034]
             y_data = avg_intensity[10:1034]
-            
-            # --- [수정됨] 측정된 데이터를 리스트에 추가 ---
+
+            # 와이드 포맷 CSV 저장을 위한 한 줄 추가
             current_time = datetime.now().strftime("%H:%M:%S")
             self.measured_data_list.append([current_time] + y_data.tolist())
-            
-            # 그래프 업데이트 신호 전송
+
+            # 그래프 업데이트
             self.oes_data_updated.emit(x_data, y_data)
 
         except Exception as e:
-            # [수정] 데이터 수집 중 오류 발생 시, 실패로 간주하고 _end_measurement 호출
             reason = f"데이터 수집 중 오류: {e}"
             self.status_message.emit("OES", reason)
             self._end_measurement(was_successful=False, reason=reason)

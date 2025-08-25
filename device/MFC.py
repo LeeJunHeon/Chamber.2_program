@@ -8,6 +8,7 @@ MFC.py — PyQt6 QSerialPort(완전 비동기) 기반 MFC 컨트롤러
   - 연결 워치독 + 자동 재연결(지수 백오프) → 공정 중간 끊김에 강함
   - 스케일 일관화: 전송(곱), 표시(나눔), 안정화·비교는 장비 단위
   - 멀티 장비를 위해 인스턴스 독립(포트/큐/타이머 분리)
+  - ⚠️ 중요: QSerialPort/타이머는 컨트롤러가 속한 스레드에서 지연 생성
 """
 
 from __future__ import annotations
@@ -19,13 +20,6 @@ import re
 
 from PyQt6.QtCore import QObject, QTimer, QIODeviceBase, pyqtSignal as Signal, pyqtSlot as Slot
 from PyQt6.QtSerialPort import QSerialPort, QSerialPortInfo
-
-# NOTE: 경로/상수는 기존 프로젝트 구조에 맞춰 주세요.
-#  - MFC_PORT: "COMx" 또는 "/dev/ttyUSBx"
-#  - MFC_BAUD: 보드레이트
-#  - MFC_COMMANDS: 장비별 명령 포맷 람다/함수 맵
-#  - FLOW_ERROR_TOLERANCE, FLOW_ERROR_MAX_COUNT: 안정화/경고 기준
-#  - MFC_SCALE_FACTORS: 채널별 스케일(예: {1:1.0, 2:10.0, 3:10.0})
 
 @dataclass
 class Command:
@@ -57,83 +51,62 @@ from lib.config import (
     )
 
 class MFCController(QObject):
-    # --- 시그널 (기존과 동일한 시그널명 유지) ---
-    status_message   = Signal(str, str)   # (섹션, 메시지)
-    update_flow      = Signal(str, float) # (가스이름, 유량 sccm(UI 단위))
-    update_pressure  = Signal(str)        # (압력 문자열)
-    command_failed   = Signal(str, str)   # (명령, 원인)
-    command_confirmed= Signal(str)        # (명령)
+    # --- 시그널 (기존 시그널명 유지) ---
+    status_message   = Signal(str, str)
+    update_flow      = Signal(str, float)
+    update_pressure  = Signal(str)
+    command_failed   = Signal(str, str)
+    command_confirmed= Signal(str)
 
-    # ---------- 초기화 ----------
     def __init__(self, parent=None):
         super().__init__(parent)
-
-        # (디버그 프린트 on/off)
         self.debug_print = DEBUG_PRINT
 
-        # (1) QSerialPort 준비
-        self.serial_mfc = QSerialPort(self)
-        self.serial_mfc.setBaudRate(MFC_BAUD)
-        self.serial_mfc.setDataBits(QSerialPort.DataBits.Data8)
-        # 필요에 따라 패리티 조정(장비가 8O1이면 OddParity로 바꾸세요)
-        self.serial_mfc.setParity(QSerialPort.Parity.NoParity)
-        self.serial_mfc.setStopBits(QSerialPort.StopBits.OneStop)
-        self.serial_mfc.setFlowControl(QSerialPort.FlowControl.NoFlowControl)
-        self.serial_mfc.readyRead.connect(self._on_ready_read)
-        self.serial_mfc.errorOccurred.connect(self._on_serial_error)
+        # (1) 시리얼/타이머는 '지연 생성' — 스레드 안에서만 생성되도록 전부 None
+        self.serial_mfc: Optional[QSerialPort] = None
 
-        # (2) 수신 버퍼(줄 단위 파싱)
+        self._cmd_timer: Optional[QTimer] = None
+        self._gap_timer: Optional[QTimer] = None
+        self.polling_timer: Optional[QTimer] = None
+        self.stabilization_timer: Optional[QTimer] = None
+        self._watchdog: Optional[QTimer] = None
+
+        # (2) 수신/파싱 버퍼
         self._rx = bytearray()
+        self._RX_MAX = 16 * 1024
+        self._LINE_MAX = 512
+        self._overflow_count = 0
 
-        # (3) 명령 큐: (cmd_str, on_reply, timeout_ms, gap_ms, tag, retries_left, allow_no_reply)
+        # (3) 명령 큐/상태
         self._cmd_q: Deque[Command] = deque()
         self._inflight: Optional[Command] = None
+        self._send_spin = False  # 재진입 가드
 
-        # (4) 타이머: 명령 타임아웃/인터커맨드 간격/폴링/안정화/워치독
-        self._cmd_timer = QTimer(self); self._cmd_timer.setSingleShot(True)
-        self._gap_timer = QTimer(self); self._gap_timer.setSingleShot(True)
-        self._cmd_timer.timeout.connect(self._on_cmd_timeout)
-        self._gap_timer.timeout.connect(self._dequeue_and_send)
-
-        self.polling_timer = QTimer(self)
-        self.polling_timer.setInterval(MFC_POLLING_INTERVAL_MS)                 # 2s 주기 폴링
-        self.polling_timer.timeout.connect(self._enqueue_poll_cycle)
-
-        self.stabilization_timer = QTimer(self)
-        self.stabilization_timer.setInterval(MFC_STABILIZATION_INTERVAL_MS)           # 1s 안정화 체크
-        self.stabilization_timer.timeout.connect(self._check_flow_stabilization)
-        self.stabilization_attempts = 0
-
-        # (5) 연결 워치독 & 자동 재연결(지수 백오프)
-        self._watchdog = QTimer(self); self._watchdog.setInterval(MFC_WATCHDOG_INTERVAL_MS)
-        self._watchdog.timeout.connect(self._watch_connection)
+        # (4) 연결/재연결 상태
         self._want_connected = False
-        self._reconnect_backoff_ms = MFC_RECONNECT_BACKOFF_START_MS                     # 0.5s → 1s → 2s … 최대 8s
+        self._reconnect_backoff_ms = MFC_RECONNECT_BACKOFF_START_MS
+        self._reconnect_pending = False
 
-        # (6) 상태/파라미터
+        # (5) 런타임 상태
         self._is_aborted = False
         self.current_cmd = ""
         self.current_params: dict = {}
         self.retry_attempts = 0
 
-        # (7) 가스/목표/오류카운터
+        # (6) 가스/스케일/모니터링
         self.gas_map = {1: "Ar", 2: "O2", 3: "N2"}
-        # 안정화/모니터링 비교는 '장비 단위'가 기준!
-        self.last_setpoints = {1: 0.0, 2: 0.0, 3: 0.0}       # 장비 단위로 저장
+        self.last_setpoints = {1: 0.0, 2: 0.0, 3: 0.0}    # 장비 단위
         self.flow_error_counters = {1: 0, 2: 0, 3: 0}
 
-        # (8) 안정화 스냅샷(콜백/명령 겹침으로부터 보호)
-        self._stabilizing_channel = None
-        self._stabilizing_target  = 0.0     # 장비 단위
-        self._pending_cmd_for_timer = None  # "FLOW_ON" 고정 보고용
+        # (7) 안정화 상태
+        self._stabilizing_channel: Optional[int] = None
+        self._stabilizing_target: float = 0.0   # 장비 단위
+        self._pending_cmd_for_timer: Optional[str] = None
+        self.stabilization_attempts = 0
 
-        self._RX_MAX = 16 * 1024   # 최대 16 KiB
-        self._LINE_MAX = 512       # 한 줄 최대 길이
-        self._overflow_count = 0
-        self._reconnect_pending = False
-        self._send_spin = False # [GUARD] _dequeue_and_send 재진입 가드
-
-    # ---------- 내부 디버그 프린트 ----------
+    # -------------------------------------------------
+    # 내부 디버그 출력
+    # -------------------------------------------------
     def _dprint(self, *args):
         if self.debug_print:
             try:
@@ -141,55 +114,64 @@ class MFCController(QObject):
             except Exception:
                 pass
 
-    # --- 응답 접두사 규칙(실기 로그 기반) ---
-    def _q_prefixes_for(self, cmd_key: str, ch: int) -> tuple[str, ...]:
-        # if cmd_key == 'READ_FLOW':          # R61~R64
-        #     return (f"Q{int(ch)}",)         # ← Q0 제거 (단일 READ는 반드시 Q{ch})
-        if cmd_key == 'READ_FLOW_SET':        # R65~R68
-            return (f"Q{4 + int(ch)}",)       # Q5~Q8
-        if cmd_key == 'READ_FLOW_ALL':        # R60
-            return ("Q0",)                    # R60만 Q0
-        return tuple()
+    # -------------------------------------------------
+    # 지연 생성 헬퍼(반드시 MFC 스레드에서 호출)
+    # -------------------------------------------------
+    def _ensure_serial_created(self):
+        if self.serial_mfc is not None:
+            return
+        self.serial_mfc = QSerialPort(self)
+        self.serial_mfc.setBaudRate(MFC_BAUD)
+        self.serial_mfc.setDataBits(QSerialPort.DataBits.Data8)
+        self.serial_mfc.setParity(QSerialPort.Parity.NoParity)
+        self.serial_mfc.setStopBits(QSerialPort.StopBits.OneStop)
+        self.serial_mfc.setFlowControl(QSerialPort.FlowControl.NoFlowControl)
+        self.serial_mfc.readyRead.connect(self._on_ready_read)
+        self.serial_mfc.errorOccurred.connect(self._on_serial_error)
 
-    def _parse_q_value_with_prefixes(self, line: str | None, expected_prefixes: tuple[str, ...]) -> float | None:
-        """
-        'Q1+000.1', 'Q0+000.1' 등에서 expected_prefixes 중 하나로 시작하면 숫자 파싱.
-        """
-        s = (line or "").strip()
-        for p in expected_prefixes:
-            if s.startswith(p):
-                m = re.match(r'^' + re.escape(p) + r'\s*([+\-]?\d+(?:\.\d+)?)$', s)
-                if m:
-                    try: return float(m.group(1))
-                    except Exception: return None
-                return None
-        return None
-    
-    def _parse_r60_values(self, line: str | None) -> list[float] | None:
-        """
-        R60: 'Q0+v1+v2+v3+v4' → [v1, v2, v3, v4]
-        채널 수는 장비/설치에 따라 줄 수 있으므로 가변적으로 파싱.
-        """
-        s = (line or "").strip()
-        if not s.startswith("Q0"):
-            return None
-        nums = re.findall(r'([+\-]?\d+(?:\.\d+)?)', s[2:])
-        try: return [float(x) for x in nums]
-        except Exception: return None
+    def _ensure_timers_created(self):
+        if self._cmd_timer is None:
+            self._cmd_timer = QTimer(self)
+            self._cmd_timer.setSingleShot(True)
+            self._cmd_timer.timeout.connect(self._on_cmd_timeout)
+
+        if self._gap_timer is None:
+            self._gap_timer = QTimer(self)
+            self._gap_timer.setSingleShot(True)
+            self._gap_timer.timeout.connect(self._dequeue_and_send)
+
+        if self.polling_timer is None:
+            self.polling_timer = QTimer(self)
+            self.polling_timer.setInterval(MFC_POLLING_INTERVAL_MS)
+            self.polling_timer.timeout.connect(self._enqueue_poll_cycle)
+
+        if self.stabilization_timer is None:
+            self.stabilization_timer = QTimer(self)
+            self.stabilization_timer.setInterval(MFC_STABILIZATION_INTERVAL_MS)
+            self.stabilization_timer.timeout.connect(self._check_flow_stabilization)
+
+        if self._watchdog is None:
+            self._watchdog = QTimer(self)
+            self._watchdog.setInterval(MFC_WATCHDOG_INTERVAL_MS)
+            self._watchdog.timeout.connect(self._watch_connection)
 
     # ---------- 연결/해제 & 워치독 ----------
     @Slot()
     def connect_mfc_device(self) -> bool:
         """포트를 열고 워치독 시작. 실패해도 워치독이 재연결 시도."""
+        self._ensure_serial_created()
+        self._ensure_timers_created()
+
         self._want_connected = True
         ok = self._open_port()
-        self._watchdog.start()
+        if self._watchdog:
+            self._watchdog.start()
         return ok
 
     def _open_port(self) -> bool:
-        if self.serial_mfc.isOpen():
+        if self.serial_mfc and self.serial_mfc.isOpen():
             return True
-        
+
         # 포트 존재 확인
         available = {p.portName() for p in QSerialPortInfo.availablePorts()}
         if MFC_PORT not in available:
@@ -202,110 +184,126 @@ class MFCController(QObject):
             msg = f"{MFC_PORT} 연결 실패: {self.serial_mfc.errorString()}"
             self.status_message.emit("MFC", msg); self._dprint(f"[MFC] {msg}")
             return False
-        # 라인 제어(장비/케이블 호환)
+
+        # 라인 제어/초기화
         self.serial_mfc.setDataTerminalReady(True)
         self.serial_mfc.setRequestToSend(False)
         self.serial_mfc.clear(QSerialPort.Direction.AllDirections)
         self._rx.clear()
+
+        # 재연결 백오프 초기화
         self._reconnect_backoff_ms = MFC_RECONNECT_BACKOFF_START_MS
-        self._reconnect_pending = False   # ← 추가
+        self._reconnect_pending = False
+
         msg = f"{MFC_PORT} 연결 성공 (PyQt6 QSerialPort)"
         self.status_message.emit("MFC", msg); self._dprint(f"[MFC] {msg}")
         return True
 
     def _watch_connection(self):
         """주기적으로 연결 상태 확인. 끊겨 있으면 백오프로 재연결."""
-        if not self._want_connected or self.serial_mfc.isOpen():
+        if (not self._want_connected) or (self.serial_mfc and self.serial_mfc.isOpen()):
             return
         if self._reconnect_pending:
-            return # ▼ 이미 예약되어 있으면 중복 예약 금지
+            return
         self._reconnect_pending = True
         msg = f"재연결 시도... ({self._reconnect_backoff_ms} ms)"
         self.status_message.emit("MFC", msg); self._dprint(f"[MFC] {msg}")
         QTimer.singleShot(self._reconnect_backoff_ms, self._try_reconnect)
 
     def _try_reconnect(self):
-        # ▼ 예약 상태 해제 (이 호출이 실행됐으니 새 예약 허용)
         self._reconnect_pending = False
-
-        # 연결 의사 없거나 이미 열려 있으면 중단  ← 추가
-        if not self._want_connected or self.serial_mfc.isOpen():
+        if (not self._want_connected) or (self.serial_mfc and self.serial_mfc.isOpen()):
             return
 
         if self._open_port():
             msg = "재연결 성공. 대기 중 명령 재개."
             self.status_message.emit("MFC", msg); self._dprint(f"[MFC] {msg}")
-            self._dequeue_and_send()   # 재연결 즉시 전송 재개
-            # 성공 시 백오프 초기화
+            QTimer.singleShot(0, self._dequeue_and_send)
             self._reconnect_backoff_ms = MFC_RECONNECT_BACKOFF_START_MS
             return
-        
-        # 실패 시 백오프 확장
+
         self._reconnect_backoff_ms = min(self._reconnect_backoff_ms * 2, MFC_RECONNECT_BACKOFF_MAX_MS)
 
     @Slot()
     def cleanup(self):
-        """안전 종료: 타이머/큐/포트 정리"""
+        """안전 종료: 타이머/큐/포트 정리 (타 스레드 파괴 경고 방지)"""
         self._want_connected = False
-        self.polling_timer.stop()
-        self.stabilization_timer.stop()
-        self._cmd_timer.stop()
-        self._gap_timer.stop()
-        self._watchdog.stop()
-        self._reconnect_pending = False   # ← 추가
 
-        # ▼ inflight 취소 통지
+        # 진행/대기 명령 콜백 취소 통지
         if self._inflight is not None:
             self._safe_callback(self._inflight.callback, None)
             self._inflight = None
-
-        # ▼ 대기 큐도 모두 취소 통지
         while self._cmd_q:
             pending = self._cmd_q.popleft()
             self._safe_callback(pending.callback, None)
 
+        # 안정화 상태 리셋
         self._stabilizing_channel = None
         self._stabilizing_target = 0.0
         self._pending_cmd_for_timer = None
 
-        if self.serial_mfc.isOpen():
-            self.serial_mfc.close()
-            msg = "시리얼 포트를 안전하게 닫았습니다."
-            self.status_message.emit("MFC", msg); self._dprint(f"[MFC] {msg}")
+        # 타이머들 정지/파기
+        for t_attr in ("_cmd_timer", "_gap_timer", "polling_timer", "stabilization_timer", "_watchdog"):
+            t = getattr(self, t_attr)
+            if t:
+                try:
+                    t.stop()
+                except Exception:
+                    pass
+                t.deleteLater()
+                setattr(self, t_attr, None)
+
+        # 포트 정리
+        if self.serial_mfc:
+            try:
+                if self.serial_mfc.isOpen():
+                    self.serial_mfc.close()
+                    self.status_message.emit("MFC", "시리얼 포트를 안전하게 닫았습니다.")
+                    self._dprint("[MFC] 시리얼 포트를 안전하게 닫았습니다.")
+            finally:
+                self.serial_mfc.deleteLater()
+                self.serial_mfc = None
+
+        self._rx.clear()
+        self._reconnect_pending = False
 
     # ---------- 시리얼 이벤트 ----------
     def _on_serial_error(self, err: QSerialPort.SerialPortError):
         if err == QSerialPort.SerialPortError.NoError:
             return
-        
+
         err_name = getattr(err, "name", str(err))
         err_code = getattr(err, "value", "?")
-        msg = f"시리얼 오류: {self.serial_mfc.errorString()} (err={err_name}/{err_code})"
+        serr = self.serial_mfc.errorString() if self.serial_mfc else ""
+        msg = f"시리얼 오류: {serr} (err={err_name}/{err_code})"
         self.status_message.emit("MFC", msg); self._dprint(f"[MFC] {msg}")
 
-        # 진행 중 명령 되돌리기(필드 사용)
+        # 진행 중 명령 되돌리기
         if self._inflight is not None:
             cmd = self._inflight
-            self._cmd_timer.stop()
+            if self._cmd_timer:
+                self._cmd_timer.stop()
             self._inflight = None
             if cmd.retries_left > 0:
                 cmd.retries_left -= 1
-                self._cmd_q.appendleft(cmd)  # 그대로 되돌림
+                self._cmd_q.appendleft(cmd)
             else:
                 self._safe_callback(cmd.callback, None)
 
-        # 포트 닫기
-        if self.serial_mfc.isOpen():
+        # 포트/타이머/버퍼 정리
+        if self.serial_mfc and self.serial_mfc.isOpen():
             self.serial_mfc.close()
-        # 타이머/버퍼 정리
-        self._gap_timer.stop()
+        if self._gap_timer:
+            self._gap_timer.stop()
         self._rx.clear()
 
-        # 재연결은 워치독이 담당(중복 예약 방지)
         QTimer.singleShot(0, self._watch_connection)
 
     def _on_ready_read(self):
-        """줄(\r/\n) 단위 수신 → 에코 라인은 건너뛰고, 실제 응답 한 줄을 전달 (단순 모드)"""
+        """줄(\r/\n) 단위 수신 → 에코 라인은 건너뛰고, 실제 응답 한 줄을 전달"""
+        if not (self.serial_mfc and self.serial_mfc.isOpen()):
+            return
+
         ba = self.serial_mfc.readAll()
         if ba.isEmpty():
             return
@@ -313,21 +311,18 @@ class MFCController(QObject):
         # 1) 버퍼 누적
         self._rx.extend(bytes(ba))
 
-        # RX 오버플로우: 최근 RX_MAX 바이트만 유지(테일 보존, in-place)
+        # RX 오버플로우 방지
         if len(self._rx) > self._RX_MAX:
-            del self._rx[:-self._RX_MAX]  # 앞부분 통으로 버리고 꼬리만 보존
+            del self._rx[:-self._RX_MAX]
             self._overflow_count += 1
             if self._overflow_count % 5 == 1:
                 try:
                     self.status_message.emit("MFC", f"수신 버퍼 과다(RX>{self._RX_MAX}); 최근 {self._RX_MAX}B만 보존.")
                 except Exception:
                     pass
-            try:
-                self._dprint(f"[WARN] RX overflow: keep tail {len(self._rx)}B")
-            except Exception:
-                pass
+            self._dprint(f"[WARN] RX overflow: keep tail {len(self._rx)}B")
 
-        # 3) 줄 경계(\r/\n) 기준으로 라인 단위 파싱
+        # 2) 줄 경계(\r/\n) 기준 파싱
         while True:
             i_cr = self._rx.find(b'\r')
             i_lf = self._rx.find(b'\n')
@@ -337,7 +332,7 @@ class MFCController(QObject):
             idx = i_cr if i_lf == -1 else (i_lf if i_cr == -1 else min(i_cr, i_lf))
             line_bytes = self._rx[:idx]
 
-            # CRLF 또는 LFCR 쌍을 한 번에 건너뛰기
+            # CRLF/LFCR 같이 제거
             drop = idx + 1
             if drop < len(self._rx):
                 ch = self._rx[idx]
@@ -346,10 +341,10 @@ class MFCController(QObject):
                     drop += 1
             del self._rx[:drop]
 
-            # 라인 길이 제한(앞부분만 보존: 토큰/프리픽스 유지)
+            # 라인 길이 제한
             if len(line_bytes) > self._LINE_MAX:
                 over = len(line_bytes) - self._LINE_MAX
-                self._dprint(f"[WARN] RX line too long (+{over}B), truncating tail; keep {self._LINE_MAX}B")
+                self._dprint(f"[WARN] RX line too long (+{over}B), truncating")
                 line_bytes = line_bytes[:self._LINE_MAX]
 
             try:
@@ -358,52 +353,46 @@ class MFCController(QObject):
                 line = None
 
             if not line:
-                # 빈 줄은 패스하고 다음 라인 검사
                 continue
 
-            # 에코 라인(보낸 명령 그대로) 스킵 — 문자열만 비교
+            # 에코 라인 스킵
             if self._inflight:
                 sent_cmd_str = (self._inflight.cmd_str or "").strip()
                 if line == sent_cmd_str:
                     self._dprint(f"[RECV] echo skipped: {repr(line)}")
-                    # 유효 응답을 아직 못 받았으므로 계속 다음 라인 검사
                     continue
 
-            # === 여기서 유효 응답 1줄만 처리하고 종료 ===
+            # 유효 응답 1줄만 처리
             self._dprint(f"[RECV] {repr(line)}")
             self._finish_command(line)
-            break  # 한 번의 readyRead에서 유효 응답은 1줄만 처리
+            break
 
-        # 4) 앞쪽에 남은 연속 CR/LF만 정리(빈 라인 재처리 방지)
+        # 앞쪽 연속 CR/LF 정리
         while self._rx[:1] in (b'\r', b'\n'):
             del self._rx[0:1]
 
-    # ---------- 명령 큐(완전 비동기) ----------
+    # ---------- 명령 큐 ----------
     def enqueue(self, cmd_str: str, on_reply: Callable[[Optional[str]], None],
                 timeout_ms: int = MFC_TIMEOUT, gap_ms: int = MFC_GAP_MS,
                 tag: str = "", retries_left: int = 5,
                 allow_no_reply: bool = False):
-        
-        """명령을 큐에 넣고, inflight가 비었으면 즉시 송신."""
+        """명령을 큐에 넣고, inflight 없고 간격타이머가 비활성일 때 전송 예약"""
         if not cmd_str.endswith('\r'):
             cmd_str += '\r'
 
         self._cmd_q.append(Command(cmd_str, on_reply, timeout_ms, gap_ms, tag, retries_left, allow_no_reply))
-        
-        if (self._inflight is None) and (not self._gap_timer.isActive()):
-            # ✅ 다음 이벤트 루프 틱에 송신 → 재진입/중첩 호출 방지(Faduino와 통일)
+
+        if (self._inflight is None) and (not (self._gap_timer and self._gap_timer.isActive())):
             QTimer.singleShot(0, self._dequeue_and_send)
 
     def _dequeue_and_send(self):
-        # 빠른 리턴
         if self._inflight is not None or not self._cmd_q:
             return
-        if not self.serial_mfc.isOpen():
+        if not (self.serial_mfc and self.serial_mfc.isOpen()):
             return
-        if self._gap_timer.isActive():
+        if self._gap_timer and self._gap_timer.isActive():
             return
-        
-        # 재진입 가드
+
         if self._send_spin:
             self._dprint("[GUARD] _dequeue_and_send re-enter blocked")
             return
@@ -413,16 +402,16 @@ class MFCController(QObject):
             cmd = self._cmd_q.popleft()
             self._inflight = cmd
             self._rx.clear()
+
             self._dprint(f"[SEND] {cmd.cmd_str.strip()} (tag={cmd.tag})")
             self.status_message.emit("MFC > 전송", f"{cmd.tag or ''} {cmd.cmd_str.strip()}".strip())
-            
-            payload = cmd.cmd_str.encode('ascii')
 
+            payload = cmd.cmd_str.encode('ascii')
             n = self.serial_mfc.write(payload)
             n_int = int(n) if isinstance(n, int) or hasattr(n, "__int__") else -1
             if n_int <= 0:
                 raise IOError(f"serial write returned {n_int}")
-            
+
             total = n_int
             if total != len(payload):
                 remain = payload[total:]
@@ -432,24 +421,28 @@ class MFCController(QObject):
                     total += m_int
                 if total != len(payload):
                     raise IOError(f"partial write: queued {total}/{len(payload)} bytes")
-                
+
             self.serial_mfc.flush()
-            self._cmd_timer.stop()
-            self._cmd_timer.start(cmd.timeout_ms)
+
+            if self._cmd_timer:
+                self._cmd_timer.stop()
+                self._cmd_timer.start(cmd.timeout_ms)
 
         except Exception as e:
             self._dprint(f"[ERROR] Send failed: {e}")
             failed = self._inflight
             self._inflight = None
-            self._cmd_timer.stop()
+            if self._cmd_timer:
+                self._cmd_timer.stop()
             if failed:
                 self._cmd_q.appendleft(failed)
             try:
-                if not self.serial_mfc.isOpen():
+                if not (self.serial_mfc and self.serial_mfc.isOpen()):
                     QTimer.singleShot(0, self._try_reconnect)
                 else:
                     gap_ms = failed.gap_ms if failed else 100
-                    self._gap_timer.start(gap_ms)
+                    if self._gap_timer:
+                        self._gap_timer.start(gap_ms)
                     QTimer.singleShot(gap_ms + 1, self._dequeue_and_send)
             except Exception as ee:
                 self._dprint(f"[WARN] reconnect/retry schedule failed: {ee}")
@@ -459,7 +452,6 @@ class MFCController(QObject):
             self._send_spin = False
 
     def _on_cmd_timeout(self):
-        """타임아웃 → 콜백에 None (allow_no_reply에 따라 처리)"""
         if not self._inflight:
             return
         cmd = self._inflight
@@ -473,34 +465,40 @@ class MFCController(QObject):
         if self._inflight is None:
             return
         cmd = self._inflight
-        self._cmd_timer.stop()
+        if self._cmd_timer:
+            self._cmd_timer.stop()
         self._inflight = None
 
-        # 응답 없음 처리
+        # 응답 없음
         if line is None:
             if cmd.allow_no_reply:
                 self._safe_callback(cmd.callback, None)
-                self._gap_timer.start(cmd.gap_ms)
+                if self._gap_timer:
+                    self._gap_timer.start(cmd.gap_ms)
                 return
             if cmd.retries_left > 0:
                 cmd.retries_left -= 1
                 self._cmd_q.appendleft(cmd)
-                if self.serial_mfc.isOpen():
+                if self.serial_mfc and self.serial_mfc.isOpen():
                     self.serial_mfc.close()
                 self._try_reconnect()
                 return
             self._safe_callback(cmd.callback, None)
-            self._gap_timer.start(cmd.gap_ms)
+            if self._gap_timer:
+                self._gap_timer.start(cmd.gap_ms)
             return
 
         # 정상 응답
-        self._safe_callback(cmd.callback, line)
-        self._gap_timer.start(cmd.gap_ms)
+        self._safe_callback(cmd.callback, (line.strip() if isinstance(line, str) else line))
+        if self._gap_timer:
+            self._gap_timer.start(cmd.gap_ms)
 
-    # ---------- 폴링(큐로 통합: 충돌 제거) ----------
+    # ---------- 폴링 ----------
     @Slot(bool)
     def set_process_status(self, should_poll: bool):
-        """공정 시작/중지 시 폴링 ON/OFF"""
+        """공정 시작/중지 시 폴링 ON/OFF (타이머가 준비된 이후에만)"""
+        if not self.polling_timer:
+            return
         if should_poll:
             if not self.polling_timer.isActive():
                 self.status_message.emit("MFC", "주기적 읽기(Polling) 시작"); self._dprint("[RUN] POLL START")
@@ -511,10 +509,8 @@ class MFCController(QObject):
                 self.status_message.emit("MFC", "주기적 읽기(Polling) 중지"); self._dprint("[RUN] POLL STOP")
 
     def _enqueue_poll_cycle(self):
-        # 유량: R60 한 번
         self._read_flow_all_async(tag="[POLL R60]")
 
-        # 압력: 기존 유지
         cmdp = MFC_COMMANDS['READ_PRESSURE']
         def on_p(line: Optional[str]):
             line = (line or "").strip()
@@ -523,54 +519,19 @@ class MFCController(QObject):
         self.enqueue(cmdp, on_p, timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS, tag="[POLL PRESS]")
 
     # ---------- 상위에서 호출하는 공개 API ----------
-    # @Slot()
-    # def abort_current_command(self):
-    #     """현재 진행 중인 명령/안정화/큐를 중단(상위 stop_process와 연동)."""
-    #     if self._is_aborted:
-    #         return
-
-    #     self._is_aborted = True
-
-    #     # ▼ 추가: 타이머 먼저 정지
-    #     self._cmd_timer.stop()
-    #     self._gap_timer.stop()
-
-    #     # 대기 큐: 모두 취소 통지
-    #     while self._cmd_q:
-    #         pending = self._cmd_q.popleft()
-    #         self._safe_callback(pending.callback, None)
-
-    #     # 진행 중 명령: 취소 통지
-    #     if self._inflight:
-    #         tag = self._inflight.tag
-    #         self._safe_callback(self._inflight.callback, None)
-    #         self._inflight = None
-    #         self.status_message.emit("MFC", f"현재 명령({tag}) 중단"); self._dprint(f"[RUN] abort {tag}")
-
-    #     # 안정화 정리
-    #     if self.stabilization_timer.isActive():
-    #         self.stabilization_timer.stop()
-    #     self._stabilizing_channel = None
-    #     self._stabilizing_target = 0.0
-    #     self._pending_cmd_for_timer = None
-
     @Slot(str, dict)
     def handle_command(self, cmd: str, params: dict):
-        """
-        ProcessController가 호출.
-        완전 비동기: 여기서는 '큐에 넣는' 작업만 하며, 결과는 시그널로 보고.
-        """
         self._is_aborted = False
         self.current_cmd = cmd
         self.current_params = params
         self.retry_attempts = 0
 
-        # (A) FLOW_SET: UI→장비 스케일 적용 후 SET, 이어서 검증
+        # (A) FLOW_SET: 스케일 적용 후 SET → 검증
         if cmd == 'FLOW_SET':
             ch = params.get('channel')
-            original_ui = float(params.get('value', 0.0))    # UI 단위
+            original_ui = float(params.get('value', 0.0))
             sf = MFC_SCALE_FACTORS.get(ch, 1.0)
-            scaled = original_ui * sf                        # 장비 단위(전송값)
+            scaled = original_ui * sf
             params['value'] = scaled
             self.status_message.emit("MFC", f"Ch{ch} 유량 스케일: {original_ui:.2f}sccm → 장비 {scaled:.2f}")
             self._dprint(f"[INFO] SCALE ch{ch}: {original_ui} -> {scaled}")
@@ -581,19 +542,13 @@ class MFCController(QObject):
             self.enqueue(set_cmd, after_set, timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS, tag=f"[SET ch{ch}]", allow_no_reply=True)
             return
 
-        # (B) FLOW_ON: ON 전송 → ON상태 확인 → 안정화 시작
-        if cmd == 'FLOW_ON':
+        # (B) FLOW_ON / (C) FLOW_OFF
+        if cmd in ('FLOW_ON', 'FLOW_OFF'):
             ch = params.get('channel')
-            self._apply_flow_onoff_with_L0(ch, True)
+            self._apply_flow_onoff_with_L0(ch, cmd == 'FLOW_ON')
             return
 
-        # (C) FLOW_OFF: OFF 전송 → OFF상태 확인
-        if cmd == 'FLOW_OFF':
-            ch = params.get('channel')
-            self._apply_flow_onoff_with_L0(ch, False)
-            return
-
-        # (D) 밸브: 5초 대기 후 위치 확인
+        # (D) 밸브
         if cmd in ('VALVE_OPEN', 'VALVE_CLOSE'):
             vcmd = MFC_COMMANDS[cmd]
             def after_valve(_line, origin_cmd=cmd):
@@ -602,40 +557,34 @@ class MFCController(QObject):
             self.enqueue(vcmd, after_valve, timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS, tag=f"[{cmd}]", allow_no_reply=True)
             return
 
-        # (E) SP1/4 등 간단 명령
+        # (E) SP1/4
         if cmd in ("SP1_SET", "SP1_ON", "SP4_ON"):
             scmd = MFC_COMMANDS[cmd](**params) if params else MFC_COMMANDS[cmd]
             def after_simple(_line, _cmd=cmd):
                 self._verify_simple_async(_cmd, params)
             self.enqueue(scmd, after_simple, timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS, tag=f"[{cmd}]", allow_no_reply=True)
             return
-        
-        # (E0) ZEROING 류: 장비가 응답을 안 줄 수 있으므로 fire-and-verify-lite
+
+        # (E0) ZEROING 류
         if cmd == "PS_ZEROING":
-            scmd = MFC_COMMANDS["PS_ZEROING"]  # "Z1"
+            scmd = MFC_COMMANDS["PS_ZEROING"]
             def after_ps(_line):
-                # 필요하면 약간 기다렸다가 확인 로직 추가 가능
                 self.command_confirmed.emit("PS_ZEROING")
-            self.enqueue(scmd, after_ps, timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS,
-                        tag="[PS_ZEROING]", allow_no_reply=True)
+            self.enqueue(scmd, after_ps, timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS, tag="[PS_ZEROING]", allow_no_reply=True)
             return
 
         if cmd == "MFC_ZEROING":
             ch = int(params.get("channel", 1))
-            scmd = MFC_COMMANDS["MFC_ZEROING"](channel=ch)  # L5/L6/L7...
+            scmd = MFC_COMMANDS["MFC_ZEROING"](channel=ch)
             def after_mfc(_line):
-                # (옵션) 짧게 대기 후 읽기 검증을 덧붙이고 싶다면 QTimer.singleShot 사용
                 self.command_confirmed.emit("MFC_ZEROING")
-            self.enqueue(scmd, after_mfc, timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS,
-                        tag=f"[MFC_ZEROING ch{ch}]", allow_no_reply=True)
+            self.enqueue(scmd, after_mfc, timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS, tag=f"[MFC_ZEROING ch{ch}]", allow_no_reply=True)
             return
-        
-        # (F) READ 계열 직접 호출
+
+        # (F) READ
         if cmd in ("READ_FLOW", "READ_PRESSURE"):
             if cmd == "READ_FLOW":
                 ch = params.get('channel', 1)
-
-                # ✅ R60 한 번 읽고, 요구 채널만 발췌해서 신호 발생
                 def on_done(vals):
                     if vals and (1 <= ch <= len(vals)):
                         v_hw = vals[ch-1]
@@ -644,7 +593,6 @@ class MFCController(QObject):
                         self.command_confirmed.emit("READ_FLOW")
                     else:
                         self.command_failed.emit("READ_FLOW", "R60 파싱 실패/채널 누락")
-
                 self._read_flow_all_async(on_done=on_done, tag=f"[READ R60 ch{ch}]")
             else:
                 self._read_pressure_async(tag="[READ_PRESSURE]")
@@ -652,17 +600,43 @@ class MFCController(QObject):
 
         self.command_failed.emit(cmd, "알 수 없는 명령"); self._dprint(f"[FAIL] unknown cmd: {cmd}")
 
+    # ---------- 파서/유틸 ----------
+    def _q_prefixes_for(self, cmd_key: str, ch: int) -> tuple[str, ...]:
+        if cmd_key == 'READ_FLOW_SET':  # R65~R68
+            return (f"Q{4 + int(ch)}",)
+        if cmd_key == 'READ_FLOW_ALL':  # R60
+            return ("Q0",)
+        return tuple()
+
+    def _parse_q_value_with_prefixes(self, line: str | None, expected_prefixes: tuple[str, ...]) -> float | None:
+        s = (line or "").strip()
+        for p in expected_prefixes:
+            if s.startswith(p):
+                m = re.match(r'^' + re.escape(p) + r'\s*([+\-]?\d+(?:\.\d+)?)$', s)
+                if m:
+                    try: return float(m.group(1))
+                    except Exception: return None
+                return None
+        return None
+
+    def _parse_r60_values(self, line: str | None) -> list[float] | None:
+        s = (line or "").strip()
+        if not s.startswith("Q0"):
+            return None
+        nums = re.findall(r'([+\-]?\d+(?:\.\d+)?)', s[2:])
+        try: return [float(x) for x in nums]
+        except Exception: return None
+
     # ---------- 비동기 검증/읽기 ----------
     def _verify_flow_set_async(self, ch: int, scaled_value: float,
-                            attempt: int = 1, max_attempts: int = 5, delay_ms: int = MFC_DELAY_MS):
-        cmd = MFC_COMMANDS['READ_FLOW_SET'](channel=ch)      # 1→R65, 2→R66, 3→R67, 4→R68
-        expected = self._q_prefixes_for('READ_FLOW_SET', ch) # ('Q{4+ch}',)
+                               attempt: int = 1, max_attempts: int = 5, delay_ms: int = MFC_DELAY_MS):
+        cmd = MFC_COMMANDS['READ_FLOW_SET'](channel=ch)
+        expected = self._q_prefixes_for('READ_FLOW_SET', ch)
 
         def on_reply(line: Optional[str], ch=ch, scaled_value=scaled_value, attempt=attempt):
             line = (line or "").strip()
             val = self._parse_q_value_with_prefixes(line, expected)
 
-            # Q 접두사인데 Q{4+ch}가 아니면 오채널 → 시도 카운트 증가 없이 재검증
             if val is None and line.startswith('Q'):
                 self.status_message.emit("DBG", f"[FLOW_SET 검증] 접두사 불일치: 기대 {expected}, 응답 {repr(line)}")
                 QTimer.singleShot(MFC_DELAY_MS, lambda: self._verify_flow_set_async(ch, scaled_value, attempt, max_attempts, delay_ms))
@@ -671,17 +645,16 @@ class MFCController(QObject):
             ok = (val is not None) and (abs(val - scaled_value) < 0.1)
 
             if ok:
-                self.last_setpoints[ch] = scaled_value       # 장비 단위 저장
+                self.last_setpoints[ch] = scaled_value
                 sf = MFC_SCALE_FACTORS.get(ch, 1.0)
                 msg = f"Ch{ch} 목표 {scaled_value/sf:.2f} sccm 설정 완료."
                 self.status_message.emit("MFC < 확인", msg); self._dprint(f"[OK ] {msg}")
                 self.command_confirmed.emit("FLOW_SET")
             else:
                 if attempt < max_attempts:
-                    # (옵션) 원 명령 재전송 → 재검증
                     resend_cmd = MFC_COMMANDS['FLOW_SET'](channel=ch, value=scaled_value)
                     self.enqueue(resend_cmd, lambda _line: None,
-                                timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS, tag=f"[RE-SET ch{ch}]", allow_no_reply=True)
+                                 timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS, tag=f"[RE-SET ch{ch}]", allow_no_reply=True)
                     self.status_message.emit("WARN",
                         f"[FLOW_SET 검증 재시도] ch{ch}: 기대={scaled_value:.2f}, 응답={repr(line)} (시도 {attempt}/{max_attempts})")
                     QTimer.singleShot(delay_ms,
@@ -692,10 +665,7 @@ class MFCController(QObject):
         self.enqueue(cmd, on_reply, timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS, tag=f"[VERIFY SET ch{ch}]")
 
     def _apply_flow_onoff_with_L0(self, ch: int, turn_on: bool):
-        """
-        단일 채널 요청(FLOW_ON/FLOW_OFF)을 L0 마스크로 승격해 한 번에 처리.
-        현재 상태는 R69로 읽어서 반영.
-        """
+        """R69로 현재 마스크 읽고, 해당 비트만 수정해 L0로 일괄 적용 → 검증/안정화"""
         def _after_r69(line: Optional[str], ch=ch, turn_on=turn_on):
             now_bits = self._parse_r69_bits((line or "").strip()) or "0000"
             bits = list(now_bits.ljust(4, '0'))
@@ -703,7 +673,6 @@ class MFCController(QObject):
                 bits[ch-1] = '1' if turn_on else '0'
             target = ''.join(bits[:4])
 
-            # ✅ ON일 때만 안정화 훅 전달, 개별 확인 신호도 넘김
             self._set_onoff_mask_and_verify(
                 target,
                 start_stab_for_ch=(ch if turn_on else None),
@@ -725,13 +694,9 @@ class MFCController(QObject):
         max_attempts: int = 2,
         delay_ms: int = MFC_DELAY_MS,
         start_stab_for_ch: int | None = None,
-        confirm_cmd: str | None = None,   # ← 추가
+        confirm_cmd: str | None = None,
     ):
-        """
-        L0<mask> 전송 후 R69로 검증. 실패 시 최대 max_attempts까지 조건부 재전송.
-        """
-
-        # 1) L0 전송 (응답 무시 가능)
+        # 1) L0 전송
         self.enqueue(
             MFC_COMMANDS['SET_ONOFF_MASK'](bits_target),
             lambda _l: None,
@@ -741,40 +706,35 @@ class MFCController(QObject):
             allow_no_reply=True,
         )
 
-        # 2) 검증 콜백 생성기 (재시도 차수 보존)
+        # 2) 검증(필요 시 재시도)
         def make_verify(cur_attempt: int):
             def _verify(line: Optional[str]):
                 now = self._parse_r69_bits((line or "").strip())
-
                 if now == bits_target:
-                    # 일괄 ON/OFF 완료
                     self.command_confirmed.emit("FLOW_ONOFF_BATCH")
-                    if confirm_cmd:                 # ← 개별 확인 신호도 선택적으로 알림
+                    if confirm_cmd:
                         self.command_confirmed.emit(confirm_cmd)
                     self.status_message.emit("MFC < 확인", f"L0 적용 확인: {bits_target}")
 
-                    # ✅ 필요 시 안정화 시작 (기존 타이머/상태 초기화 후 시작)
+                    # 안정화 시작(필요 시)
                     if start_stab_for_ch:
                         ch = start_stab_for_ch
                         if 1 <= ch <= len(bits_target) and bits_target[ch - 1] == '1':
-                            # 기존 안정화 타이머/상태 정리
-                            if self.stabilization_timer.isActive():
+                            if self.stabilization_timer and self.stabilization_timer.isActive():
                                 self.stabilization_timer.stop()
                             self._stabilizing_channel = None
                             self._stabilizing_target = 0.0
                             self._pending_cmd_for_timer = None
 
-                            # 새 안정화 목표 설정(장비 단위)
                             self._stabilizing_channel = ch
                             self._stabilizing_target = float(self.last_setpoints.get(ch, 0.0))
 
-                            if self._stabilizing_target > 0:
+                            if (self._stabilizing_target > 0) and self.stabilization_timer:
                                 self.stabilization_attempts = 0
                                 self._pending_cmd_for_timer = "FLOW_ON"
                                 self.stabilization_timer.start()
                     return
 
-                # 불일치 → 재전송+재검증 (차수 증가)
                 if cur_attempt < max_attempts:
                     self.enqueue(
                         MFC_COMMANDS['SET_ONOFF_MASK'](bits_target),
@@ -795,13 +755,9 @@ class MFCController(QObject):
                         ),
                     )
                 else:
-                    self.command_failed.emit(
-                        "FLOW_ONOFF_BATCH",
-                        f"L0 적용 불일치(now={now}, want={bits_target})",
-                    )
+                    self.command_failed.emit("FLOW_ONOFF_BATCH", f"L0 적용 불일치(now={now}, want={bits_target})")
             return _verify
 
-        # 최초 검증 트리거
         self.enqueue(
             MFC_COMMANDS['READ_MFC_ON_OFF_STATUS'],
             make_verify(attempt),
@@ -811,13 +767,13 @@ class MFCController(QObject):
         )
 
     def _check_valve_position_async(
-        self, 
+        self,
         origin_cmd: str,
-        attempt: int = 1, 
-        max_attempts: int = 5, 
+        attempt: int = 1,
+        max_attempts: int = 5,
         delay_ms: int = MFC_DELAY_MS,
-        resend_on_attempts: tuple = (2, 4),   # ← 이 차수에서만 재전송
-        resend_wait_ms: int = MFC_DELAY_MS_VALVE            # ← 재전송 후 대기(밸브 이동 시간)
+        resend_on_attempts: tuple = (2, 4),
+        resend_wait_ms: int = MFC_DELAY_MS_VALVE
     ):
         cmd = MFC_COMMANDS['READ_VALVE_POSITION']
 
@@ -841,32 +797,21 @@ class MFCController(QObject):
                 self.command_confirmed.emit(origin_cmd)
             else:
                 if attempt < max_attempts:
-                    # ✅ 조건부 재전송 (2, 4번째 시도 등에서만)
                     if attempt in resend_on_attempts:
-                        vcmd = MFC_COMMANDS[origin_cmd]  # VALVE_OPEN or VALVE_CLOSE
-                        self.enqueue(
-                            vcmd,
-                            lambda _l: None,
-                            timeout_ms=MFC_TIMEOUT,
-                            gap_ms=MFC_GAP_MS,
-                            tag=f"[RE-{origin_cmd}]",
-                            allow_no_reply=True,
-                        )
+                        vcmd = MFC_COMMANDS[origin_cmd]
+                        self.enqueue(vcmd, lambda _l: None, timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS,
+                                     tag=f"[RE-{origin_cmd}]", allow_no_reply=True)
                         self.status_message.emit("MFC", f"{origin_cmd} 재전송 (시도 {attempt}/{max_attempts})")
-                        wait = max(delay_ms, resend_wait_ms)  # 재전송 후는 더 길게 대기
+                        wait = max(delay_ms, resend_wait_ms)
                     else:
                         wait = delay_ms
 
-                    self.status_message.emit("WARN", f"[{origin_cmd} 검증 재시도] 응답={repr(line)} (시도 {attempt}/{max_attempts})")
+                    self.status_message.emit("WARN",
+                        f"[{origin_cmd} 검증 재시도] 응답={repr(line)} (시도 {attempt}/{max_attempts})")
                     QTimer.singleShot(
                         wait,
                         lambda: self._check_valve_position_async(
-                            origin_cmd,
-                            attempt + 1,
-                            max_attempts,
-                            delay_ms,
-                            resend_on_attempts,
-                            resend_wait_ms
+                            origin_cmd, attempt + 1, max_attempts, delay_ms, resend_on_attempts, resend_wait_ms
                         )
                     )
                 else:
@@ -875,7 +820,7 @@ class MFCController(QObject):
         self.enqueue(cmd, on_reply, timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS, tag=f"[VERIFY VALVE {origin_cmd}]")
 
     def _verify_simple_async(self, cmd: str, params: dict,
-                            attempt: int = 1, max_attempts: int = 5, delay_ms: int = MFC_DELAY_MS):
+                             attempt: int = 1, max_attempts: int = 5, delay_ms: int = MFC_DELAY_MS):
         if cmd == "SP1_SET":
             val = float(params['value'])
             rd = MFC_COMMANDS['READ_SP1_VALUE']
@@ -921,19 +866,14 @@ class MFCController(QObject):
             self.enqueue(rd, on_reply, timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS, tag=f"[VERIFY {cmd}]")
 
     def _read_flow_all_async(self, on_done=None, tag: str = "[POLL R60]", attempt: int = 1):
-        """
-        R60 한 번으로 모든 채널을 읽어 UI/모니터를 갱신.
-        on_done: 콜백 (vals: list[float] | None) -> None
-        """
+        """R60 한 번으로 모든 채널 읽기"""
         def on_reply(line: Optional[str], attempt=attempt):
             line = (line or "").strip()
-            vals = self._parse_r60_values(line)   # 'Q0+v1+v2+...' -> [v1, v2, ...]
+            vals = self._parse_r60_values(line)
             if not vals:
-                # 폴백 없이 내부 짧은 재시도 1회만
                 if attempt < 2:
                     QTimer.singleShot(MFC_DELAY_MS, lambda: self._read_flow_all_async(on_done, tag, attempt+1))
                 else:
-                    # 상위 로직에 "이번 틱 실패"만 통지
                     if on_done:
                         self._safe_callback(on_done, None)
                 return
@@ -944,8 +884,8 @@ class MFCController(QObject):
                     try:
                         v_hw = vals[idx]
                         sf   = MFC_SCALE_FACTORS.get(ch, 1.0)
-                        self.update_flow.emit(name, v_hw / sf)   # UI(sccm)
-                        self._monitor_flow(ch, v_hw)             # 내부 비교(장비단위)
+                        self.update_flow.emit(name, v_hw / sf)
+                        self._monitor_flow(ch, v_hw)
                     except Exception:
                         pass
 
@@ -953,7 +893,7 @@ class MFCController(QObject):
                 self._safe_callback(on_done, vals)
 
         self.enqueue(MFC_COMMANDS['READ_FLOW_ALL'], on_reply,
-                    timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS, tag=tag)
+                     timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS, tag=tag)
 
     def _read_pressure_async(self, tag: str = ""):
         cmd = MFC_COMMANDS['READ_PRESSURE']
@@ -972,9 +912,10 @@ class MFCController(QObject):
             return
 
         ch = self._stabilizing_channel
-        target = float(self._stabilizing_target)  # 장비 단위
+        target = float(self._stabilizing_target)
         if ch is None or target <= 0:
-            self.stabilization_timer.stop()
+            if self.stabilization_timer:
+                self.stabilization_timer.stop()
             self._stabilizing_channel = None
             self._stabilizing_target = 0.0
             self._pending_cmd_for_timer = None
@@ -994,7 +935,8 @@ class MFCController(QObject):
             )
 
             if (actual_hw is not None) and (abs(actual_hw - target) <= tol):
-                self.stabilization_timer.stop()
+                if self.stabilization_timer:
+                    self.stabilization_timer.stop()
                 self.command_confirmed.emit("FLOW_ON")
                 self._stabilizing_channel = None
                 self._stabilizing_target = 0.0
@@ -1002,24 +944,23 @@ class MFCController(QObject):
                 return
 
             if self.stabilization_attempts >= 30:
-                self.stabilization_timer.stop()
+                if self.stabilization_timer:
+                    self.stabilization_timer.stop()
                 self.command_failed.emit("FLOW_ON", "유량 안정화 시간 초과")
                 self._stabilizing_channel = None
                 self._stabilizing_target = 0.0
                 self._pending_cmd_for_timer = None
 
-        # 이번 틱은 R60만 사용(내부 1회 재시도 포함)
         def _after_all(vals):
             if vals and (ch - 1) < len(vals):
                 _finish(vals[ch - 1])
             else:
-                _finish(None)  # 값 없으면 이번 틱은 실패로 처리
+                _finish(None)
 
         self._read_flow_all_async(on_done=_after_all, tag=f"[STAB R60 ch{ch}]")
 
     def _monitor_flow(self, channel: int, actual_flow_hw: float):
-        """폴링에서 호출: 내부 모니터링은 장비 단위로 비교."""
-        target_flow = self.last_setpoints.get(channel, 0.0)  # 장비 단위
+        target_flow = self.last_setpoints.get(channel, 0.0)
         if target_flow < 0.1:
             self.flow_error_counters[channel] = 0
             return
@@ -1034,7 +975,6 @@ class MFCController(QObject):
 
     # ---------- 보조 ----------
     def _parse_r69_bits(self, resp: str) -> str:
-        """R69 응답 → 상태비트 문자열(예: '1000')."""
         s = (resp or "").strip()
         if s.startswith("L0"):
             payload = s[2:]
@@ -1044,7 +984,7 @@ class MFCController(QObject):
             payload = s
         bits = "".join(ch for ch in payload if ch in "01")
         return bits[:4]
-    
+
     def _safe_callback(self, callback: Callable, *args):
         try:
             callback(*args)
@@ -1052,210 +992,3 @@ class MFCController(QObject):
             self._dprint(traceback.format_exc())
             self._dprint(f"[ERROR] Callback failed: {e}")
             self.status_message.emit("MFC", f"콜백 오류: {e}")
-
-# if __name__ == "__main__":
-#     # ---- 콘솔 기반 테스트 하네스 ----
-#     import sys
-#     from threading import Thread
-#     from PyQt6.QtCore import QCoreApplication, QObject, pyqtSignal as Signal, QTimer
-
-#     class ConsoleInput(QObject):
-#         line_received = Signal(str)
-
-#         def start(self):
-#             t = Thread(target=self._run, daemon=True)
-#             t.start()
-
-#         def _run(self):
-#             #print_menu()
-#             for line in sys.stdin:
-#                 self.line_received.emit(line.strip())
-
-#     def print_menu():
-#         print("\n=== MFC 테스트 메뉴 ===")
-#         print(" 0) Connect MFC (포트 열기)")
-#         print(" 1) Start Polling")
-#         print(" 2) Stop  Polling")
-#         print(" 3) READ_FLOW <ch>")
-#         print(" 4) READ_PRESSURE")
-#         print(" 5) FLOW_SET <ch> <sccm>")
-#         print(" 6) FLOW_ON  <ch>")
-#         print(" 7) FLOW_OFF <ch>")
-#         print(" 8) VALVE_OPEN")
-#         print(" 9) VALVE_CLOSE")
-#         print("10) PS_ZEROING")
-#         print("11) MFC_ZEROING <ch>")
-#         print("12) RAW <cmd>            (예: RAW R60)")
-#         print("99) Cleanup & Quit")
-#         print("======================= 입력 예) 5 1 10.0  (Ch1, 10 sccm 설정)\n", flush=True)
-
-#     def parse_int(x, default=None):
-#         try:
-#             return int(x)
-#         except Exception:
-#             return default
-
-#     def parse_float(x, default=None):
-#         try:
-#             return float(x)
-#         except Exception:
-#             return default
-
-#     app = QCoreApplication(sys.argv)
-
-#     ctr = MFCController()
-#     ctr.debug_print = False
-
-#     # ---- 시그널 로깅: 터미널로 바로 출력 ----
-#     def on_status(section, msg):
-#         print(f"[{section}] {msg}", flush=True)
-
-#     def on_flow(name, sccm):
-#         try:
-#             print(f"[FLOW] {name}: {sccm:.3f} sccm", flush=True)
-#         except Exception:
-#             print(f"[FLOW] {name}: {sccm}", flush=True)
-
-#     def on_pressure(s):
-#         print(f"[PRES] {s}", flush=True)
-
-#     def on_confirmed(cmd):
-#         print(f"[OK] {cmd}", flush=True)
-
-#     def on_failed(cmd, why):
-#         print(f"[FAIL] {cmd} - {why}", flush=True)
-
-#     ctr.status_message.connect(on_status)
-#     ctr.update_flow.connect(on_flow)
-#     ctr.update_pressure.connect(on_pressure)
-#     ctr.command_confirmed.connect(on_confirmed)
-#     ctr.command_failed.connect(on_failed)
-
-#     # ---- 콘솔 입력 → 명령 실행 ----
-#     console = ConsoleInput()
-
-#     def handle_line(line: str):
-#         if not line:
-#             print_menu()
-#             return
-#         parts = line.split()
-#         sel = parts[0].lower()
-
-#         # 숫자 선택지
-#         if sel.isdigit():
-#             n = int(sel)
-
-#             if n == 0:
-#                 ok = ctr.connect_mfc_device()
-#                 print(f"[APP] connect_mfc_device() -> {ok}", flush=True)
-
-#             elif n == 1:
-#                 ctr.set_process_status(True)
-
-#             elif n == 2:
-#                 ctr.set_process_status(False)
-
-#             elif n == 3:
-#                 # READ_FLOW <ch>
-#                 if len(parts) < 2:
-#                     print("사용법: 3 <ch>", flush=True)
-#                 else:
-#                     ch = parse_int(parts[1])
-#                     if ch is None:
-#                         print("ch 정수 필요", flush=True)
-#                     else:
-#                         ctr.handle_command("READ_FLOW", {"channel": ch})
-
-#             elif n == 4:
-#                 ctr.handle_command("READ_PRESSURE", {})
-
-#             elif n == 5:
-#                 # FLOW_SET <ch> <sccm>
-#                 if len(parts) < 3:
-#                     print("사용법: 5 <ch> <sccm>", flush=True)
-#                 else:
-#                     ch = parse_int(parts[1])
-#                     val = parse_float(parts[2])
-#                     if ch is None or val is None:
-#                         print("ch 정수, sccm 실수 필요", flush=True)
-#                     else:
-#                         ctr.handle_command("FLOW_SET", {"channel": ch, "value": val})
-
-#             elif n == 6:
-#                 # FLOW_ON <ch>
-#                 if len(parts) < 2:
-#                     print("사용법: 6 <ch>", flush=True)
-#                 else:
-#                     ch = parse_int(parts[1])
-#                     if ch is None:
-#                         print("ch 정수 필요", flush=True)
-#                     else:
-#                         ctr.handle_command("FLOW_ON", {"channel": ch})
-
-#             elif n == 7:
-#                 # FLOW_OFF <ch>
-#                 if len(parts) < 2:
-#                     print("사용법: 7 <ch>", flush=True)
-#                 else:
-#                     ch = parse_int(parts[1])
-#                     if ch is None:
-#                         print("ch 정수 필요", flush=True)
-#                     else:
-#                         ctr.handle_command("FLOW_OFF", {"channel": ch})
-
-#             elif n == 8:
-#                 ctr.handle_command("VALVE_OPEN", {})
-
-#             elif n == 9:
-#                 ctr.handle_command("VALVE_CLOSE", {})
-
-#             elif n == 10:
-#                 ctr.handle_command("PS_ZEROING", {})
-
-#             elif n == 11:
-#                 # MFC_ZEROING <ch>
-#                 if len(parts) < 2:
-#                     print("사용법: 11 <ch>", flush=True)
-#                 else:
-#                     ch = parse_int(parts[1])
-#                     if ch is None:
-#                         print("ch 정수 필요", flush=True)
-#                     else:
-#                         ctr.handle_command("MFC_ZEROING", {"channel": ch})
-
-#             elif n == 12:
-#                 print("사용법: 12 RAW <cmd>", flush=True)
-
-#             elif n == 99:
-#                 print("[APP] cleanup & quit...", flush=True)
-#                 ctr.cleanup()
-#                 QTimer.singleShot(300, app.quit)
-
-#             else:
-#                 print_menu()
-
-#         else:
-#             # RAW <cmd> 지원: "RAW R60" 또는 "raw L00011" 등
-#             if sel in ("raw",):
-#                 if len(parts) < 2:
-#                     print("사용법: RAW <cmd>  예) RAW R60", flush=True)
-#                 else:
-#                     raw_cmd = " ".join(parts[1:])
-#                     def on_raw_reply(line):
-#                         print(f"[RAW RECV] {repr(line)}", flush=True)
-#                     ctr.enqueue(raw_cmd, on_raw_reply, timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS, tag="[RAW]")
-#             elif sel in ("h", "help", "?"):
-#                 print_menu()
-#             else:
-#                 print_menu()
-
-#         # 다음 입력 유도
-#         print("> ", end="", flush=True)
-
-#     console.line_received.connect(handle_line)
-#     console.start()
-
-#     print_menu()
-#     print("> ", end="", flush=True)
-
-#     sys.exit(app.exec())

@@ -61,8 +61,37 @@ class IGController(QObject):
         super().__init__(parent)
         self.debug_print = DEBUG_PRINT
 
-        # ---- 1) QSerialPort 설정 ----
-        self.serial_ig = QSerialPort(self)
+        # 1) 시리얼/타이머는 여기서 만들지 말고 전부 None으로
+        self.serial_ig = None
+
+        self._cmd_timer = None
+        self._gap_timer = None
+        self.polling_timer = None
+        self._watchdog = None
+
+        self._rx = bytearray(); self._RX_MAX = 16 * 1024
+        self._LINE_MAX = 512;   self._overflow_count = 0
+
+        self._cmd_q = deque()
+        self._inflight = None
+        self._send_spin = False
+
+        self._want_connected = False
+        self._reconnect_backoff_ms = IG_RECONNECT_BACKOFF_START_MS
+        self._reconnect_pending = False
+
+        self._target_pressure = 0.0
+        self._waiting_active = False
+        self._wait_start_s = 0.0
+
+    # -------------------------------------------------
+    # 객체 생성 헬퍼
+    # -------------------------------------------------   
+
+    def _ensure_serial_created(self):
+        if self.serial_ig is not None:
+            return
+        self.serial_ig = QSerialPort(self)                    # IG 스레드에서 생성!
         self.serial_ig.setBaudRate(IG_BAUD)
         self.serial_ig.setDataBits(QSerialPort.DataBits.Data8)
         self.serial_ig.setParity(QSerialPort.Parity.NoParity)
@@ -71,43 +100,26 @@ class IGController(QObject):
         self.serial_ig.readyRead.connect(self._on_ready_read)
         self.serial_ig.errorOccurred.connect(self._on_serial_error)
 
-        # ---- 2) 수신 버퍼/제한 ----
-        self._rx = bytearray()
-        self._RX_MAX = 16 * 1024      # 과도 수신 보호(최대 보존 바이트)
-        self._LINE_MAX = 512          # 한 줄 최대 길이
-        self._overflow_count = 0
+    def _ensure_timers_created(self):
+        if self._cmd_timer is None:
+            self._cmd_timer = QTimer(self)
+            self._cmd_timer.setSingleShot(True)
+            self._cmd_timer.timeout.connect(self._on_cmd_timeout)
 
-        # ---- 3) 명령 큐/인플라이트 ----
-        self._cmd_q: Deque[Command] = deque()
-        self._inflight: Optional[Command] = None      # 현재 진행 중인 단일 명령
-        self._send_spin = False                       # 재진입 가드
+        if self._gap_timer is None:
+            self._gap_timer = QTimer(self)
+            self._gap_timer.setSingleShot(True)
+            self._gap_timer.timeout.connect(self._dequeue_and_send)
 
-        # ---- 4) 타이머들 ----
-        self._cmd_timer = QTimer(self)   # 명령 타임아웃
-        self._cmd_timer.setSingleShot(True)
-        self._cmd_timer.timeout.connect(self._on_cmd_timeout)
+        if self.polling_timer is None:
+            self.polling_timer = QTimer(self)
+            self.polling_timer.setInterval(IG_POLLING_INTERVAL_MS)
+            self.polling_timer.timeout.connect(self._enqueue_read_once)
 
-        self._gap_timer = QTimer(self)   # 인터커맨드 간격
-        self._gap_timer.setSingleShot(True)
-        self._gap_timer.timeout.connect(self._dequeue_and_send)
-
-        self.polling_timer = QTimer(self)                           # 주기 폴링(RDI 큐잉)
-        self.polling_timer.setInterval(IG_POLLING_INTERVAL_MS)
-        self.polling_timer.timeout.connect(self._enqueue_read_once)
-
-        self._watchdog = QTimer(self)                               # 연결 감시/재연결 스케줄러
-        self._watchdog.setInterval(IG_WATCHDOG_INTERVAL_MS)
-        self._watchdog.timeout.connect(self._watch_connection)
-
-        # ---- 5) 연결/재연결 상태 ----
-        self._want_connected = False
-        self._reconnect_backoff_ms = IG_RECONNECT_BACKOFF_START_MS
-        self._reconnect_pending = False
-
-        # ---- 6) 대기 로직 상태 ----
-        self._target_pressure: float = 0.0
-        self._waiting_active: bool = False
-        self._wait_start_s: float = 0.0   # time.monotonic() 기준 시작 시각
+        if self._watchdog is None:
+            self._watchdog = QTimer(self)
+            self._watchdog.setInterval(IG_WATCHDOG_INTERVAL_MS)
+            self._watchdog.timeout.connect(self._watch_connection)    
 
     # -------------------------------------------------
     # 내부 디버그 출력
@@ -128,6 +140,9 @@ class IGController(QObject):
         포트를 열고 워치독을 시작한다.
         - 실패해도 워치독이 지수 백오프로 재연결을 계속 시도한다.
         """
+        self._ensure_serial_created()   # ← 여기서 생성
+        self._ensure_timers_created()
+
         self._want_connected = True
         ok = self._open_port()
         self._watchdog.start()
@@ -162,16 +177,16 @@ class IGController(QObject):
         self._reconnect_pending = False
 
         self.status_message.emit("IG", f"{IG_PORT} 연결 성공 (QSerialPort)")
-        self._dprint(f"[IG ] {IG_PORT} connected")
+        self._dprint(f"[IG ] {IG_PORT} 연결 성공 (QSerialPort)")
         return True
 
     def _watch_connection(self):
         """워치독: 포트가 닫혀 있고 연결 의도가 있으면 지수 백오프로 재연결을 예약."""
-        if not self._want_connected or self.serial_ig.isOpen():
+        if not self._want_connected or (self.serial_ig and self.serial_ig.isOpen()):
             return
         if self._reconnect_pending:
             return
-
+        
         self._reconnect_pending = True
         self.status_message.emit("IG", f"재연결 시도 예약... ({self._reconnect_backoff_ms} ms)")
         self._dprint(f"[IG ] reconnect in {self._reconnect_backoff_ms}ms")
@@ -180,7 +195,7 @@ class IGController(QObject):
     def _try_reconnect(self):
         """예약된 재연결 시도."""
         self._reconnect_pending = False
-        if not self._want_connected or self.serial_ig.isOpen():
+        if not self._want_connected or (self.serial_ig and self.serial_ig.isOpen()):
             return
 
         if self._open_port():
@@ -195,23 +210,10 @@ class IGController(QObject):
 
     @Slot()
     def cleanup(self):
-        """
-        안전 종료:
-          - 모든 타이머 정지
-          - 인플라이트/대기 중 명령에 콜백(None) 통지
-          - 버퍼/포트 정리
-        """
         self._want_connected = False
         self._waiting_active = False
 
-        # 타이머 정지
-        self._cmd_timer.stop()
-        self._gap_timer.stop()
-        self.polling_timer.stop()
-        self._watchdog.stop()
-        self._reconnect_pending = False
-
-        # 진행 중/대기 중 콜백에 취소 통지
+        # 진행 중 명령 취소 통지
         if self._inflight is not None:
             self._safe_callback(self._inflight.callback, None)
             self._inflight = None
@@ -219,29 +221,45 @@ class IGController(QObject):
             cmd = self._cmd_q.popleft()
             self._safe_callback(cmd.callback, None)
 
-        # 버퍼/포트 정리
+        # 타이머들 정지/파기
+        for t_attr in ("_cmd_timer", "_gap_timer", "polling_timer", "_watchdog"):
+            t = getattr(self, t_attr)
+            if t:
+                t.stop()
+                t.deleteLater()
+                setattr(self, t_attr, None)
+
+        # 시리얼 정리
+        if self.serial_ig:
+            try:
+                if self.serial_ig.isOpen():
+                    self.serial_ig.close()
+            finally:
+                self.serial_ig.deleteLater()
+                self.serial_ig = None
+
         self._rx.clear()
-        if self.serial_ig.isOpen():
-            self.serial_ig.close()
-            self.status_message.emit("IG", "연결 종료됨")
+        self._reconnect_pending = False
+        self.status_message.emit("IG", "연결 종료됨")
+
 
     # =================================================
     # 시리얼 이벤트(오류/수신)
     # =================================================
     def _on_serial_error(self, err: QSerialPort.SerialPortError):
-        """Qt 시리얼 오류 콜백: 진행 중 명령 롤백 + 포트 닫기 + 워치독 재연결."""
         if err == QSerialPort.SerialPortError.NoError:
             return
 
         err_name = getattr(err, "name", str(err))
         err_code = getattr(err, "value", "?")
-        msg = f"시리얼 오류: {self.serial_ig.errorString()} (err={err_name}/{err_code})"
+        serr = self.serial_ig.errorString() if self.serial_ig else ""
+        msg = f"시리얼 오류: {serr} (err={err_name}/{err_code})"
         self.status_message.emit("IG", msg); self._dprint(f"[ERR] {msg}")
 
-        # 진행 중 명령을 재시도 기회 유지한 채로 되돌림
         if self._inflight is not None:
             cmd = self._inflight
-            self._cmd_timer.stop()
+            if self._cmd_timer:
+                self._cmd_timer.stop()
             self._inflight = None
             if cmd.retries_left > 0:
                 cmd.retries_left -= 1
@@ -249,13 +267,12 @@ class IGController(QObject):
             else:
                 self._safe_callback(cmd.callback, None)
 
-        # 포트 닫고 버퍼/갭 타이머 정리 → 재연결은 워치독이 담당
-        if self.serial_ig.isOpen():
+        if self.serial_ig and self.serial_ig.isOpen():
             self.serial_ig.close()
-        self._gap_timer.stop()
+        if self._gap_timer:
+            self._gap_timer.stop()
         self._rx.clear()
 
-        # 다음 틱에 워치독이 동작하도록 트리거
         QTimer.singleShot(0, self._watch_connection)
 
     def _on_ready_read(self):
@@ -265,6 +282,8 @@ class IGController(QObject):
           - 보낸 명령 에코 라인 스킵
           - 유효 응답 1줄만 처리(_finish_command) → 나머지는 다음 틱
         """
+        if not (self.serial_ig and self.serial_ig.isOpen()):
+            return
         ba = self.serial_ig.readAll()
         if ba.isEmpty():
             return
@@ -340,17 +359,16 @@ class IGController(QObject):
             cmd_str += '\r'
         self._cmd_q.append(Command(cmd_str, on_reply, timeout_ms, gap_ms, tag, retries_left, allow_no_reply))
 
-        # 인플라이트가 없고 갭 타이머가 쉬는 중이면 즉시 송신 시도 예약
-        if (self._inflight is None) and (not self._gap_timer.isActive()):
+        # ✅ 인플라이트 없고, 갭 타이머가 없거나 비활성일 때만 송신 예약 (이 블록만 유지)
+        if (self._inflight is None) and (not (self._gap_timer and self._gap_timer.isActive())):
             QTimer.singleShot(0, self._dequeue_and_send)
 
     def _dequeue_and_send(self):
-        """큐에서 1건을 꺼내 전송하고, 타임아웃 타이머를 시작한다."""
         if self._inflight is not None or not self._cmd_q:
             return
-        if not self.serial_ig.isOpen():
+        if not (self.serial_ig and self.serial_ig.isOpen()):
             return
-        if self._gap_timer.isActive():
+        if self._gap_timer and self._gap_timer.isActive():
             return
 
         if self._send_spin:
@@ -372,7 +390,6 @@ class IGController(QObject):
             if n <= 0:
                 raise IOError(f"serial write returned {n}")
 
-            # 부분 쓰기 보정(실제 QSerialPort는 보통 한 번에 다 보냄)
             total = n
             if total != len(payload):
                 remain = payload[total:]
@@ -384,26 +401,30 @@ class IGController(QObject):
                     raise IOError(f"partial write: queued {total}/{len(payload)} bytes")
 
             self.serial_ig.flush()
-            self._cmd_timer.stop()
-            self._cmd_timer.start(cmd.timeout_ms)
+
+            if self._cmd_timer:
+                self._cmd_timer.stop()
+                self._cmd_timer.start(cmd.timeout_ms)
 
         except Exception as e:
-            # 전송 실패 → 해당 명령 보존/재시도 예약 또는 재연결
             self._dprint(f"[ERROR] Send failed: {e}")
             failed = self._inflight
             self._inflight = None
-            self._cmd_timer.stop()
+            if self._cmd_timer:
+                self._cmd_timer.stop()
             if failed:
                 self._cmd_q.appendleft(failed)
             try:
-                if not self.serial_ig.isOpen():
+                if not (self.serial_ig and self.serial_ig.isOpen()):
                     QTimer.singleShot(0, self._try_reconnect)
                 else:
                     gap_ms = failed.gap_ms if failed else 100
-                    self._gap_timer.start(gap_ms)
+                    if self._gap_timer:
+                        self._gap_timer.start(gap_ms)
                     QTimer.singleShot(gap_ms + 1, self._dequeue_and_send)
             except Exception as ee:
                 self._dprint(f"[WARN] reconnect/retry schedule failed: {ee}")
+
             self.status_message.emit("IG", f"전송 오류: {e}")
             return
         finally:
@@ -430,34 +451,33 @@ class IGController(QObject):
             return
 
         cmd = self._inflight
-        self._cmd_timer.stop()
+        if self._cmd_timer:
+            self._cmd_timer.stop()
         self._inflight = None
 
-        # 응답 없음 처리
         if line is None:
             if cmd.allow_no_reply:
-                # 응답은 없어도 정상 진행
                 self._safe_callback(cmd.callback, None)
-                self._gap_timer.start(cmd.gap_ms)
+                if self._gap_timer:
+                    self._gap_timer.start(cmd.gap_ms)
                 return
 
-            # 재시도 기회가 있으면 되돌리고 재연결
             if cmd.retries_left > 0:
                 cmd.retries_left -= 1
                 self._cmd_q.appendleft(cmd)
-                if self.serial_ig.isOpen():
+                if self.serial_ig and self.serial_ig.isOpen():
                     self.serial_ig.close()
                 self._try_reconnect()
                 return
 
-            # 더 이상 재시도 불가 → 콜백 통지 후 진행
             self._safe_callback(cmd.callback, None)
-            self._gap_timer.start(cmd.gap_ms)
+            if self._gap_timer:
+                self._gap_timer.start(cmd.gap_ms)
             return
 
-        # 정상 응답 처리
         self._safe_callback(cmd.callback, line.strip())
-        self._gap_timer.start(cmd.gap_ms)
+        if self._gap_timer:
+            self._gap_timer.start(cmd.gap_ms)
 
     # =================================================
     # 외부 API
@@ -479,7 +499,7 @@ class IGController(QObject):
             return
 
         # 포트 연결 + 워치독 시작
-        if not self.serial_ig.isOpen():
+        if not (self.serial_ig and self.serial_ig.isOpen()):
             if not self.connect_ig_device():
                 self.base_pressure_failed.emit("IG", "포트 연결 실패")
                 return
@@ -563,3 +583,14 @@ class IGController(QObject):
         except Exception as e:
             self._dprint(f"[ERROR] Callback failed: {e}")
             self.status_message.emit("IG", f"콜백 오류: {e}")
+
+    @Slot()
+    def start_polling(self):
+        if self.polling_timer:
+            self.polling_timer.start()
+
+    @Slot()
+    def stop_polling(self):
+        if self.polling_timer:
+            self.polling_timer.stop()
+

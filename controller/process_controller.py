@@ -305,7 +305,7 @@ class ProcessController(QObject):
         common_info = self._get_common_process_info(params)
         gun_shutters, gas_info = common_info['gun_shutters'], common_info['gas_info']
 
-        shutdown_steps.append(ProcessStep(action=ActionType.FADUINO_CMD, params=('MS', False), message='Main Shutter 닫기'))
+        shutdown_steps.append(ProcessStep(action=ActionType.FADUINO_CMD, params=('MS', False), message='Main Shutter 닫기 (항상 닫음)'))
 
         if common_info['use_dc']:
             shutdown_steps.append(ProcessStep(action=ActionType.DC_POWER_STOP, message='DC Power Off'))

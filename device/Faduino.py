@@ -632,6 +632,9 @@ class FaduinoController(QObject):
 
     @Slot()
     def force_dc_read(self):
+        if not getattr(self, "is_dc_active", False):
+            return
+
         def on_d(line: Optional[str]):
             p = self._parse_ok_and_compute(line or "")
             if p and p.get("type") == "ERROR":

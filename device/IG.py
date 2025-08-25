@@ -515,7 +515,7 @@ class IGController(QObject):
             pass
 
         self.enqueue("SIG 1", _after_on,
-                     timeout_ms=IG_TIMEOUT_MS, gap_ms=1000,
+                     timeout_ms=IG_TIMEOUT_MS, gap_ms=5000,
                      tag="[IG ON]", retries_left=1, allow_no_reply=True)
 
         # (B) 첫 읽기 — 큐 뒤에 붙인다 → 위 gap 1초 후 자동 전송됨

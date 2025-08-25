@@ -31,6 +31,8 @@ class MainWindow(QWidget):
     request_ig_cleanup      = Signal()
     request_oes_cleanup     = Signal()
 
+    stop_all = Signal() # 모든 장치 하드스톱
+
     def __init__(self):
         super().__init__()
         self.ui = Ui_Form()
@@ -450,7 +452,7 @@ class MainWindow(QWidget):
         if self.current_process_index < len(self.process_queue):
             params = self.process_queue[self.current_process_index]
             self._update_ui_from_params(params)
-            QTimer.singleShot(100, lambda p=params: self._safe_start_process(p))
+            QTimer.singleShot(100, lambda p=params: self._safe_start_process(self._normalize_params_for_process(p)))
         else:
             self.append_log("MAIN", "모든 공정이 완료되었습니다.")
             self.process_queue = []
@@ -787,6 +789,64 @@ class MainWindow(QWidget):
                     ctrl.cleanup()
             except Exception:
                 pass
+
+    def _normalize_params_for_process(self, raw: dict) -> dict:
+        def tf(v):
+            return str(v).strip().upper() in ("T","TRUE","1","Y","YES")
+
+        def fget(key, default="0"):
+            try:
+                return float(str(raw.get(key, default)).strip())
+            except Exception:
+                return float(default)
+
+        def iget(key, default="0"):
+            try:
+                return int(float(str(raw.get(key, default)).strip()))
+            except Exception:
+                return int(default)
+
+        out = {
+            # 공통 수치
+            "base_pressure":     fget("base_pressure", "1e-5"),
+            "working_pressure":  fget("working_pressure", "0"),
+            "process_time":      fget("process_time", "0"),
+            "shutter_delay":     fget("shutter_delay", "0"),
+            "integration_time":  iget("integration_time", "60"),
+            "dc_power":          fget("dc_power", "0"),
+            "rf_power":          fget("rf_power", "0"),
+
+            # 파워 사용 여부
+            "use_rf_power":      tf(raw.get("use_rf_power", "F")),
+            "use_dc_power":      tf(raw.get("use_dc_power", "F")),
+
+            # 가스 사용 여부 (CSV 대문자 키 → 표준 키)
+            "use_ar":            tf(raw.get("Ar", "F")),
+            "use_o2":            tf(raw.get("O2", "F")),
+            "use_n2":            tf(raw.get("N2", "F")),
+
+            # 가스 유량 (CSV의 대문자 키 → 소문자 표준 키)
+            "ar_flow":           fget("Ar_flow", "0"),
+            "o2_flow":           fget("O2_flow", "0"),
+            "n2_flow":           fget("N2_flow", "0"),
+
+            # 건 셔터 (gun1/gun2/gun3 → use_g1/use_g2/use_g3)
+            "use_g1":            tf(raw.get("gun1", "F")),
+            "use_g2":            tf(raw.get("gun2", "F")),
+            "use_g3":            tf(raw.get("gun3", "F")),
+
+            # 메인 셔터
+            "use_ms":            tf(raw.get("main_shutter", "F")),
+
+            # 메모(이름)
+            "process_note":      raw.get("Process_name", raw.get("process_note", "")),
+        }
+
+        # (선택) 타겟 이름이 CSV에 있으면 그대로 전파
+        for k in ("G1_target_name","G2_target_name","G3_target_name"):
+            if k in raw: out[k] = raw[k]
+        return out
+
 
 
 if __name__ == "__main__":

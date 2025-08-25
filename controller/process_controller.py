@@ -747,6 +747,11 @@ class ProcessController(QObject):
         print("="*50)
 
     # ---------------- 안전/리셋 ----------------
+    def stop_now(self):   # 새로 추가 (작은 public 메서드)
+        if not self.is_running:
+            return
+        self._finish_process(False)  # ← 내부에서 step_timer/폴링 중지 + process_aborted emit
+
     def emergency_stop(self):
         self.log_message.emit("Process", "*** 비상 정지 활성화 ***")
         self._in_emergency = True

@@ -4,7 +4,7 @@ import csv
 import atexit, signal
 from datetime import datetime
 from PyQt6.QtWidgets import QApplication, QWidget, QMessageBox, QFileDialog
-from PyQt6.QtCore import QCoreApplication, QTimer, QThread, pyqtSlot as Slot
+from PyQt6.QtCore import QCoreApplication, Qt, QMetaObject, QTimer, QThread, pyqtSlot as Slot, pyqtSignal as Signal
 
 # === controller import ===
 from UI import Ui_Form
@@ -21,6 +21,17 @@ from controller.process_controller import ProcessController
 
 
 class MainWindow(QWidget):
+    # UI → 장치(워커) 요청 신호들 (클래스 속성으로 선언!)
+    request_faduino_connect = Signal()
+    request_mfc_connect     = Signal()
+    request_ig_connect      = Signal()
+    request_oes_initialize  = Signal()
+    request_faduino_cleanup = Signal()
+    request_mfc_cleanup     = Signal()
+    request_ig_cleanup      = Signal()
+    request_oes_cleanup     = Signal()
+
+
     def __init__(self):
         super().__init__()
         self.ui = Ui_Form()
@@ -116,107 +127,155 @@ class MainWindow(QWidget):
                     pass
 
     def _connect_signals(self):
-        # ▼▼▼ [추가] 데이터 로깅을 위한 신호 연결 ▼▼▼
-        # 1. 공정 시작/종료 신호를 DataLogger에 연결
+        # === DataLogger ===
         self.process_controller.process_started.connect(self.data_logger.start_new_log_session)
         self.process_controller.process_finished.connect(self.data_logger.finalize_and_write_log)
-
-        # # 2. 각 장치 컨트롤러의 데이터 신호를 DataLogger의 슬롯에 연결
         self.ig_controller.pressure_update.connect(self.data_logger.log_ig_pressure)
         self.faduino_controller.dc_power_updated.connect(self.data_logger.log_dc_power)
         self.faduino_controller.rf_power_updated.connect(self.data_logger.log_rf_power)
         self.mfc_controller.update_flow.connect(self.data_logger.log_mfc_flow)
         self.mfc_controller.update_pressure.connect(self.data_logger.log_mfc_pressure)
 
-        # # 로깅 연결
-        self.faduino_controller.status_message.connect(self.append_log)
-        self.mfc_controller.status_message.connect(self.append_log)
-        self.oes_controller.status_message.connect(self.append_log)
+        # === 로그 / 상태표시 ===
+        # status_message가 있는 장치들만 루프에 넣기
+        for src in (self.faduino_controller, self.mfc_controller,
+                    self.oes_controller, self.ig_controller, self.rga_controller):
+            src.status_message.connect(self.append_log)
+
+        # 파워 컨트롤러는 따로 명시
         self.dc_power_controller.status_message.connect(self.append_log)
         self.rf_power_controller.status_message.connect(self.append_log)
+
+        # ProcessController는 status_message가 아니라 log_message 사용
         self.process_controller.log_message.connect(self.append_log)
-        self.ig_controller.status_message.connect(self.append_log)
-        self.rga_controller.status_message.connect(self.append_log)
+
+        # 진행 상태 텍스트는 그대로 유지
         self.process_controller.update_process_state.connect(self.on_update_process_state)
 
-        # # ProcessController -> 각 장치 (명령)
-        self.process_controller.update_faduino_port.connect(self.faduino_controller.handle_named_command)
-        self.process_controller.mfc_command_requested.connect(self.mfc_controller.handle_command)
-        self.process_controller.oes_command_requested.connect(self.oes_controller.run_measurement)
-        self.process_controller.dc_power_command_requested.connect(self.dc_power_controller.start_process)
-        self.process_controller.dc_power_stop_requested.connect(self.dc_power_controller.stop_process)
-        self.process_controller.rf_power_command_requested.connect(self.rf_power_controller.start_process) 
-        self.process_controller.rf_power_stop_requested.connect(self.rf_power_controller.stop_process)
-        self.process_controller.rga_external_scan_requested.connect(self.rga_controller.execute_external_scan)
-        self.process_controller.ig_command_requested.connect(self.ig_controller.start_wait_for_pressure)
+        # === ProcessController -> 각 장치 (cross-thread = Queued) ===
+        self.process_controller.update_faduino_port.connect(
+            self.faduino_controller.handle_named_command,
+            type=Qt.ConnectionType.QueuedConnection
+        )
+        self.process_controller.mfc_command_requested.connect(
+            self.mfc_controller.handle_command,
+            type=Qt.ConnectionType.QueuedConnection
+        )
+        self.process_controller.oes_command_requested.connect(
+            self.oes_controller.run_measurement,
+            type=Qt.ConnectionType.QueuedConnection
+        )
+        self.process_controller.dc_power_command_requested.connect(
+            self.dc_power_controller.start_process,
+            type=Qt.ConnectionType.QueuedConnection
+        )
+        self.process_controller.dc_power_stop_requested.connect(
+            self.dc_power_controller.stop_process,
+            type=Qt.ConnectionType.QueuedConnection
+        )
+        self.process_controller.rf_power_command_requested.connect(
+            self.rf_power_controller.start_process,
+            type=Qt.ConnectionType.QueuedConnection
+        )
+        self.process_controller.rf_power_stop_requested.connect(
+            self.rf_power_controller.stop_process,
+            type=Qt.ConnectionType.QueuedConnection
+        )
+        self.process_controller.rga_external_scan_requested.connect(
+            self.rga_controller.execute_external_scan,
+            type=Qt.ConnectionType.QueuedConnection
+        )
+        self.process_controller.ig_command_requested.connect(
+            self.ig_controller.start_wait_for_pressure,
+            type=Qt.ConnectionType.QueuedConnection
+        )
 
-        # # 각 장치 -> ProcessController (완료 보고)
-        self.mfc_controller.command_confirmed.connect(self.process_controller.on_step_completed)
-        self.mfc_controller.command_failed.connect(self.process_controller.on_step_failed)
-        self.oes_controller.oes_finished.connect(self.process_controller.on_step_completed)
-        self.oes_controller.oes_failed.connect(self.process_controller.on_step_failed)
-        self.dc_power_controller.target_reached.connect(self.process_controller.on_step_completed)
-        #self.dc_power_controller.target_failed.connect(self.process_controller.on_step_failed)
-        self.dc_power_controller.power_off_finished.connect(self.process_controller.on_step_completed)
-        self.rf_power_controller.target_failed.connect(self.process_controller.on_step_failed)
-        self.rf_power_controller.power_off_finished.connect(self.process_controller.on_step_completed)
-        self.rf_power_controller.target_reached.connect(self.process_controller.on_step_completed)
-        self.faduino_controller.command_confirmed.connect(self.process_controller.on_step_completed)
-        self.faduino_controller.command_failed.connect(self.process_controller.on_step_failed)
+        # === set_polling (cross-thread) ===
+        self.process_controller.set_polling.connect(
+            self.faduino_controller.set_process_status,
+            type=Qt.ConnectionType.QueuedConnection
+        )
+        self.process_controller.set_polling.connect(
+            self.mfc_controller.set_process_status,
+            type=Qt.ConnectionType.QueuedConnection
+        )
 
-        self.rga_controller.scan_finished.connect(self.process_controller.on_step_completed)
-        self.rga_controller.scan_failed.connect(self.process_controller.on_step_failed)
-        self.ig_controller.base_pressure_reached.connect(self.process_controller.on_step_completed)
-        self.ig_controller.base_pressure_failed.connect(self.process_controller.on_step_failed)
+        # === 비상 종료(정리) : cleanup은 BlockingQueued ===
+        self.process_controller.process_aborted.connect(
+            self.mfc_controller.cleanup,
+            type=Qt.ConnectionType.BlockingQueuedConnection
+        )
+        self.process_controller.process_aborted.connect(
+            self.ig_controller.cleanup,
+            type=Qt.ConnectionType.BlockingQueuedConnection
+        )
+        self.process_controller.process_aborted.connect(
+            self.faduino_controller.cleanup,
+            type=Qt.ConnectionType.BlockingQueuedConnection
+        )
+        self.process_controller.process_aborted.connect(
+            self.oes_controller.cleanup,
+            type=Qt.ConnectionType.BlockingQueuedConnection
+        )
+        # 파워류는 stop만 요청하면 되므로 Queued로 충분
+        self.process_controller.process_aborted.connect(
+            self.rf_power_controller.stop_process,
+            type=Qt.ConnectionType.QueuedConnection
+        )
+        self.process_controller.process_aborted.connect(
+            self.dc_power_controller.stop_process,
+            type=Qt.ConnectionType.QueuedConnection
+        )
 
-        # ProcessController -> 폴링 제어: set_polling 신호 하나로 모든 장비의 폴링 상태를 동기화
-        self.process_controller.set_polling.connect(self.faduino_controller.set_process_status)
-        self.process_controller.set_polling.connect(self.mfc_controller.set_process_status)
+        # === UI → 장치(연결/정리/초기화) 요청 ===
+        self.request_faduino_connect.connect(
+            self.faduino_controller.connect_faduino,
+            type=Qt.ConnectionType.QueuedConnection
+        )
+        self.request_mfc_connect.connect(
+            self.mfc_controller.connect_mfc_device,
+            type=Qt.ConnectionType.QueuedConnection
+        )
+        self.request_ig_connect.connect(
+            self.ig_controller.connect_ig_device,
+            type=Qt.ConnectionType.QueuedConnection
+        )
+        # OES는 워커 스레드에 있으므로 초기화/정리도 신호로
+        self.request_oes_initialize.connect(
+            self.oes_controller.initialize_device,
+            type=Qt.ConnectionType.BlockingQueuedConnection
+        )
+        self.request_oes_cleanup.connect(
+            self.oes_controller.cleanup,
+            type=Qt.ConnectionType.BlockingQueuedConnection
+        )
 
-        # ProcessController -> 비상 종료: process_aborted 신호 하나로 모든 장비의 cleanup을 실행
-        self.process_controller.process_aborted.connect(self.mfc_controller.cleanup)
-        #self.process_controller.process_aborted.connect(self.mfc_controller.abort_current_command)
-        self.process_controller.process_aborted.connect(self.ig_controller.cleanup)
-        self.process_controller.process_aborted.connect(self.faduino_controller.cleanup)
-        self.process_controller.process_aborted.connect(self.oes_controller.cleanup)
-        # 파워도 추가하는게 맞는지?
-        self.process_controller.process_aborted.connect(self.rf_power_controller.stop_process)
-        self.process_controller.process_aborted.connect(self.dc_power_controller.stop_process)
-
-
-        # (추가) 파워 컨트롤러의 상태 변경 신호를 Faduino의 새 슬롯에 연결
+        # === 파워 ↔ Faduino 상태 연동 / 표시 ===
         self.rf_power_controller.state_changed.connect(self.faduino_controller.on_rf_state_changed)
         self.dc_power_controller.state_changed.connect(self.faduino_controller.on_dc_state_changed)
-
-        # # DC Power 연결
         self.dc_power_controller.request_status_read.connect(self.faduino_controller.force_dc_read)
         self.dc_power_controller.send_dc_power_value.connect(self.faduino_controller.set_dc_power)
         self.dc_power_controller.send_dc_power_value_unverified.connect(self.faduino_controller.set_dc_power_unverified)
         self.faduino_controller.dc_power_updated.connect(self.dc_power_controller.update_measurements)
         self.dc_power_controller.update_dc_status_display.connect(self.handle_dc_power_display)
 
-        # # RF Power 연결
         self.rf_power_controller.request_status_read.connect(self.faduino_controller.force_rf_read)
         self.rf_power_controller.send_rf_power_value.connect(self.faduino_controller.set_rf_power)
         self.rf_power_controller.send_rf_power_value_unverified.connect(self.faduino_controller.set_rf_power_unverified)
         self.faduino_controller.rf_power_updated.connect(self.rf_power_controller.update_measurements)
         self.rf_power_controller.update_rf_status_display.connect(self.handle_rf_power_display)
 
-        # RGA, OES 그래프 연결
+        # === 그래프 / UI 업데이트 ===
         self.rga_controller.rga_data_updated.connect(self.graph_controller.update_rga_plot)
         self.oes_controller.oes_data_updated.connect(self.graph_controller.update_oes_plot)
-
-        # MFC UI 업데이트 연결
         self.mfc_controller.update_flow.connect(self.update_mfc_flow_ui)
         self.mfc_controller.update_pressure.connect(self.update_mfc_pressure_ui)
-        
-        # UI 버튼 연결
+
+        # === 버튼/상태 ===
         self.ui.Start_button.clicked.connect(self.on_start_button_clicked)
-        #self.ui.Stop_button.clicked.connect(self.process_controller.abort_process)
         self.ui.Stop_button.clicked.connect(self.on_stop_button_clicked)
         self.ui.Process_list_button.clicked.connect(self.on_process_list_button_clicked)
         self.process_controller.process_status_changed.connect(self._on_process_status_changed)
-        # 초기 UI Stop button 비활성화
         self._on_process_status_changed(False)
 
     # <--- 추가: Faduino의 DC 전압/전류 피드백을 처리하는 슬롯 ---
@@ -389,20 +448,20 @@ class MainWindow(QWidget):
     def _check_and_connect_devices(self):
         """모든 장비의 연결을 확인하고, 끊겨있으면 연결을 시도합니다. 하나라도 실패하면 False를 반환합니다."""
 
-        # Faduino (QSerialPort + 워치독: 즉시 실패해도 백그라운드 재시도)
+        # Faduino
         if not getattr(self.faduino_controller, "serial_faduino", None) \
         or not self.faduino_controller.serial_faduino.isOpen():
-            self.faduino_controller.connect_faduino()  # 성공/실패는 Faduino 워치독이 재시도
-        
-        # MFC (QSerialPort + 워치독: 즉시 실패해도 백그라운드 재시도)
+            self.request_faduino_connect.emit()
+
+        # MFC
         if not getattr(self.mfc_controller, "serial_mfc", None) \
         or not self.mfc_controller.serial_mfc.isOpen():
-            self.mfc_controller.connect_mfc_device()  # 성공/실패는 MFC 워치독이 재시도
+            self.request_mfc_connect.emit()
 
-        # 3. IG (QSerialPort + 워치독: 즉시 실패해도 백그라운드 재시도)
+        # IG
         if not getattr(self.ig_controller, "serial_ig", None) \
         or not self.ig_controller.serial_ig.isOpen():
-            self.ig_controller.connect_ig_device()  # 성공/실패는 IG 워치독이 재시도
+            self.request_ig_connect.emit()
             
         # 4. OES (main에서 쓰레드를 사용하니 보완필요)
         if self.oes_controller.sChannel < 0:
@@ -723,13 +782,13 @@ class MainWindow(QWidget):
             pass
 
         # 1) 장비 직접 cleanup (이중 안전장치)
-        try: self.faduino_controller.cleanup()
+        try: self.request_faduino_cleanup.emit()
         except Exception: pass
-        try: self.mfc_controller.cleanup()
+        try: self.request_mfc_cleanup.emit()
         except Exception: pass
-        try: self.ig_controller.cleanup()
+        try: self.request_ig_cleanup.emit()
         except Exception: pass
-        try: self.oes_controller.cleanup()
+        try: self.oes_controller.cleanup()  # OES가 메인 스레드 소속이면 직접 호출 OK
         except Exception: pass
         # (RF/DC 컨트롤러는 Faduino를 통해 파워 0으로 내리므로 별도 close 불필요)
 

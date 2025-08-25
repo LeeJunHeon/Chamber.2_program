@@ -127,6 +127,7 @@ class FaduinoController(QObject):
                 pass
 
     # ------------- 연결/해제 & 워치독 -------------
+    @Slot()
     def connect_faduino(self) -> bool:
         """포트를 열고 워치독 시작. 실패해도 워치독이 재연결 시도."""
         self._want_connected = True

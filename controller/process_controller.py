@@ -609,6 +609,8 @@ class ProcessController(QObject):
         else:
             self.log_message.emit("Process", "=== 공정이 중단되었습니다 ===")
             self.update_process_state.emit("공정 중단됨")
+            # 모든 장치에 중단 신호 전파
+            self.process_aborted.emit()
         
         self.process_status_changed.emit(False)
         self.process_finished.emit(success)
@@ -626,9 +628,6 @@ class ProcessController(QObject):
         self.log_message.emit("Process", "공정 긴급 중단을 시작합니다...")
         self._aborting = True
         self._accept_completions = False
-        
-        # 모든 장치에 중단 신호 전파
-        self.process_aborted.emit()
         
         # 긴급 종료 시퀀스 실행
         emergency_steps = self._create_emergency_shutdown_sequence()

@@ -114,13 +114,13 @@ class ProcessController(QObject):
         self._countdown_base_message = ""
 
         # MFC 확인 화이트리스트(폴링으로 오는 READ_*는 스텝완료로 취급 X)
-        self._mfc_ok_cmds = {
-            "FLOW_SET", "FLOW_ON", "FLOW_OFF",
-            "SP1_SET", "SP1_ON", "SP4_ON",
-            "MFC_ZEROING", "PS_ZEROING",
-            "VALVE_OPEN", "VALVE_CLOSE",
-            "FLOW_ONOFF_BATCH",
-        }
+        # self._mfc_ok_cmds = {
+        #     "FLOW_SET", "FLOW_ON", "FLOW_OFF",
+        #     "SP1_SET", "SP1_ON", "SP4_ON",
+        #     "MFC_ZEROING", "PS_ZEROING",
+        #     "VALVE_OPEN", "VALVE_CLOSE",
+        #     "FLOW_ONOFF_BATCH",
+        # }
 
     # ---------------- 시퀀스 구성 ----------------
     def _create_process_sequence(self, params: Dict[str, Any]) -> List[ProcessStep]:
@@ -186,10 +186,10 @@ class ProcessController(QObject):
                 message=f'베이스 압력({base_pressure:.1e}) 도달 대기'
             ),
             # 외부 RGA 스캔 트리거 → 별도 완료 신호가 없으므로 no_wait
-            ProcessStep(
-                action=ActionType.RGA_SCAN,
-                message='RGA 측정 시작',
-            )
+            # ProcessStep(
+            #     action=ActionType.RGA_SCAN,
+            #     message='RGA 측정 시작',
+            # )
         ])
 
         # 모든 채널 Flow OFF
@@ -270,16 +270,14 @@ class ProcessController(QObject):
                 action=ActionType.DC_POWER_SET,
                 value=dc_power,
                 message=f'DC Power {dc_power}W 설정',
-                parallel=want_parallel,
-                #no_wait=True
+                parallel=want_parallel
             ))
         if use_rf:
             steps.append(ProcessStep(
                 action=ActionType.RF_POWER_SET,
                 value=rf_power,
                 message=f'RF Power {rf_power}W 설정',
-                parallel=want_parallel,
-                #no_wait=True
+                parallel=want_parallel
             ))
 
         steps.append(ProcessStep(
@@ -310,9 +308,9 @@ class ProcessController(QObject):
         shutdown_steps.append(ProcessStep(action=ActionType.FADUINO_CMD, params=('MS', False), message='Main Shutter 닫기'))
 
         if common_info['use_dc']:
-            shutdown_steps.append(ProcessStep(action=ActionType.DC_POWER_STOP, message='DC Power Off', no_wait=True))
+            shutdown_steps.append(ProcessStep(action=ActionType.DC_POWER_STOP, message='DC Power Off'))
         if common_info['use_rf']:
-            shutdown_steps.append(ProcessStep(action=ActionType.RF_POWER_STOP, message='RF Power Off', no_wait=True))
+            shutdown_steps.append(ProcessStep(action=ActionType.RF_POWER_STOP, message='RF Power Off'))
 
         for gas, info in gas_info.items():
             shutdown_steps.append(ProcessStep(
@@ -486,9 +484,19 @@ class ProcessController(QObject):
         """MFCController.command_confirmed(cmd) 연결용"""
         if not self.is_running:
             return
-        # 폴링 중 READ_*은 스텝 완료로 보지 않음
-        if cmd in self._mfc_ok_cmds:
+
+        step = self.current_step
+        # 현재 스텝이 MFC_CMD가 아니면 무시
+        if not step or step.action != ActionType.MFC_CMD:
+            self.log_message.emit("MFC", f"확인 무시: '{cmd}' (현재 스텝: {step.action.name if step else '없음'})")
+            return
+
+        # 이 스텝이 기대하는 명령과 정확히 일치할 때만 완료 처리
+        expected_cmd = step.params[0] if (step.params and len(step.params) >= 1) else None
+        if cmd == expected_cmd:
             self.on_step_completed()
+        else:
+            self.log_message.emit("MFC", f"확인 무시: '{cmd}', 기대: '{expected_cmd}'")
 
     @Slot(str, str)
     def on_mfc_failed(self, cmd: str, why: str):

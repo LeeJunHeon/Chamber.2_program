@@ -543,8 +543,16 @@ class IGController(QObject):
             if (time.monotonic() - self._wait_start_s) > float(IG_WAIT_TIMEOUT):
                 self.status_message.emit("IG", f"시간 초과({IG_WAIT_TIMEOUT}초): 목표 압력 미도달")
                 self.base_pressure_failed.emit("IG", "Timeout")
-                self.polling_timer.stop()
-                self.cleanup()
+                self._waiting_active = False
+                if self.polling_timer: self.polling_timer.stop()
+                self.enqueue(
+                    "SIG 0",
+                    lambda _l: None,
+                    timeout_ms=IG_TIMEOUT_MS, gap_ms=200,
+                    tag="[IG OFF] SIG 0", retries_left=1,
+                    allow_no_reply=True
+                )
+                QTimer.singleShot(150, self.cleanup)   # <-- 새로 추가(1줄)
                 return
 
             # 응답 파싱
@@ -565,7 +573,17 @@ class IGController(QObject):
             if pressure <= self._target_pressure:
                 self.status_message.emit("IG", "목표 압력 도달")
                 self.base_pressure_reached.emit()
-                self.polling_timer.stop()
+                self._waiting_active = False
+                if self.polling_timer: 
+                    self.polling_timer.stop()
+                self.enqueue(
+                    "SIG 0",
+                    lambda _l: None,
+                    timeout_ms=IG_TIMEOUT_MS, gap_ms=200,
+                    tag="[IG OFF] SIG 0", retries_left=1,
+                    allow_no_reply=True
+                )
+                QTimer.singleShot(150, self.cleanup)   # <-- 새로 추가(1줄)
                 self.cleanup()
                 return
 

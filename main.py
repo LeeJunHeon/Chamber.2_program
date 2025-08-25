@@ -193,11 +193,11 @@ class MainWindow(QWidget):
             self.process_controller.on_oes_failed,
             type=Qt.ConnectionType.QueuedConnection
         )
-        self.ig_controller.wait_finished.connect(
+        self.ig_controller.base_pressure_reached.connect(
             self.process_controller.on_ig_ok,
             type=Qt.ConnectionType.QueuedConnection
         )
-        self.ig_controller.wait_failed.connect(
+        self.ig_controller.base_pressure_failed.connect(
             self.process_controller.on_ig_failed,
             type=Qt.ConnectionType.QueuedConnection
         )

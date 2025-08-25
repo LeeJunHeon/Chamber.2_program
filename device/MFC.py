@@ -590,7 +590,7 @@ class MFCController(QObject):
                         v_hw = vals[ch-1]
                         sf   = MFC_SCALE_FACTORS.get(ch, 1.0)
                         self.update_flow.emit(self.gas_map.get(ch, f"Ch{ch}"), v_hw / sf)
-                        self.command_confirmed.emit("READ_FLOW")
+                        #self.command_confirmed.emit("READ_FLOW")
                     else:
                         self.command_failed.emit("READ_FLOW", "R60 파싱 실패/채널 누락")
                 self._read_flow_all_async(on_done=on_done, tag=f"[READ R60 ch{ch}]")
@@ -901,7 +901,7 @@ class MFCController(QObject):
             line = (line or "").strip()
             if line:
                 self.update_pressure.emit(line)
-                self.command_confirmed.emit("READ_PRESSURE")
+                #self.command_confirmed.emit("READ_PRESSURE")
             else:
                 self.command_failed.emit("READ_PRESSURE", "응답 없음")
         self.enqueue(cmd, on_reply, timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS, tag=tag or "[READ_PRESSURE]")

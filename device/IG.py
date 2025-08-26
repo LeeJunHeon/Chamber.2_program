@@ -62,18 +62,18 @@ class IGController(QObject):
         self.debug_print = DEBUG_PRINT
 
         # 1) 시리얼/타이머는 여기서 만들지 말고 전부 None으로
-        self.serial_ig = None
+        self.serial_ig: Optional[QSerialPort] = None
 
-        self._cmd_timer = None
-        self._gap_timer = None
-        self.polling_timer = None
-        self._watchdog = None
+        self._cmd_timer: Optional[QTimer] = None
+        self._gap_timer: Optional[QTimer] = None
+        self.polling_timer: Optional[QTimer] = None
+        self._watchdog: Optional[QTimer] = None
 
         self._rx = bytearray(); self._RX_MAX = 16 * 1024
         self._LINE_MAX = 512;   self._overflow_count = 0
 
-        self._cmd_q = deque()
-        self._inflight = None
+        self._cmd_q: Deque[Command] = deque()
+        self._inflight: Optional[QTimer] = None
         self._send_spin = False
 
         self._want_connected = False
@@ -121,16 +121,6 @@ class IGController(QObject):
             self._watchdog.setInterval(IG_WATCHDOG_INTERVAL_MS)
             self._watchdog.timeout.connect(self._watch_connection)    
 
-    # -------------------------------------------------
-    # 내부 디버그 출력
-    # -------------------------------------------------
-    def _dprint(self, *args):
-        if self.debug_print:
-            try:
-                print(*args, flush=True)
-            except Exception:
-                pass
-
     # =================================================
     # 연결/해제 & 워치독(자동 재연결)
     # =================================================
@@ -157,13 +147,13 @@ class IGController(QObject):
         available = {p.portName() for p in QSerialPortInfo.availablePorts()}
         if IG_PORT not in available:
             msg = f"{IG_PORT} 존재하지 않음. 사용 가능 포트: {sorted(available)}"
-            self.status_message.emit("IG", msg); self._dprint(f"[IG ] {msg}")
+            self.status_message.emit("IG", msg); 
             return False
 
         self.serial_ig.setPortName(IG_PORT)
         if not self.serial_ig.open(QIODeviceBase.OpenModeFlag.ReadWrite):
             msg = f"{IG_PORT} 연결 실패: {self.serial_ig.errorString()}"
-            self.status_message.emit("IG", msg); self._dprint(f"[IG ] {msg}")
+            self.status_message.emit("IG", msg); 
             return False
 
         # 라인 제어/버퍼 초기화
@@ -177,7 +167,6 @@ class IGController(QObject):
         self._reconnect_pending = False
 
         self.status_message.emit("IG", f"{IG_PORT} 연결 성공 (QSerialPort)")
-        self._dprint(f"[IG ] {IG_PORT} 연결 성공 (QSerialPort)")
         return True
 
     def _watch_connection(self):
@@ -189,7 +178,6 @@ class IGController(QObject):
         
         self._reconnect_pending = True
         self.status_message.emit("IG", f"재연결 시도 예약... ({self._reconnect_backoff_ms} ms)")
-        self._dprint(f"[IG ] reconnect in {self._reconnect_backoff_ms}ms")
         QTimer.singleShot(self._reconnect_backoff_ms, self._try_reconnect)
 
     def _try_reconnect(self):
@@ -200,7 +188,6 @@ class IGController(QObject):
 
         if self._open_port():
             self.status_message.emit("IG", "재연결 성공. 대기 중 명령 재개.")
-            self._dprint("[IG ] reconnected")
             QTimer.singleShot(0, self._dequeue_and_send)
             self._reconnect_backoff_ms = IG_RECONNECT_BACKOFF_START_MS
             return
@@ -253,14 +240,16 @@ class IGController(QObject):
         err_name = getattr(err, "name", str(err))
         err_code = getattr(err, "value", "?")
         serr = self.serial_ig.errorString() if self.serial_ig else ""
-        msg = f"시리얼 오류: {serr} (err={err_name}/{err_code})"
-        self.status_message.emit("IG", msg); self._dprint(f"[ERR] {msg}")
+        # 포괄 오류 로그
+        self.status_message.emit("IG", f"시리얼 오류: {serr} (err={err_name}/{err_code})")
 
-        if self._inflight is not None:
-            cmd = self._inflight
+        cmd = self._inflight
+        if cmd is not None:
             if self._cmd_timer:
                 self._cmd_timer.stop()
             self._inflight = None
+            # 인플라이트 명령 기준 오류 로그
+            self.status_message.emit("IG < 응답", f"{cmd.tag} {cmd.cmd_str.strip()} → (시리얼 오류)")
             if cmd.retries_left > 0:
                 cmd.retries_left -= 1
                 self._cmd_q.appendleft(cmd)
@@ -295,7 +284,6 @@ class IGController(QObject):
             self._overflow_count += 1
             if self._overflow_count % 5 == 1:
                 self.status_message.emit("IG", f"수신 버퍼 과다(RX>{self._RX_MAX}); 최근 {self._RX_MAX}B만 보존.")
-            self._dprint(f"[WARN] RX overflow: keep tail {len(self._rx)}B")
 
         # 2) 줄 단위 파싱
         while True:
@@ -317,7 +305,7 @@ class IGController(QObject):
 
             # 라인 길이 제한
             if len(line_bytes) > self._LINE_MAX:
-                self._dprint(f"[WARN] RX line too long (+{len(line_bytes)-self._LINE_MAX}B), truncating")
+                self.status_message.emit("IG", f"Rx line too long (+{len(line_bytes)-self._LINE_MAX}B), truncating")
                 line_bytes = line_bytes[:self._LINE_MAX]
 
             try:
@@ -332,11 +320,9 @@ class IGController(QObject):
             if self._inflight:
                 sent = (self._inflight.cmd_str or "").strip()
                 if line == sent:
-                    self._dprint(f"[RECV] echo skipped: {repr(line)}")
                     continue
 
             # 유효 응답 1줄 처리 후 종료(한 틱에 1응답)
-            self._dprint(f"[RECV] {repr(line)}")
             self._finish_command(line)
             break
 
@@ -372,7 +358,7 @@ class IGController(QObject):
             return
 
         if self._send_spin:
-            self._dprint("[GUARD] _dequeue_and_send re-enter blocked")
+            self.status_message.emit("IG", "[GUARD] _dequeue_and_send re-enter blocked")
             return
         self._send_spin = True
 
@@ -381,8 +367,7 @@ class IGController(QObject):
             self._inflight = cmd
             self._rx.clear()
 
-            self._dprint(f"[SEND] {cmd.cmd_str.strip()} (tag={cmd.tag})")
-            self.status_message.emit("IG > 전송", f"{cmd.tag or ''} {cmd.cmd_str.strip()}".strip())
+            self.status_message.emit("IG", f"[SEND] {cmd.cmd_str.strip()} (tag={cmd.tag})")
 
             payload = cmd.cmd_str.encode('ascii')
             n = self.serial_ig.write(payload)
@@ -407,25 +392,24 @@ class IGController(QObject):
                 self._cmd_timer.start(cmd.timeout_ms)
 
         except Exception as e:
-            self._dprint(f"[ERROR] Send failed: {e}")
             failed = self._inflight
             self._inflight = None
             if self._cmd_timer:
                 self._cmd_timer.stop()
             if failed:
+                # 전송 실패 로그(보낸 명령 포함)
+                self.status_message.emit("IG", f"{failed.tag} {failed.cmd_str.strip()} 전송 오류: {e}")
                 self._cmd_q.appendleft(failed)
             try:
-                if not (self.serial_ig and self.serial_ig.isOpen()):
-                    QTimer.singleShot(0, self._try_reconnect)
-                else:
-                    gap_ms = failed.gap_ms if failed else 100
-                    if self._gap_timer:
-                        self._gap_timer.start(gap_ms)
-                    QTimer.singleShot(gap_ms + 1, self._dequeue_and_send)
-            except Exception as ee:
-                self._dprint(f"[WARN] reconnect/retry schedule failed: {ee}")
-
-            self.status_message.emit("IG", f"전송 오류: {e}")
+                # 워치독 기반 재연결로 통일
+                if self.serial_ig and self.serial_ig.isOpen():
+                    try:
+                        self.serial_ig.close()
+                    except Exception:
+                        pass
+                QTimer.singleShot(0, self._watch_connection)
+            except Exception:
+                pass
             return
         finally:
             self._send_spin = False
@@ -436,9 +420,9 @@ class IGController(QObject):
             return
         cmd = self._inflight
         if cmd.allow_no_reply:
-            self._dprint("[NOTE] no-reply command; proceeding after write")
+            self.status_message.emit("IG", "[NOTE] no-reply command; proceeding after write")
         else:
-            self._dprint("[TIMEOUT] command response timed out")
+            self.status_message.emit("IG", "[TIMEOUT] command response timed out")
         self._finish_command(None)
 
     def _finish_command(self, line: Optional[str]):
@@ -447,15 +431,21 @@ class IGController(QObject):
           - line=None: 타임아웃/무응답/취소
           - line=str: 정상 응답(한 줄)
         """
-        if self._inflight is None:
+        cmd = self._inflight
+        if cmd is None:
             return
 
-        cmd = self._inflight
         if self._cmd_timer:
             self._cmd_timer.stop()
         self._inflight = None
 
+        sent_txt = cmd.cmd_str.strip()
+        tag_txt  = cmd.tag or ""
+
+
         if line is None:
+            self.status_message.emit("IG < 응답", f"{tag_txt} {sent_txt} → (응답 없음/타임아웃)")
+
             if cmd.allow_no_reply:
                 self._safe_callback(cmd.callback, None)
                 if self._gap_timer:
@@ -464,16 +454,23 @@ class IGController(QObject):
 
             if cmd.retries_left > 0:
                 cmd.retries_left -= 1
+                # 재시도 로그
+                self.status_message.emit("IG", f"{tag_txt} {sent_txt} 재시도 남은횟수={cmd.retries_left}")
                 self._cmd_q.appendleft(cmd)
                 if self.serial_ig and self.serial_ig.isOpen():
                     self.serial_ig.close()
-                self._try_reconnect()
+                QTimer.singleShot(0, self._watch_connection)
                 return
 
             self._safe_callback(cmd.callback, None)
             if self._gap_timer:
                 self._gap_timer.start(cmd.gap_ms)
             return
+        
+        # 정상 수신 로그(보낸 명령 ↔ 받은 응답)
+        recv_txt = (line or "").strip()
+        self.status_message.emit("IG < 응답", f"{tag_txt} {sent_txt} ← {recv_txt}")
+
 
         self._safe_callback(cmd.callback, line.strip())
         if self._gap_timer:
@@ -490,8 +487,8 @@ class IGController(QObject):
         큐 기반으로 폴링한다.
 
         시퀀스:
-          (A) IG ON  → allow_no_reply=True, gap=1000ms
-          (B) RDI 1회 → (A)의 gap이 끝나자마자 전송되어 '켜자마자 1초 뒤' 첫 읽기
+          (A) IG ON  → allow_no_reply=False, gap=1000ms
+          (B) RDI 1회 → (A)에서 'OK'응답을 받으면 첫 읽기
           (C) 이후 polling_timer가 interval_ms마다 RDI 큐잉
         """
         if self._waiting_active:
@@ -510,20 +507,34 @@ class IGController(QObject):
         self._waiting_active = True
 
         # (A) IG ON — 응답이 없어도 진행(allow_no_reply=True), gap=1000ms
-        def _after_on(_line: Optional[str]):
-            # ON에 대한 응답은 무시(장비에 따라 OK가 오기도, 안 오기도 함)
-            pass
+        def _after_on(line: Optional[str]):
+            s = (line or "").strip().upper()
+            if s == "OK":
+                # OK 수신 → 여기서만 첫 RDI + 폴링 시작
+                self._enqueue_read_once(tag="[FIRST READ AFTER ON]")
+                self.polling_timer.setInterval(int(interval_ms))
+                self.polling_timer.start()
+                return
+            
+            # OK 미수신 → 포트 닫고 워치독으로 재연결 예약 후 SIG 1 재전송
+            try:
+                if self.serial_ig and self.serial_ig.isOpen():
+                    self.serial_ig.close()
+            except Exception:
+                pass
+            QTimer.singleShot(0, self._watch_connection)
+            self.enqueue(
+                "SIG 1", _after_on,
+                timeout_ms=IG_TIMEOUT_MS, gap_ms=200,
+                tag="[IG ON - RETRY]", retries_left=2, allow_no_reply=False
+            )
 
-        self.enqueue("SIG 1", _after_on,
-                     timeout_ms=IG_TIMEOUT_MS, gap_ms=5000,
-                     tag="[IG ON]", retries_left=1, allow_no_reply=True)
-
-        # (B) 첫 읽기 — 큐 뒤에 붙인다 → 위 gap 1초 후 자동 전송됨
-        self._enqueue_read_once(tag="[FIRST READ AFTER ON]")
-
-        # (C) 이후 주기 폴링 시작
-        self.polling_timer.setInterval(int(interval_ms))
-        self.polling_timer.start()
+        # SIG 1은 반드시 응답 요구(allow_no_reply=False)
+        self.enqueue(
+            "SIG 1", _after_on,
+            timeout_ms=IG_TIMEOUT_MS, gap_ms=200,
+            tag="[IG ON]", retries_left=2, allow_no_reply=False
+        )
 
     # =================================================
     # 내부: 읽기/파싱/판정
@@ -545,14 +556,16 @@ class IGController(QObject):
                 self.base_pressure_failed.emit("IG", "Timeout")
                 self._waiting_active = False
                 if self.polling_timer: self.polling_timer.stop()
-                self.enqueue(
-                    "SIG 0",
-                    lambda _l: None,
-                    timeout_ms=IG_TIMEOUT_MS, gap_ms=200,
-                    tag="[IG OFF] SIG 0", retries_left=1,
-                    allow_no_reply=True
+
+                def _after_sig0(_l: Optional[str]):
+                    self.cleanup()
+
+                self.enqueue(   
+                    "SIG 0", _after_sig0,
+                    timeout_ms=IG_TIMEOUT_MS, gap_ms=150,
+                    tag="[IG OFF] SIG 0", retries_left=2, allow_no_reply=False
                 )
-                QTimer.singleShot(150, self.cleanup)   # <-- 새로 추가(1줄)
+                
                 return
 
             # 응답 파싱
@@ -576,15 +589,16 @@ class IGController(QObject):
                 self._waiting_active = False
                 if self.polling_timer: 
                     self.polling_timer.stop()
+
+                def _after_sig0(_l: Optional[str]):
+                    self.cleanup()
+                
                 self.enqueue(
-                    "SIG 0",
-                    lambda _l: None,
-                    timeout_ms=IG_TIMEOUT_MS, gap_ms=200,
-                    tag="[IG OFF] SIG 0", retries_left=1,
-                    allow_no_reply=True
+                    "SIG 0", _after_sig0,
+                    timeout_ms=IG_TIMEOUT_MS, gap_ms=150,
+                    tag="[IG OFF] SIG 0", retries_left=2, allow_no_reply=False
                 )
-                QTimer.singleShot(150, self.cleanup)   # <-- 새로 추가(1줄)
-                self.cleanup()
+
                 return
 
         # allow_no_reply=False: RDI는 반드시 한 줄을 기대
@@ -599,7 +613,6 @@ class IGController(QObject):
         try:
             callback(arg)
         except Exception as e:
-            self._dprint(f"[ERROR] Callback failed: {e}")
             self.status_message.emit("IG", f"콜백 오류: {e}")
 
     @Slot()

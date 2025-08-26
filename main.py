@@ -222,7 +222,7 @@ class MainWindow(QWidget):
 
         # DC 파워 목표 도달 → 공정 진행 (DC는 실패 없음)
         self.dc_power_controller.target_reached.connect(
-            self.process_controller.on_device_step_ok,
+            self.process_controller.on_dc_target_reached,
             type=Qt.ConnectionType.QueuedConnection
         )
         # ⬇︎ 추가: DC 파워 정지 완료 → 공정 진행
@@ -233,7 +233,7 @@ class MainWindow(QWidget):
 
         # RF 파워 목표 도달/실패 → 공정 진행/실패
         self.rf_power_controller.target_reached.connect(
-            self.process_controller.on_device_step_ok,
+            self.process_controller.on_rf_target_reached,
             type=Qt.ConnectionType.QueuedConnection
         )
         self.rf_power_controller.target_failed.connect(

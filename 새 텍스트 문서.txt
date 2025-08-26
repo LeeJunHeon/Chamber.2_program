@@ -1,0 +1,3 @@
+QObject::killTimer: Timers cannot be stopped from another thread
+QObject::killTimer: Timers cannot be stopped from another thread
+QObject::killTimer: Timers cannot be stopped from another thread

@@ -496,6 +496,38 @@ class FaduinoController(QObject):
         if self._gap_timer: 
             self._gap_timer.start(cmd.gap_ms)
 
+    # 읽기성 명령인지 판별 (상태 S, 소문자 r/d, 핀 읽기 P)
+    def _is_read_cmd(self, cmd_str: str) -> bool:
+        c = (cmd_str or "").lstrip()
+        if not c:
+            return False
+        head = c[0]
+        return head in ("S", "P", "r", "d")  # 상태/핀/소문자 r,d 읽기
+
+    def _purge_reads_only(self, cancel_inflight: bool = True, reason: str = ""):
+        # 인플라이트가 읽기면 취소
+        if cancel_inflight and self._inflight and self._is_read_cmd(self._inflight.cmd_str):
+            if self._cmd_timer:
+                self._cmd_timer.stop()
+            cmd = self._inflight
+            self._inflight = None
+            self.status_message.emit("Faduino", f"[QUIESCE] 읽기 인플라이트 취소: {cmd.tag or cmd.cmd_str.strip()} ({reason})")
+            self._safe_callback(cmd.callback, None)
+
+        # 큐에서 읽기만 제거
+        from collections import deque
+        kept = deque()
+        dropped = 0
+        while self._cmd_q:
+            c = self._cmd_q.popleft()
+            if self._is_read_cmd(c.cmd_str):
+                dropped += 1
+                continue
+            kept.append(c)
+        self._cmd_q = kept
+        if dropped:
+            self.status_message.emit("Faduino", f"[QUIESCE] 읽기 명령 {dropped}건 제거 ({reason})")
+
     # ---------- 폴링 ----------
     def _initial_sync_if_needed(self, relay_mask: int) -> bool:
         """연결/재연결/폴링 시작 직후 '첫 번째' S/P 응답에서만
@@ -520,6 +552,9 @@ class FaduinoController(QObject):
             if self.polling_timer and self.polling_timer.isActive():
                 self.polling_timer.stop()
                 self.status_message.emit("Faduino", "공정 감시 폴링 중지")
+            # 🔑 폴링 off 직후, S/r/d/P 등 '읽기' 명령을 즉시 정리
+            #    (이미 예약된 singleShot·gap 타이머로 들어올 수 있는 잔여 읽기도 제거)
+            self._purge_reads_only(cancel_inflight=True, reason="polling off")
 
     def _enqueue_poll_cycle(self):
         def on_s(line: Optional[str]):
@@ -548,6 +583,45 @@ class FaduinoController(QObject):
             except Exception:
                 pass
         self.enqueue('S', on_s, timeout_ms=FADUINO_TIMEOUT_MS, gap_ms=FADUINO_GAP_MS, tag='[POLL S]')
+
+    # ---------- 큐/상태 정리 유틸 ----------
+    @Slot()
+    def purge_pending(self, reason: str = "process finished") -> int:
+        """대기/진행 중인 모든 명령을 즉시 취소하고 큐를 비웁니다."""
+        # 타이머 정지
+        if self._cmd_timer: self._cmd_timer.stop()
+        if self._gap_timer: self._gap_timer.stop()
+
+        purged = 0
+        # 진행 중(inflight) 취소
+        if self._inflight is not None:
+            cmd = self._inflight
+            self._inflight = None
+            purged += 1
+            self._safe_callback(cmd.callback, None)
+
+        # 대기 큐 비우기
+        while self._cmd_q:
+            cmd = self._cmd_q.popleft()
+            purged += 1
+            self._safe_callback(cmd.callback, None)
+
+        # 수신 버퍼도 정리
+        self._rx.clear()
+
+        self.status_message.emit("Faduino", f"대기 중 명령 {purged}개 폐기 ({reason})")
+        return purged
+
+    @Slot(bool)
+    def on_process_finished(self, success: bool):
+        """공정 종료(성공/실패 공통) 시 폴링을 멈추고 큐를 깨끗히 비웁니다."""
+        # 폴링 중지
+        self.set_process_status(False)
+        # RF/DC 측정 강제 읽기 경로 방지
+        self.is_rf_active = False
+        self.is_dc_active = False
+        # 큐 비우기
+        self.purge_pending(f"process finished ({'ok' if success else 'fail'})")
 
     # ---------- 공개 API ----------
     @Slot(str, bool)

@@ -484,6 +484,13 @@ class ProcessController(QObject):
         """장치에서 '해당 스텝 완료' 신호를 받을 때 호출."""
         if not self.is_running:
             return
+        
+        if self._aborting:
+            cs = self.current_step
+            if not cs or cs.action not in {ActionType.FADUINO_CMD, ActionType.MFC_CMD,
+                                        ActionType.DC_POWER_STOP, ActionType.RF_POWER_STOP}:
+                return
+            
         self.on_step_completed()
 
     @Slot(str)
@@ -663,6 +670,7 @@ class ProcessController(QObject):
         if self._aborting:  # ✅ 이미 중단 중이면 무시
             self.log_message.emit("Process", "(중복) 긴급 중단 진행 중 - 추가 호출 무시")
             return
+        self.process_aborted.emit()
         self.step_timer.stop()
         self._stop_countdown()
         self.set_polling.emit(False)

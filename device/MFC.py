@@ -483,6 +483,49 @@ class MFCController(QObject):
         if self._gap_timer:
             self._gap_timer.start(cmd.gap_ms)
 
+    def _is_poll_read_cmd(self, cmd_str: str, tag: str = "") -> bool:
+        """
+        MFC에서 '폴링으로만' 날리는 읽기 명령인지 판별.
+        - 주기 폴링: [POLL R60], [POLL PRESS] 등
+        - 안전망: 실제 전송문자도 검사 (R60, R5 계열)
+        ※ 검증/제어용 읽기(R69, SP1?, M?, V? 등)는 건드리지 않음
+        """
+        if (tag or "").startswith("[POLL "):
+            return True
+        s = (cmd_str or "").lstrip().upper()
+        return s.startswith("R60") or s.startswith("R5")  # 유량/압력 폴링만
+
+    def _purge_poll_reads_only(self, cancel_inflight: bool = True, reason: str = "") -> int:
+        """
+        폴링 OFF 직후, 큐/인플라이트에 남아 있는 '폴링용 읽기(R60/R5)'만 제거.
+        검증/제어 관련 읽기는 그대로 둠.
+        """
+        purged = 0
+
+        # 인플라이트가 폴링 읽기면 취소
+        if cancel_inflight and self._inflight and self._is_poll_read_cmd(self._inflight.cmd_str, self._inflight.tag):
+            if self._cmd_timer:
+                self._cmd_timer.stop()
+            cmd = self._inflight
+            self._inflight = None
+            purged += 1
+            self.status_message.emit("MFC", f"[QUIESCE] 폴링 읽기 인플라이트 취소: {cmd.tag or cmd.cmd_str.strip()} ({reason})")
+            self._safe_callback(cmd.callback, None)
+
+        # 큐에서 폴링 읽기만 제거
+        kept = deque()
+        while self._cmd_q:
+            c = self._cmd_q.popleft()
+            if self._is_poll_read_cmd(c.cmd_str, c.tag):
+                purged += 1
+                continue
+            kept.append(c)
+        self._cmd_q = kept
+
+        if purged:
+            self.status_message.emit("MFC", f"[QUIESCE] 폴링 읽기 명령 {purged}건 제거 ({reason})")
+        return purged
+
     # ---------- 폴링 ----------
     @Slot(bool)
     def set_process_status(self, should_poll: bool):
@@ -497,6 +540,8 @@ class MFCController(QObject):
             if self.polling_timer.isActive():
                 self.polling_timer.stop()
                 self.status_message.emit("MFC", "주기적 읽기(Polling) 중지")
+            # 🔑 폴링 Off 직후: 폴링으로만 날리는 읽기(R60/R5) 명령만 싹 정리
+            self._purge_poll_reads_only(cancel_inflight=True, reason="polling off/shutter closed")
 
     def _enqueue_poll_cycle(self):
         self._read_flow_all_async(tag="[POLL R60]")
@@ -507,6 +552,42 @@ class MFCController(QObject):
             if line:
                 self.update_pressure.emit(line)
         self.enqueue(cmdp, on_p, timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS, tag="[POLL PRESS]")
+
+    # ---------- 큐/상태 정리 유틸 ----------
+    @Slot()
+    def purge_pending(self, reason: str = "process finished") -> int:
+        """대기/진행 중인 모든 명령을 즉시 취소하고 큐를 비웁니다."""
+        if self._cmd_timer: self._cmd_timer.stop()
+        if self._gap_timer: self._gap_timer.stop()
+
+        purged = 0
+        if self._inflight is not None:
+            cmd = self._inflight
+            self._inflight = None
+            purged += 1
+            self._safe_callback(cmd.callback, None)
+
+        while self._cmd_q:
+            cmd = self._cmd_q.popleft()
+            purged += 1
+            self._safe_callback(cmd.callback, None)
+
+        self._rx.clear()
+        self.status_message.emit("MFC", f"대기 중 명령 {purged}개 폐기 ({reason})")
+        return purged
+
+    @Slot(bool)
+    def on_process_finished(self, success: bool):
+        """공정 종료(성공/실패 공통) 시 폴링을 멈추고 큐를 깨끗히 비웁니다."""
+        # 폴링 중지
+        if self.polling_timer and self.polling_timer.isActive():
+            self.polling_timer.stop()
+            self.status_message.emit("MFC", "주기적 읽기(Polling) 중지")
+
+        # 내부 안정화/지연 타이머 등 보조 타이머도 중지
+        if self.stabilization_timer: self.stabilization_timer.stop()
+
+        self.purge_pending(f"process finished ({'ok' if success else 'fail'})")
 
     # ---------- 상위에서 호출하는 공개 API ----------
     @Slot(str, dict)

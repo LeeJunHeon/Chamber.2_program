@@ -16,8 +16,10 @@ class GraphController:
         self.rga_plot.showGrid(x=False, y=True)
         self.rga_plot.setLogMode(y=False)
         self.rga_plot.setMouseEnabled(x=False, y=False)
-        self.rga_plot.setYRange(-11, -5)
-        self.rga_plot.setXRange(0, 65)
+        self._rga_default_xrange = (0, 65)    
+        self._rga_default_yrange = (-11, -5)   
+        self.rga_plot.setYRange(*self._rga_default_xrange)
+        self.rga_plot.setXRange(*self._rga_default_yrange)
 
         self.rga_plot.getAxis('left').setStyle(tickFont=font)
         self.rga_plot.getAxis('bottom').setStyle(tickFont=font)
@@ -59,8 +61,11 @@ class GraphController:
         self.oes_plot.setLabel('bottom', 'Wavelength (nm)', color='k')
         self.oes_plot.showGrid(x=False, y=True)
         self.oes_plot.setMouseEnabled(x=False, y=False)
-        self.oes_plot.setXRange(100, 1200)
-        self.oes_plot.setYRange(0, 16000)
+        self._oes_default_xrange = (100, 1200)
+        self._oes_default_yrange = (0, 16000)   
+        self.oes_plot.setXRange(*self._oes_default_xrange)
+        self.oes_plot.setYRange(*self._oes_default_yrange)
+
         x_axis_oes = self.oes_plot.getAxis('bottom')
         x_ticks = [[(i, str(i)) for i in range(100, 1300, 100)]]
         x_axis_oes.setTicks(x_ticks)
@@ -116,3 +121,23 @@ class GraphController:
 
     def update_oes_plot(self, x_data, y_data):
         self.oes_curve.setData(x_data, y_data)
+
+    def clear_rga_plot(self):
+        # 데이터 비우기
+        self.rga_stem_item.setData(x=np.array([]), y=np.array([]), height=np.array([]))
+        self.rga_marker_item.setData(x=np.array([]), y=np.array([]))
+        # 축 범위 초기화
+        self.rga_plot.setXRange(*self._rga_default_xrange)
+        self.rga_plot.setYRange(*self._rga_default_yrange)
+
+    def clear_oes_plot(self):
+        # 데이터 비우기
+        self.oes_curve.setData([], [])
+        # 축 범위 초기화
+        self.oes_plot.setXRange(*self._oes_default_xrange)
+        self.oes_plot.setYRange(*self._oes_default_yrange)
+
+    def reset(self):
+        self.clear_rga_plot()
+        self.clear_oes_plot()
+

@@ -131,6 +131,12 @@ class MainWindow(QWidget):
         self.mfc_controller.update_flow.connect(self.data_logger.log_mfc_flow)
         self.mfc_controller.update_pressure.connect(self.data_logger.log_mfc_pressure)
 
+        # 공정이 시작될 때만 그래프 초기화 (수동/자동 모두 포함)
+        self.process_controller.process_started.connect(
+            lambda *args: self.graph_controller.reset_plots(),
+            type=Qt.ConnectionType.QueuedConnection
+        )
+
         # === 로그 / 상태 ===
         for src in (self.faduino_controller, self.mfc_controller,
                     self.oes_controller, self.ig_controller, self.rga_controller):
@@ -254,6 +260,16 @@ class MainWindow(QWidget):
             self.mfc_controller.set_process_status,
             type=Qt.ConnectionType.QueuedConnection
         )
+
+        # ✅ 공정 종료 시 큐 즉시 비우기 + 폴링/강제읽기 완전 중단
+        self.process_controller.process_finished.connect(
+            self.faduino_controller.on_process_finished, 
+            type=Qt.ConnectionType.QueuedConnection
+            )
+        self.process_controller.process_finished.connect(
+            self.mfc_controller.on_process_finished,   
+            type=Qt.ConnectionType.QueuedConnection
+            )
 
         # === 비상 종료(정리) : cleanup은 BlockingQueued ===
         self.process_controller.process_aborted.connect(
@@ -649,41 +665,45 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "실행 오류", "현재 다른 공정이 실행 중입니다.")
             return
         
-        if not self._check_and_connect_devices():
-            QMessageBox.critical(self, "장비 연결 오류", "필수 장비 연결에 실패했습니다. 로그를 확인하세요.")
-            return
-
+        # ★ 자동 시퀀스: 여기서는 장비 체크를 하지 않음
+        #    (_safe_start_process() 내부에서 장비 체크/초기화 수행)
         if self.process_queue:
             self.append_log("MAIN", "입력받은 파일로 자동 공정 시퀀스를 시작합니다.")
             self.current_process_index = -1
             self._start_next_process_from_queue(True)
-        else:
-            try:
-                base_pressure = float(self.ui.Base_pressure_edit.toPlainText() or 1e-5)
-                integration_time = int(self.ui.Intergration_time_edit.toPlainText() or 60)
-                working_pressure = float(self.ui.Working_pressure_edit.toPlainText() or 0.0)
-                shutter_delay = float(self.ui.Shutter_delay_edit.toPlainText() or 0.0)
-                process_time = float(self.ui.Process_time_edit.toPlainText() or 0.0)
-            except ValueError:
-                self.append_log("UI", "오류: 값 입력란을 확인해주세요.")
-                return
+            return  # ← 중요: 아래 단일 실행 코드로 낙하 방지
+        
+        # ★ 단일 실행: 여기서만 장비 체크
+        if not self._check_and_connect_devices():
+            QMessageBox.critical(self, "장비 연결 오류", "필수 장비 연결에 실패했습니다. 로그를 확인하세요.")
+            return
 
-            vals = self._validate_single_run_inputs()
-            if vals is None:
-                return
+        try:
+            base_pressure = float(self.ui.Base_pressure_edit.toPlainText() or 1e-5)
+            integration_time = int(self.ui.Intergration_time_edit.toPlainText() or 60)
+            working_pressure = float(self.ui.Working_pressure_edit.toPlainText() or 0.0)
+            shutter_delay = float(self.ui.Shutter_delay_edit.toPlainText() or 0.0)
+            process_time = float(self.ui.Process_time_edit.toPlainText() or 0.0)
+        except ValueError:
+            self.append_log("UI", "오류: 값 입력란을 확인해주세요.")
+            return
 
-            params = {
-                "base_pressure": base_pressure,
-                "integration_time": integration_time,
-                "working_pressure": working_pressure,
-                "shutter_delay": shutter_delay,
-                "process_time": process_time,
-                "process_note": self.ui.note_edit.toPlainText(),
-                **vals,
-            }
+        vals = self._validate_single_run_inputs()
+        if vals is None:
+            return
 
-            self.append_log("MAIN", "입력 검증 통과 → 공정 시작")
-            self.process_controller.start_process(params)
+        params = {
+            "base_pressure": base_pressure,
+            "integration_time": integration_time,
+            "working_pressure": working_pressure,
+            "shutter_delay": shutter_delay,
+            "process_time": process_time,
+            "process_note": self.ui.note_edit.toPlainText(),
+            **vals,
+        }
+
+        self.append_log("MAIN", "입력 검증 통과 → 공정 시작")
+        self.process_controller.start_process(params)
 
     @Slot()
     def on_stop_button_clicked(self, _checked: bool=False):

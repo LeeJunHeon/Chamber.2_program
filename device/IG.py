@@ -535,7 +535,7 @@ class IGController(QObject):
             self.enqueue(
                 "SIG 1", _after_on,
                 timeout_ms=IG_TIMEOUT_MS, gap_ms=IG_GAP_MS,
-                tag="[IG ON - RETRY]", retries_left=2, allow_no_reply=False
+                tag="[IG ON - RETRY]", retries_left=5, allow_no_reply=False
             )
 
         # 첫 시도
@@ -543,7 +543,7 @@ class IGController(QObject):
         self.enqueue(
             "SIG 1", _after_on,
             timeout_ms=IG_TIMEOUT_MS, gap_ms=IG_GAP_MS,
-            tag="[IG ON]", retries_left=2, allow_no_reply=False
+            tag="[IG ON]", retries_left=5, allow_no_reply=False
         )
 
     def _first_rdi_then_start_polling(self, interval_ms: int):
@@ -586,7 +586,7 @@ class IGController(QObject):
                 self.enqueue(   
                     "SIG 0", _after_sig0,
                     timeout_ms=IG_TIMEOUT_MS, gap_ms=150,
-                    tag="[IG OFF] SIG 0", retries_left=2, allow_no_reply=False
+                    tag="[IG OFF] SIG 0", retries_left=5, allow_no_reply=False
                 )
                 
                 return
@@ -619,7 +619,7 @@ class IGController(QObject):
                 self.enqueue(
                     "SIG 0", _after_sig0,
                     timeout_ms=IG_TIMEOUT_MS, gap_ms=150,
-                    tag="[IG OFF] SIG 0", retries_left=2, allow_no_reply=False
+                    tag="[IG OFF] SIG 0", retries_left=5, allow_no_reply=False
                 )
 
                 return

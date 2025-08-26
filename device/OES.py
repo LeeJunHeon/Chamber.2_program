@@ -86,8 +86,9 @@ class OESController(QObject):
             self.status_message.emit("OES", "측정 완료 및 장비 연결 종료")
             self.oes_finished.emit()
         else:
-            self.status_message.emit("OES", f"측정 실패 ({reason}) 및 장비 연결 종료")
-            self.oes_failed.emit("OES", reason)
+            # ⬇️ 공정은 계속. 실패 로그만 남기고 세션 종료 알림은 finished로 대체
+            self.status_message.emit("OES(경고)", f"측정 실패({reason}). 공정은 계속 진행됩니다.")
+            self.oes_finished.emit()
 
     @Slot()
     def initialize_device(self):
@@ -141,8 +142,8 @@ class OESController(QObject):
     def run_measurement(self, duration_sec, integration_time_ms):
         if self.is_running or self.sChannel < 0:
             reason = "이미 실행 중" if self.is_running else "초기화 실패"
-            self.status_message.emit("OES", f"오류: {reason}")
-            self.oes_failed.emit("OES", reason)
+            # ⬇️ 실패 시그널(oes_failed) 내보내지 않음
+            self.status_message.emit("OES(경고)", f"측정 시작 불가: {reason}. 공정은 계속 진행됩니다.")
             return
         
         self.status_message.emit("OES", f"{duration_sec/60:.1f}분 동안 측정을 시작합니다.")

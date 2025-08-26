@@ -499,6 +499,13 @@ class MainWindow(QWidget):
         if self.process_controller.is_running:
             self.append_log("MAIN", "경고: 이미 다른 공정이 실행 중이므로 새 공정을 시작하지 않습니다.")
             return
+        
+        # ✅ 매 공정 시작 직전 장비 재확인/재초기화(특히 OES)
+        if not self._check_and_connect_devices():
+            self.append_log("MAIN", "장비 재확인 실패 → 자동 시퀀스를 중단합니다.")
+            self._start_next_process_from_queue(False)
+            return
+
         try:
             self.process_controller.start_process(params)
         except Exception as e:

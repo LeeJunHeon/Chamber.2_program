@@ -412,7 +412,11 @@ class MFCController(QObject):
 
             if self._cmd_timer:
                 self._cmd_timer.stop()
-                self._cmd_timer.start(cmd.timeout_ms)
+                if cmd.allow_no_reply:
+                    # 응답을 기대하지 않는 명령은 타임아웃을 걸지 말고 바로 완료 처리
+                    QTimer.singleShot(0, lambda: self._finish_command(None))
+                else:
+                    self._cmd_timer.start(cmd.timeout_ms)
 
         except Exception as e:
             self.status_message.emit("MFC", f"[ERROR] Send failed: {e}")

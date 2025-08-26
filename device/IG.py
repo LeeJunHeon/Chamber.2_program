@@ -73,7 +73,7 @@ class IGController(QObject):
         self._LINE_MAX = 512;   self._overflow_count = 0
 
         self._cmd_q: Deque[Command] = deque()
-        self._inflight: Optional[QTimer] = None
+        self._inflight: Optional[Command] = None
         self._send_spin = False
 
         self._want_connected = False
@@ -83,6 +83,8 @@ class IGController(QObject):
         self._target_pressure = 0.0
         self._waiting_active = False
         self._wait_start_s = 0.0
+
+        self._first_read_delay_ms = 5000   # IG ON OK 후 첫 RDI까지 한 번만 지연
 
     # -------------------------------------------------
     # 객체 생성 헬퍼
@@ -506,14 +508,20 @@ class IGController(QObject):
         self._wait_start_s = time.monotonic()
         self._waiting_active = True
 
-        # (A) IG ON — 응답이 없어도 진행(allow_no_reply=True), gap=1000ms
+        # (A) IG ON, gap=1000ms
         def _after_on(line: Optional[str]):
+            if line is None:
+                return
+            
             s = (line or "").strip().upper()
             if s == "OK":
-                # OK 수신 → 여기서만 첫 RDI + 폴링 시작
-                self._enqueue_read_once(tag="[FIRST READ AFTER ON]")
-                self.polling_timer.setInterval(int(interval_ms))
-                self.polling_timer.start()
+                # ✅ OK 수신 → 첫 RDI는 5초 뒤 '한 번만' 실행, 이후에 polling 시작
+                self.status_message.emit("IG",
+                    f"IG ON OK → 첫 RDI를 {self._first_read_delay_ms}ms 후 수행")
+                QTimer.singleShot(
+                    self._first_read_delay_ms,
+                    lambda: self._first_rdi_then_start_polling(int(interval_ms))
+                )
                 return
             
             # OK 미수신 → 포트 닫고 워치독으로 재연결 예약 후 SIG 1 재전송
@@ -523,19 +531,34 @@ class IGController(QObject):
             except Exception:
                 pass
             QTimer.singleShot(0, self._watch_connection)
+            # 첫 시도 실패 이후
             self.enqueue(
                 "SIG 1", _after_on,
-                timeout_ms=IG_TIMEOUT_MS, gap_ms=200,
+                timeout_ms=IG_TIMEOUT_MS, gap_ms=IG_GAP_MS,
                 tag="[IG ON - RETRY]", retries_left=2, allow_no_reply=False
             )
 
+        # 첫 시도
         # SIG 1은 반드시 응답 요구(allow_no_reply=False)
         self.enqueue(
             "SIG 1", _after_on,
-            timeout_ms=IG_TIMEOUT_MS, gap_ms=200,
+            timeout_ms=IG_TIMEOUT_MS, gap_ms=IG_GAP_MS,
             tag="[IG ON]", retries_left=2, allow_no_reply=False
         )
 
+    def _first_rdi_then_start_polling(self, interval_ms: int):
+        # 대기 상태가 이미 종료되었다면 아무 것도 하지 않음 (취소/타임아웃 대비)
+        if not self._waiting_active:
+            return
+
+        # 첫 RDI 한 번만 실행
+        self._enqueue_read_once(tag="[FIRST READ AFTER ON]")
+
+        # 그리고 나서 polling 시작
+        if self.polling_timer:
+            self.polling_timer.setInterval(int(interval_ms))
+            self.polling_timer.start()
+    
     # =================================================
     # 내부: 읽기/파싱/판정
     # =================================================
@@ -612,7 +635,7 @@ class IGController(QObject):
         """콜백 예외가 전체 루프를 깨지 않도록 보호."""
         try:
             callback(arg)
-        except Exception as e:
+        except Exception as e: 
             self.status_message.emit("IG", f"콜백 오류: {e}")
 
     @Slot()

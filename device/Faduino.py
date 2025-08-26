@@ -154,6 +154,7 @@ class FaduinoController(QObject):
         self.serial_faduino.setRequestToSend(False)      # type: ignore
         self.serial_faduino.clear(QSerialPort.Direction.AllDirections)  # type: ignore
         self._rx.clear()
+        self._is_first_poll = True
 
         # 재연결 상태 초기화
         self._reconnect_backoff_ms = FADUINO_RECONNECT_BACKOFF_START_MS
@@ -184,6 +185,7 @@ class FaduinoController(QObject):
             return
 
         if self._open_port():
+            self._is_first_poll = True
             self.status_message.emit("Faduino", "재연결 성공. 대기 중 명령 재개.")
             QTimer.singleShot(0, self._dequeue_and_send)
             self._reconnect_backoff_ms = FADUINO_RECONNECT_BACKOFF_START_MS
@@ -495,10 +497,22 @@ class FaduinoController(QObject):
             self._gap_timer.start(cmd.gap_ms)
 
     # ---------- 폴링 ----------
+    def _initial_sync_if_needed(self, relay_mask: int) -> bool:
+        """연결/재연결/폴링 시작 직후 '첫 번째' S/P 응답에서만
+        하드웨어 릴레이 상태를 expected_relay_mask로 시드한다.
+        이후 응답은 시드를 건너뛰고 검증만 수행한다."""
+        if self._is_first_poll:
+            self.expected_relay_mask = relay_mask
+            self._is_first_poll = False
+            self.status_message.emit("Faduino", f"초기 릴레이 상태 동기화 완료: {relay_mask}")
+            return True
+        return False
+
     @Slot(bool)
     def set_process_status(self, should_poll: bool):
         self._ensure_timers_created()
         if should_poll:
+            self._is_first_poll = True
             if self.polling_timer and not self.polling_timer.isActive():
                 self.status_message.emit("Faduino", "공정 감시 폴링 시작")
                 self.polling_timer.start()
@@ -517,14 +531,16 @@ class FaduinoController(QObject):
                 return
             try:
                 relay_mask = p["relay_mask"]
-                if self._is_first_poll:
-                    self.expected_relay_mask = relay_mask
-                    self._is_first_poll = False
-                    self.status_message.emit("Faduino", f"초기 릴레이 상태 동기화 완료: {relay_mask}")
-                elif relay_mask != self.expected_relay_mask:
-                    msg = f"릴레이 상태 불일치! 예상: {self.expected_relay_mask}, 실제: {relay_mask}"
-                    self.status_message.emit("Faduino(경고)", msg)
-                    self.command_failed.emit("Faduino", f"Relay 상태 확인 {msg}")
+
+                # ✅ 공통 헬퍼 호출: 이번이 첫 S라면 여기서 시드하고 끝.
+                if self._initial_sync_if_needed(relay_mask):
+                    pass
+                else:
+                    # 첫 S가 아니면 검증
+                    if relay_mask != self.expected_relay_mask:
+                        msg = f"릴레이 상태 불일치! 예상: {self.expected_relay_mask}, 실제: {relay_mask}"
+                        self.status_message.emit("Faduino(경고)", msg)
+                        self.command_failed.emit("Faduino", f"Relay 상태 확인 {msg}")
                 if self.is_rf_active and "rf" in p:
                     self._update_rf(*p["rf"])
                 if self.is_dc_active and "dc" in p:
@@ -601,13 +617,13 @@ class FaduinoController(QObject):
                 return
             try:
                 relay_mask = p["relay_mask"]
-                if self._is_first_poll:
-                    self.expected_relay_mask = relay_mask; self._is_first_poll = False
-                    self.status_message.emit("Faduino", f"초기 릴레이 상태 동기화 완료: {relay_mask}")
-                elif relay_mask != self.expected_relay_mask:
-                    msg = f"릴레이 상태 불일치! 예상: {self.expected_relay_mask}, 실제: {relay_mask}"
-                    self.status_message.emit("Faduino(경고)", msg)
-                    self.command_failed.emit("Faduino", f"Relay 상태 확인 {msg}")
+                # ✅ 최초 동기화 먼저
+                if not self._initial_sync_if_needed(relay_mask):
+                    # 최초가 아니면 검증
+                    if relay_mask != self.expected_relay_mask:
+                        msg = f"릴레이 상태 불일치! 예상: {self.expected_relay_mask}, 실제: {relay_mask}"
+                        self.status_message.emit("Faduino(경고)", msg)
+                        self.command_failed.emit("Faduino", f"Relay 상태 확인 {msg}")
                 if self.is_rf_active and "rf" in p:
                     self._update_rf(*p["rf"])
                 if self.is_dc_active and "dc" in p:
@@ -634,6 +650,9 @@ class FaduinoController(QObject):
                 if not p or p.get("type") != "OK_S":
                     return
                 try:
+                    # ✅ 최초 동기화
+                    self._initial_sync_if_needed(p["relay_mask"])
+
                     # RF만 갱신
                     if self.is_rf_active and "rf" in p:
                         self._update_rf(*p["rf"])
@@ -675,6 +694,8 @@ class FaduinoController(QObject):
                 if not p or p.get("type") != "OK_S":
                     return
                 try:
+                    # ✅ 최초 1회 동기화 수행 (있으면 시드만 하고 계속 진행)
+                    self._initial_sync_if_needed(p["relay_mask"])
                     # DC만 갱신
                     if self.is_dc_active and "dc" in p:
                         self._update_dc(*p["dc"])
@@ -707,13 +728,13 @@ class FaduinoController(QObject):
                 return
             try:
                 relay_mask = p["relay_mask"]
-                if self._is_first_poll:
-                    self.expected_relay_mask = relay_mask; self._is_first_poll = False
-                    self.status_message.emit("Faduino", f"초기 릴레이 상태 동기화 완료: {relay_mask}")
-                elif relay_mask != self.expected_relay_mask:
-                    msg = f"릴레이 상태 불일치! 예상: {self.expected_relay_mask}, 실제: {relay_mask}"
-                    self.status_message.emit("Faduino(경고)", msg)
-                    self.command_failed.emit("Faduino", f"Relay 상태 확인 {msg}")
+                # ✅ 최초 동기화 먼저
+                if not self._initial_sync_if_needed(relay_mask):
+                    # 최초가 아니면 검증
+                    if relay_mask != self.expected_relay_mask:
+                        msg = f"릴레이 상태 불일치! 예상: {self.expected_relay_mask}, 실제: {relay_mask}"
+                        self.status_message.emit("Faduino(경고)", msg)
+                        self.command_failed.emit("Faduino", f"Relay 상태 확인 {msg}")
             except Exception:
                 pass
         self.enqueue('P', on_p, timeout_ms=FADUINO_TIMEOUT_MS, gap_ms=FADUINO_GAP_MS, tag='[FORCE P]')

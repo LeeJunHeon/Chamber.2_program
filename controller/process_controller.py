@@ -366,6 +366,7 @@ class ProcessController(QObject):
             self.is_running = True
             self._aborting = False
             self._accept_completions = True
+            self._in_emergency = False
 
             self.process_status_changed.emit(True)
             self.process_started.emit(params)
@@ -448,7 +449,9 @@ class ProcessController(QObject):
         # 다음 스텝으로
         self._current_step_idx += 1
         if self._current_step_idx >= len(self.process_sequence):
-            self._finish_process(True)
+            # ✅ 정지/비상정지로 내려온 경우엔 성공으로 간주하지 않음
+            success = not (self._aborting or self._in_emergency)
+            self._finish_process(success)
             return
 
         current_step = self.process_sequence[self._current_step_idx]
@@ -651,9 +654,14 @@ class ProcessController(QObject):
 
         self.process_status_changed.emit(False)
         self.process_finished.emit(success)
+        self._aborting = False
+        self._in_emergency = False
 
     def abort_process(self):
         if not self.is_running:
+            return
+        if self._aborting:  # ✅ 이미 중단 중이면 무시
+            self.log_message.emit("Process", "(중복) 긴급 중단 진행 중 - 추가 호출 무시")
             return
         self.step_timer.stop()
         self._stop_countdown()

@@ -47,14 +47,18 @@ from lib.config import (
     MFC_GAP_MS,
     MFC_DELAY_MS,
     MFC_DELAY_MS_VALVE,
-    DEBUG_PRINT
+    DEBUG_PRINT,
+    MFC_PRESSURE_SCALE,
+    MFC_PRESSURE_DECIMALS,
+    MFC_SP1_VERIFY_TOL
     )
 
 class MFCController(QObject):
     # --- 시그널 (기존 시그널명 유지) ---
     status_message   = Signal(str, str)
     update_flow      = Signal(str, float)
-    update_pressure  = Signal(str)
+    update_pressure  = Signal(str)          # UI 라벨용
+    update_pressure_value = Signal(float)   # CSV/계산용
     command_failed   = Signal(str, str)
     command_confirmed= Signal(str)
 
@@ -548,9 +552,7 @@ class MFCController(QObject):
 
         cmdp = MFC_COMMANDS['READ_PRESSURE']
         def on_p(line: Optional[str]):
-            line = (line or "").strip()
-            if line:
-                self.update_pressure.emit(line)
+            self._emit_pressure_ui(line)
         self.enqueue(cmdp, on_p, timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS, tag="[POLL PRESS]")
 
     # ---------- 큐/상태 정리 유틸 ----------
@@ -631,12 +633,31 @@ class MFCController(QObject):
             self.enqueue(vcmd, after_valve, timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS, tag=f"[{cmd}]", allow_no_reply=True)
             return
 
-        # (E) SP1/4
-        if cmd in ("SP1_SET", "SP1_ON", "SP4_ON"):
-            scmd = MFC_COMMANDS[cmd](**params) if params else MFC_COMMANDS[cmd]
+        # --- (E) SP1/4 ---
+        if cmd == "SP1_SET":
+            ui_val = float(params.get("value", 0.0))
+            hw_val = self._to_hw_pressure(ui_val)
+
+            # 로그(혼동 방지): UI ↔ HW 모두 보여주기
+            self.status_message.emit("MFC",
+                f"SP1 스케일: UI {ui_val:.2f} → 장비 {hw_val:.{MFC_PRESSURE_DECIMALS}f}")
+
+            # 검증에서 HW 값으로 비교하되, UI 값은 메시지에 쓰려고 보관
+            params_hw = {**params, "value": hw_val, "_ui_value": ui_val}
+
+            scmd = MFC_COMMANDS["SP1_SET"](value=hw_val)
+            def after_simple(_line):
+                self._verify_simple_async("SP1_SET", params_hw)
+            self.enqueue(scmd, after_simple, timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS,
+                        tag="[SP1_SET]", allow_no_reply=True)
+            return
+
+        if cmd in ("SP1_ON", "SP4_ON"):
+            scmd = MFC_COMMANDS[cmd]
             def after_simple(_line, _cmd=cmd):
                 self._verify_simple_async(_cmd, params)
-            self.enqueue(scmd, after_simple, timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS, tag=f"[{cmd}]", allow_no_reply=True)
+            self.enqueue(scmd, after_simple, timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS,
+                        tag=f"[{cmd}]", allow_no_reply=True)
             return
 
         # (E0) ZEROING 류
@@ -934,25 +955,38 @@ class MFCController(QObject):
     def _verify_simple_async(self, cmd: str, params: dict,
                              attempt: int = 1, max_attempts: int = 5, delay_ms: int = MFC_DELAY_MS):
         if cmd == "SP1_SET":
-            val = float(params['value'])
+            val_hw = float(params['value'])
+            ui_val = float(params.get("_ui_value", val_hw))  # 폴백
             rd = MFC_COMMANDS['READ_SP1_VALUE']
+
             def on_reply(line: Optional[str], attempt=attempt):
-                line = (line or "").strip()
+                s = (line or "").strip()
                 ok = False
                 try:
-                    ok = (line and '+' in line and abs(float(line.split('+')[1]) - val) < 0.1)
+                    # 응답(예: 'S1+000.20')에서 숫자만 추출
+                    cur_hw = self._parse_pressure_value(s)
+                    ok = (cur_hw is not None) and (abs(cur_hw - val_hw) < float(MFC_SP1_VERIFY_TOL))
                 except Exception:
                     ok = False
+
                 if ok:
-                    msg = f"SP1 목표값 {val:.2f} 설정 완료."
-                    self.status_message.emit("MFC < 확인", msg)
+                    self.status_message.emit(
+                        "MFC < 확인",
+                        f"SP1 설정 완료: UI {ui_val:.2f} (장비 {val_hw:.{MFC_PRESSURE_DECIMALS}f})"
+                    )
                     self.command_confirmed.emit("SP1_SET")
                 else:
                     if attempt < max_attempts:
                         self.status_message.emit("WARN",
-                            f"[SP1_SET 검증 재시도] 응답={repr(line)} (시도 {attempt}/{max_attempts})")
-                        QTimer.singleShot(delay_ms,
-                            lambda: self._verify_simple_async("SP1_SET", {"value": val}, attempt+1, max_attempts, delay_ms))
+                            f"[SP1_SET 검증 재시도] 응답={repr(s)} (시도 {attempt}/{max_attempts})")
+                        QTimer.singleShot(
+                            delay_ms,
+                            lambda: self._verify_simple_async(
+                                "SP1_SET",
+                                {"value": val_hw, "_ui_value": ui_val},
+                                attempt+1, max_attempts, delay_ms
+                            )
+                        )
                     else:
                         self.command_failed.emit("SP1_SET", "SP1 설정 확인 실패")
             self.enqueue(rd, on_reply, timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS, tag="[VERIFY SP1_SET]")
@@ -1012,8 +1046,7 @@ class MFCController(QObject):
         def on_reply(line: Optional[str]):
             line = (line or "").strip()
             if line:
-                self.update_pressure.emit(line)
-                #self.command_confirmed.emit("READ_PRESSURE")
+                self._emit_pressure_ui(line)
             else:
                 self.command_failed.emit("READ_PRESSURE", "응답 없음")
         self.enqueue(cmd, on_reply, timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS, tag=tag or "[READ_PRESSURE]")
@@ -1103,3 +1136,30 @@ class MFCController(QObject):
         except Exception as e:
             self.status_message.emit("MFC", traceback.format_exc())
             self.status_message.emit("MFC", f"콜백 오류: {e}")
+
+    def _to_hw_pressure(self, ui_val: float) -> float:
+        """UI → HW 변환 (보낼 때 사용)"""
+        return float(ui_val) * float(MFC_PRESSURE_SCALE)
+
+    def _to_ui_pressure(self, hw_val: float) -> float:
+        """HW → UI 변환 (표시/기록할 때 사용)"""
+        return float(hw_val) / float(MFC_PRESSURE_SCALE)
+
+    def _parse_pressure_value(self, line: str | None) -> float | None:
+        """장비 압력 응답에서 첫 번째 실수 파싱 (예: 'P+012.34' → 12.34)"""
+        s = (line or "").strip()
+        m = re.search(r'([+\-]?\d+(?:\.\d+)?)', s)
+        try:
+            return float(m.group(1)) if m else None
+        except Exception:
+            return None
+
+    def _emit_pressure_ui(self, line: Optional[str]):
+        """원시 응답 → 숫자 파싱 → HW→UI 변환 → 문자열/숫자 둘 다 emit"""
+        val_hw = self._parse_pressure_value(line)
+        if val_hw is None:
+            return
+        ui_val = self._to_ui_pressure(val_hw)
+        fmt = "{:." + str(int(MFC_PRESSURE_DECIMALS)) + "f}"
+        self.update_pressure.emit(fmt.format(ui_val))     # UI 라벨용 문자열
+        self.update_pressure_value.emit(float(ui_val))    # CSV/그래프용 숫자

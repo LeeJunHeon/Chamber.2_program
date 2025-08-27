@@ -244,10 +244,10 @@ class ProcessController(QObject):
                 ])
 
     def _add_pressure_control_steps(self, steps: List[ProcessStep], working_pressure: float):
-        sp1_value = working_pressure / 10.0
+        #sp1_value = working_pressure / 10.0
         steps.extend([
             ProcessStep(action=ActionType.MFC_CMD, params=('SP4_ON', {}), message='압력 제어(SP4) 시작'),
-            ProcessStep(action=ActionType.MFC_CMD, params=('SP1_SET', {'value': sp1_value}),
+            ProcessStep(action=ActionType.MFC_CMD, params=('SP1_SET', {'value': working_pressure}),
                         message=f'목표 압력(SP1) {working_pressure:.2f} 설정'),
             ProcessStep(action=ActionType.DELAY, duration=60000, message='압력 안정화 대기 (60초)')
         ])

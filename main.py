@@ -133,7 +133,7 @@ class MainWindow(QWidget):
 
         # 공정이 시작될 때만 그래프 초기화 (수동/자동 모두 포함)
         self.process_controller.process_started.connect(
-            lambda *args: self.graph_controller.reset_plots(),
+            lambda *args: self.graph_controller.reset(),
             type=Qt.ConnectionType.QueuedConnection
         )
 

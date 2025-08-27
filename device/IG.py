@@ -444,7 +444,6 @@ class IGController(QObject):
         sent_txt = cmd.cmd_str.strip()
         tag_txt  = cmd.tag or ""
 
-
         if line is None:
             self.status_message.emit("IG < 응답", f"{tag_txt} {sent_txt} → (응답 없음/타임아웃)")
 
@@ -511,10 +510,17 @@ class IGController(QObject):
         # (A) IG ON, gap=1000ms
         def _after_on(line: Optional[str]):
             if line is None:
+                # 응답 없음 → 포트 닫지 말고 같은 포트에서 재시도
+                self.status_message.emit("IG", "SIG 1 응답 없음 → 동일 포트 재시도")
+                self.enqueue("SIG 1", _after_on,
+                            timeout_ms=IG_TIMEOUT_MS, gap_ms=IG_GAP_MS,
+                            tag="[IG ON - RETRY]", retries_left=5, allow_no_reply=False)
                 return
             
-            s = (line or "").strip().upper()
-            if s == "OK":
+            s = (line or "").strip()
+            su = s.upper()
+
+            if su.startswith("OK"):
                 # ✅ OK 수신 → 첫 RDI는 5초 뒤 '한 번만' 실행, 이후에 polling 시작
                 self.status_message.emit("IG",
                     f"IG ON OK → 첫 RDI를 {self._first_read_delay_ms}ms 후 수행")

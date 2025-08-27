@@ -589,6 +589,10 @@ class MFCController(QObject):
 
         self.purge_pending(f"process finished ({'ok' if success else 'fail'})")
 
+        # 잔여 목표/카운터 초기화
+        self.last_setpoints = {1: 0.0, 2: 0.0, 3: 0.0}
+        self.flow_error_counters = {1: 0, 2: 0, 3: 0}
+
     # ---------- 상위에서 호출하는 공개 API ----------
     @Slot(str, dict)
     def handle_command(self, cmd: str, params: dict):
@@ -751,6 +755,9 @@ class MFCController(QObject):
                 self._stabilizing_target = 0.0
                 self._pending_cmd_for_timer = None
                 self.status_message.emit("MFC", f"FLOW_OFF 요청: ch{ch} 안정화 취소")
+                # ✅ 경고 오경보 방지: OFF 시 목표 0으로
+                self.last_setpoints[ch] = 0.0
+                self.flow_error_counters[ch] = 0
 
             self._set_onoff_mask_and_verify(
                 target,

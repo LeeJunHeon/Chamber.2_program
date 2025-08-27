@@ -670,7 +670,8 @@ class ProcessController(QObject):
         if self._aborting:  # ✅ 이미 중단 중이면 무시
             self.log_message.emit("Process", "(중복) 긴급 중단 진행 중 - 추가 호출 무시")
             return
-        self.process_aborted.emit()
+        #self.process_aborted.emit()
+
         self.step_timer.stop()
         self._stop_countdown()
         self.set_polling.emit(False)

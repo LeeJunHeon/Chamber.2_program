@@ -715,7 +715,7 @@ class MainWindow(QWidget):
         self.process_controller.abort_process()
 
         # 2) 그리고 즉시 장치 하드스톱 (큐/타이머/시리얼 정리, 파워 정지)
-        self.stop_all.emit()
+        #self.stop_all.emit()
 
         if self.process_queue:
             self.append_log("MAIN", "자동 시퀀스가 사용자에 의해 중단되었습니다.")

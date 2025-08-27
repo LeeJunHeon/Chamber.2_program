@@ -565,36 +565,88 @@ class IGController(QObject):
     def _enqueue_read_once(self, tag: str = "[POLL RDI]"):
         """
         RDI 한 번을 큐에 올려 읽는다.
-          - 응답 파싱 실패/빈 응답이면 아무것도 하지 않고(실패 시그널 없음) 다음 주기에 재시도
-          - 성공하면 pressure_update 시그널 + 목표 도달 판단
+        - 응답 파싱 실패/빈 응답이면 다음 주기에 자동 재시도
+        - 'IG OFF' 응답이면: 중단 대신 자동 재점등(SIG 1) 시도 후 폴링 재개
+        - 목표 도달 시 SIG 0 전송 후 cleanup
         """
         def _on_rdi(line: Optional[str]):
-            # 대기 중이 아니면 무시(취소/성공 후 호출될 수 있음)
+            # 대기 상태가 아니면 무시(취소/성공 후 호출될 수 있음)
             if not self._waiting_active:
                 return
 
-            # 총 대기 시간 초과 먼저 확인
-            if (time.monotonic() - self._wait_start_s) > float(IG_WAIT_TIMEOUT):
+            now_s = time.monotonic()
+
+            # 1) 전체 대기 시간 초과: 자동 OFF 없이 종료 신호만
+            if (now_s - self._wait_start_s) > float(IG_WAIT_TIMEOUT):
                 self.status_message.emit("IG", f"시간 초과({IG_WAIT_TIMEOUT}초): 목표 압력 미도달")
                 self.base_pressure_failed.emit("IG", "Timeout")
                 self._waiting_active = False
-                if self.polling_timer: self.polling_timer.stop()
-
+                if self.polling_timer:
+                    self.polling_timer.stop()
+                
                 def _after_sig0(_l: Optional[str]):
                     self.cleanup()
 
-                self.enqueue(   
+                self.enqueue(
                     "SIG 0", _after_sig0,
                     timeout_ms=IG_TIMEOUT_MS, gap_ms=150,
-                    tag="[IG OFF] SIG 0", retries_left=5, allow_no_reply=False
+                    tag="[IG OFF] SIG 0", retries_left=3, allow_no_reply=False
                 )
-                
+
                 return
 
-            # 응답 파싱
+            # 2) 응답 파싱
             s = (line or "").strip()
             if not s:
-                return  # 빈 응답 → 다음 주기에 자동 재시도
+                return  # 빈 응답 → 다음 주기 자동 재시도
+
+            # 3) 폴링 중 'IG OFF' 응답: 자동 재점등 시도
+            if s.upper() == "IG OFF":
+                self.status_message.emit("IG", "IG OFF 응답 감지 → 자동 재점등을 시도합니다.")
+                if self.polling_timer:
+                    self.polling_timer.stop()
+
+                # 로컬(클로저) 재시도 카운터/백오프(ms): 2s, 5s, 10s
+                attempt = {"n": 0}
+                backoff = [2000, 5000, 10000]
+
+                def re_on_cb(reply: Optional[str]):
+                    ok = (reply or "").strip().upper() == "OK"
+                    if ok:
+                        self.status_message.emit("IG", "재점등 성공. 첫 RDI 후 폴링을 재개합니다.")
+                        QTimer.singleShot(
+                            self._first_read_delay_ms,
+                            lambda: (
+                                self._enqueue_read_once(tag="[AFTER RE-ON]"),
+                                self.polling_timer and self.polling_timer.start()
+                            )
+                        )
+                    else:
+                        if attempt["n"] < len(backoff):
+                            delay = backoff[attempt["n"]]
+                            attempt["n"] += 1
+                            self.status_message.emit("IG", f"재점등 실패 → {delay}ms 후 재시도")
+                            QTimer.singleShot(
+                                delay,
+                                lambda: self.enqueue(
+                                    "SIG 1", re_on_cb,
+                                    timeout_ms=IG_TIMEOUT_MS, gap_ms=IG_GAP_MS,
+                                    tag="[IG RE-ON]", retries_left=3, allow_no_reply=False
+                                )
+                            )
+                        else:
+                            self.status_message.emit("IG", "자동 재점등 실패(한도 도달). 폴링만 재개합니다.")
+                            if self.polling_timer:
+                                self.polling_timer.start()
+                # 즉시 1차 재점등
+                self.enqueue(
+                    "SIG 1", re_on_cb,
+                    timeout_ms=IG_TIMEOUT_MS, gap_ms=IG_GAP_MS,
+                    tag="[IG RE-ON]", retries_left=3, allow_no_reply=False
+                )
+                return
+
+            # 4) 숫자 파싱
             cleaned = s.lower().replace("x10e", "e")   # '1.2x10e-5' → '1.2e-5'
             try:
                 pressure = float(cleaned)
@@ -602,31 +654,33 @@ class IGController(QObject):
                 self.status_message.emit("IG", f"압력 읽기 실패(파싱): {repr(s)}")
                 return
 
-            # 업데이트 + 목표 도달 판정
+            # 5) 업데이트 + 목표 도달 판단
             self.pressure_update.emit(pressure)
             self.status_message.emit("IG",
                 f"현재 압력: {pressure:.3e} Torr (목표: {self._target_pressure:.3e} Torr)")
+
             if pressure <= self._target_pressure:
+                # === 목표 도달: SIG 0 → cleanup → 다음 단계(상위는 base_pressure_reached 시그널로 진행) ===
                 self.status_message.emit("IG", "목표 압력 도달")
                 self.base_pressure_reached.emit()
                 self._waiting_active = False
-                if self.polling_timer: 
+                if self.polling_timer:
                     self.polling_timer.stop()
 
                 def _after_sig0(_l: Optional[str]):
                     self.cleanup()
-                
+
                 self.enqueue(
                     "SIG 0", _after_sig0,
                     timeout_ms=IG_TIMEOUT_MS, gap_ms=150,
-                    tag="[IG OFF] SIG 0", retries_left=5, allow_no_reply=False
+                    tag="[IG OFF] SIG 0", retries_left=3, allow_no_reply=False
                 )
-
                 return
 
         # allow_no_reply=False: RDI는 반드시 한 줄을 기대
         self.enqueue("RDI", _on_rdi, timeout_ms=IG_TIMEOUT_MS, gap_ms=IG_GAP_MS,
-                     tag=tag, retries_left=1, allow_no_reply=False)
+                    tag=tag, retries_left=1, allow_no_reply=False)
+
 
     # =================================================
     # 보조

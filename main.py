@@ -711,8 +711,8 @@ class MainWindow(QWidget):
             self.append_log("MAIN", "중단할 공정이 없습니다.")
             return
 
-        # 1) 감독관에게 더 이상 다음 스텝을 내지 말라고 먼저 통보
-        self.process_controller.abort_process()
+        # 1) 정상 정지 요청 → 종료 시퀀스로 전환
+        self.process_controller.request_stop()
 
         # 2) 그리고 즉시 장치 하드스톱 (큐/타이머/시리얼 정리, 파워 정지)
         #self.stop_all.emit()

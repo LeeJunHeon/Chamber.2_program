@@ -821,17 +821,16 @@ class MainWindow(QWidget):
         except Exception:
             pass
 
-        for ctrl in (
-            getattr(self, 'faduino_controller', None),
-            getattr(self, 'mfc_controller', None),
-            getattr(self, 'ig_controller', None),
-            getattr(self, 'oes_controller', None),
-        ):
-            try:
-                if ctrl:
-                    ctrl.cleanup()
-            except Exception:
-                pass
+        # ✅ 워커 스레드 쪽에서 안전하게 정리
+        try: self.request_faduino_cleanup.emit()
+        except Exception: pass
+        try: self.request_mfc_cleanup.emit()
+        except Exception: pass
+        try: self.request_ig_cleanup.emit()
+        except Exception: pass
+        try: self.request_oes_cleanup.emit()
+        except Exception: pass
+
 
     def _emergency_cleanup(self):
         if self._emergency_done:
@@ -845,17 +844,16 @@ class MainWindow(QWidget):
         except Exception:
             pass
 
-        for ctrl in (
-            getattr(self, 'faduino_controller', None),
-            getattr(self, 'mfc_controller', None),
-            getattr(self, 'ig_controller', None),
-            getattr(self, 'oes_controller', None),
-        ):
-            try:
-                if ctrl:
-                    ctrl.cleanup()
-            except Exception:
-                pass
+        # ✅ 워커 스레드 쪽에서 안전하게 정리
+        try: self.request_faduino_cleanup.emit()
+        except Exception: pass
+        try: self.request_mfc_cleanup.emit()
+        except Exception: pass
+        try: self.request_ig_cleanup.emit()
+        except Exception: pass
+        try: self.request_oes_cleanup.emit()
+        except Exception: pass
+
 
     def _normalize_params_for_process(self, raw: dict) -> dict:
         def tf(v):

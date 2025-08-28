@@ -965,7 +965,8 @@ class MFCController(QObject):
                 try:
                     # 응답(예: 'S1+000.20')에서 숫자만 추출
                     cur_hw = self._parse_pressure_value(s)
-                    ok = (cur_hw is not None) and (abs(cur_hw - val_hw) < float(MFC_SP1_VERIFY_TOL))
+                    tol = max(float(MFC_SP1_VERIFY_TOL), 1e-9)
+                    ok = (cur_hw is not None) and (abs(cur_hw - val_hw) <= tol)
                 except Exception:
                     ok = False
 
@@ -1144,13 +1145,36 @@ class MFCController(QObject):
     def _to_ui_pressure(self, hw_val: float) -> float:
         """HW → UI 변환 (표시/기록할 때 사용)"""
         return float(hw_val) / float(MFC_PRESSURE_SCALE)
-
+    
     def _parse_pressure_value(self, line: str | None) -> float | None:
-        """장비 압력 응답에서 첫 번째 실수 파싱 (예: 'P+012.34' → 12.34)"""
+        """
+        장비 압력/설정 응답에서 수치만 안전하게 파싱.
+        - 'P+012.34'  → 12.34
+        - 'S1+000.20' → 0.20   (S1의 '1'은 무시)
+        규칙:
+        1) '+' 뒤의 실수를 우선 추출
+        2) 없으면 문자열 내 '마지막' 숫자를 사용
+        """
         s = (line or "").strip()
-        m = re.search(r'([+\-]?\d+(?:\.\d+)?)', s)
+        if not s:
+            return None
+
+        s_up = s.upper()
+
+        # 1) '+' 뒤의 수치 우선
+        m = re.search(r'\+\s*([+\-]?\d+(?:\.\d+)?)', s_up)
+        if m:
+            try:
+                return float(m.group(1))
+            except Exception:
+                pass
+
+        # 2) 폴백: 문자열 내 마지막 숫자 사용 (S1의 '1' 같은 앞 숫자 무시)
+        nums = re.findall(r'([+\-]?\d+(?:\.\d+)?)', s_up)
+        if not nums:
+            return None
         try:
-            return float(m.group(1)) if m else None
+            return float(nums[-1])
         except Exception:
             return None
 

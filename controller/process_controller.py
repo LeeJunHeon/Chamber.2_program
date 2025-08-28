@@ -383,23 +383,25 @@ class ProcessController(QObject):
             self._finish_process(False)
 
     def _run_next_step(self, step: ProcessStep, step_index: int):
-        # ✅ 정지 요청이 있으면 즉시 종료 절차로 진입
-        if self._stop_requested and not (self._aborting or self._shutdown_in_progress):
+        # ✅ 수정: 종료 절차 중에는 정지 요청 체크 안함
+        if (self._stop_requested and 
+            not (self._aborting or self._shutdown_in_progress) and
+            not self._in_emergency):
             self.log_message.emit("Process", "정지 요청 감지 - 종료 절차를 시작합니다.")
             self._start_normal_shutdown()
             return
 
-        # if not (self._countdown_active and step.action != ActionType.DELAY):
-        #     self.update_process_state.emit(step.message)
-    
         if not self.is_running or self._aborting:
+            self.log_message.emit("Process", f"스텝 실행 중단: running={self.is_running}, aborting={self._aborting}")
             return
 
         action = step.action
         message = step.message
 
         self.update_process_state.emit(message)
-        self.log_message.emit("Process", f"[STEP {step_index + 1}/{len(self.process_sequence)}] {message}")
+        # ✅ 수정: 종료 절차 여부를 로그에 표시
+        procedure_type = "종료절차" if self._shutdown_in_progress else "공정"
+        self.log_message.emit("Process", f"[{procedure_type} {step_index + 1}/{len(self.process_sequence)}] {message}")
 
         try:
             if action == ActionType.DELAY:
@@ -428,7 +430,7 @@ class ProcessController(QObject):
                 handler()
                 if step.no_wait:
                     self._accept_completions = False
-                    QTimer.singleShot(0, self._advance_after_nowait)
+                    QTimer.singleShot(100, self._advance_after_nowait)  # ✅ 지연 시간 증가
             else:
                 raise ValueError(f"알 수 없는 Action: {action}")
 
@@ -441,18 +443,22 @@ class ProcessController(QObject):
         if sender is self.step_timer:
             self._stop_countdown()
 
-        # ✅ 정지 요청 체크 - 타이머에서 온 완료 신호도 체크
-        if self._stop_requested and not (self._aborting or self._shutdown_in_progress):
+        # ✅ 수정: 정지 요청 체크를 종료 절차 중에는 하지 않음
+        if (self._stop_requested and 
+            not (self._aborting or self._shutdown_in_progress) and 
+            not self._in_emergency):
             self.log_message.emit("Process", "정지 요청 감지 - 종료 절차를 시작합니다.")
             self._start_normal_shutdown()
             return
 
         if not self._accept_completions or not self.is_running:
+            self.log_message.emit("Process", f"스텝 완료 무시: accept={self._accept_completions}, running={self.is_running}")
             return
 
         # 병렬 처리 중
         if self._px is not None:
             if not self._px.mark_completed():
+                self.log_message.emit("Process", f"병렬 작업 진행 중: {self._px.completed}/{self._px.total}")
                 return
             self.log_message.emit("Process", f"병렬 작업 {self._px.total}개 모두 완료")
             self._current_step_idx = self._px.end_index
@@ -463,9 +469,18 @@ class ProcessController(QObject):
 
         # 다음 스텝으로
         self._current_step_idx += 1
+        
+        # ✅ 추가: 현재 진행 상황 로그
+        self.log_message.emit("Process", f"다음 스텝으로 진행: {self._current_step_idx + 1}/{len(self.process_sequence)}")
+        
         if self._current_step_idx >= len(self.process_sequence):
-            # ✅ 정지/비상정지로 내려온 경우엔 성공으로 간주하지 않음
-            success = not (self._aborting or self._in_emergency or self._stop_requested)
+            # ✅ 수정: 종료 조건 명확화
+            if self._shutdown_in_progress:
+                self.log_message.emit("Process", "종료 절차가 모두 완료되었습니다.")
+                success = True  # 종료 절차 완료는 성공으로 간주
+            else:
+                success = not (self._aborting or self._in_emergency or self._stop_requested)
+            
             self._finish_process(success)
             return
 
@@ -628,6 +643,7 @@ class ProcessController(QObject):
 
         full_reason = f"[{source} - {reason}]"
         self.log_message.emit("Process", f"오류 발생: {full_reason}. 공정을 중단합니다.")
+        print("현재 상태:", self.get_debug_status())
         self.abort_process()
 
     # ---------------- 카운트다운 ----------------
@@ -760,8 +776,15 @@ class ProcessController(QObject):
     # ✅ 새로 추가: 일반 정지 처리 메서드들
     def _start_normal_shutdown(self):
         """일반 정지 요청 시 안전한 종료 절차 시작"""
-        if self._aborting or self._shutdown_in_progress:
+        # ✅ 수정: 조건 단순화 및 로그 추가
+        if self._aborting:
+            self.log_message.emit("Process", "종료 절차 무시: 이미 긴급 중단 중입니다.")
             return
+        
+        if self._shutdown_in_progress:
+            self.log_message.emit("Process", "종료 절차 무시: 이미 종료 절차 진행 중입니다.")
+            return
+        
         self._shutdown_in_progress = True  # ✅ 재진입 방지
         
         self.log_message.emit("Process", "정지 요청 - 안전한 종료 절차를 시작합니다.")
@@ -770,36 +793,53 @@ class ProcessController(QObject):
         self.set_polling.emit(False)
         self._px = None
         
-        # 현재 진행 중인 작업을 안전하게 정리하고 종료 절차로 이동
-        shutdown_steps = self._create_shutdown_sequence(self.current_params)
-        if shutdown_steps:
-            self.process_sequence = shutdown_steps
-            self._current_step_idx = -1
-            self._px = None
-            self._accept_completions = True
-            self.log_message.emit("Process", f"종료 절차 시작 (총 {len(shutdown_steps)}단계)")
-            self.on_step_completed()
-        else:
+        # ✅ 수정: 종료 절차 생성 및 실행 로직 개선
+        try:
+            shutdown_steps = self._create_shutdown_sequence(self.current_params)
+            if shutdown_steps:
+                self.log_message.emit("Process", f"종료 절차 생성 완료: {len(shutdown_steps)}단계")
+                
+                # 기존 시퀀스를 종료 시퀀스로 교체
+                self.process_sequence = shutdown_steps
+                self._current_step_idx = -1
+                self._px = None
+                self._accept_completions = True  # ✅ 중요: 스텝 완료 신호 수락
+                
+                self.log_message.emit("Process", "종료 절차 시작...")
+                # ✅ 짧은 지연 후 첫 종료 스텝 시작 (이벤트 루프가 정리될 시간 제공)
+                QTimer.singleShot(100, self.on_step_completed)
+            else:
+                self.log_message.emit("Process", "종료 절차가 없어서 즉시 완료합니다.")
+                self._finish_process(False)
+        except Exception as e:
+            self.log_message.emit("Process", f"종료 절차 시작 오류: {str(e)}")
             self._finish_process(False)
 
     def request_stop(self):
-        """✅ 새로 추가: UI에서 호출할 일반 정지 요청 메서드"""
+        """✅ 수정: UI에서 호출할 일반 정지 요청 메서드"""
         if not self.is_running:
             self.log_message.emit("Process", "정지 요청: 실행 중인 공정이 없습니다.")
             return
         
-        if self._aborting or self._stop_requested:
-            self.log_message.emit("Process", "정지 요청: 이미 정지/중단 처리 중입니다.")
+        if self._aborting:
+            self.log_message.emit("Process", "정지 요청: 이미 긴급 중단 처리 중입니다.")
+            return
+            
+        if self._stop_requested or self._shutdown_in_progress:
+            self.log_message.emit("Process", "정지 요청: 이미 정지 처리 중입니다.")
             return
         
-        self.log_message.emit("Process", "정지 요청을 받았습니다. 현재 단계 완료 후 안전하게 종료합니다.")
+        self.log_message.emit("Process", "정지 요청을 받았습니다.")
         self._stop_requested = True
         
-        # DELAY 중인 경우 타이머 중단하고 즉시 종료 절차로
+        # DELAY 중인 경우 타이머 중단
         if self.step_timer.isActive():
+            self.log_message.emit("Process", "현재 대기 중인 타이머를 중단하고 종료 절차로 진입합니다.")
             self.step_timer.stop()
             self._stop_countdown()
-            self._start_normal_shutdown()
+        
+        # 즉시 종료 절차 시작
+        self._start_normal_shutdown()
 
     # ---------------- 조회/검증 ----------------
     @property
@@ -911,3 +951,22 @@ class ProcessController(QObject):
         self.process_status_changed.emit(False)
         self.update_process_state.emit("대기 중")
         self.log_message.emit("Process", "프로세스 컨트롤러가 리셋되었습니다.")
+
+    # ✅ 추가: 디버깅용 상태 확인 메서드
+    def get_debug_status(self) -> Dict[str, Any]:
+        """디버깅용 상태 정보 반환"""
+        return {
+            'is_running': self.is_running,
+            'current_step_idx': self._current_step_idx,
+            'total_steps': len(self.process_sequence),
+            'accept_completions': self._accept_completions,
+            'aborting': self._aborting,
+            'stop_requested': self._stop_requested,
+            'shutdown_in_progress': self._shutdown_in_progress,
+            'in_emergency': self._in_emergency,
+            'step_timer_active': self.step_timer.isActive(),
+            'countdown_active': self._countdown_active,
+            'parallel_execution': self._px is not None,
+            'current_step_action': self.current_step.action.name if self.current_step else None,
+            'current_step_message': self.current_step.message if self.current_step else None
+        }

@@ -498,9 +498,8 @@ class IGController(QObject):
 
         # 포트 연결 + 워치독 시작
         if not (self.serial_ig and self.serial_ig.isOpen()):
-            if not self.connect_ig_device():
-                self.base_pressure_failed.emit("IG", "포트 연결 실패")
-                return
+            self.connect_ig_device()  # 초기 실패여도 워치독이 재시도
+            self.status_message.emit("IG", "포트가 아직 열리지 않음 → 자동 재연결을 대기합니다.")
 
         self.status_message.emit("IG", "Base Pressure 대기를 시작합니다.")
         self._target_pressure = float(base_pressure)
@@ -509,6 +508,10 @@ class IGController(QObject):
 
         # (A) IG ON, gap=1000ms
         def _after_on(line: Optional[str]):
+            if not self._waiting_active:
+                self.status_message.emit("IG", "IG ON 응답 처리 중이었지만 대기가 취소됨 → 무시")
+                return
+
             if line is None:
                 # 응답 없음 → 포트 닫지 말고 같은 포트에서 재시도
                 self.status_message.emit("IG", "SIG 1 응답 없음 → 동일 포트 재시도")
@@ -616,7 +619,15 @@ class IGController(QObject):
                 attempt = {"n": 0}
                 backoff = [2000, 5000, 10000]
 
+                if not self._waiting_active:
+                    self.status_message.emit("IG", "재점등 응답 처리 중이었지만 대기가 취소됨 → 무시")
+                    return
+
                 def re_on_cb(reply: Optional[str]):
+                    if not self._waiting_active:
+                        self.status_message.emit("IG", "재점등 응답 처리 중이었지만 대기가 취소됨 → 무시")
+                        return
+    
                     ok = (reply or "").strip().upper() == "OK"
                     if ok:
                         self.status_message.emit("IG", "재점등 성공. 첫 RDI 후 폴링을 재개합니다.")
@@ -691,6 +702,60 @@ class IGController(QObject):
     # =================================================
     # 보조
     # =================================================
+    @Slot()
+    def cancel_wait(self):
+        """
+        사용자가 Stop을 누를 때 호출.
+        - waiting 플래그 내려서 이후 콜백/타이머가 즉시 무시되게 함
+        - 폴링 타이머 정지
+        - 인플라이트/대기 명령 전부 취소(콜백에 None 전달)
+        - IG OFF(SIG 0) 한 번 보내고 끝(응답 무시)
+        """
+        # waiting OFF
+        self._waiting_active = False
+
+        # 폴링 멈춤
+        if self.polling_timer and self.polling_timer.isActive():
+            self.polling_timer.stop()
+
+        # 진행/대기 명령 전부 취소
+        self._purge_pending(reason="user cancel / stop")
+
+        # 장비 OFF (응답은 기대하지 않음)
+        try:
+            self.enqueue(
+                "SIG 0", lambda _l: None,
+                timeout_ms=IG_TIMEOUT_MS, gap_ms=150,
+                tag="[IG OFF] SIG 0 (cancel)", retries_left=0, allow_no_reply=True
+            )
+        except Exception:
+            pass
+
+    def _purge_pending(self, reason: str = "") -> int:
+        """
+        인플라이트/큐에 있는 명령을 모두 취소하고 버퍼를 정리.
+        """
+        purged = 0
+        if self._cmd_timer: self._cmd_timer.stop()
+        if self._gap_timer: self._gap_timer.stop()
+
+        if self._inflight is not None:
+            cmd = self._inflight
+            self._inflight = None
+            purged += 1
+            self._safe_callback(cmd.callback, None)  # 콜백에 None → 상위는 무시해야 함
+
+        while self._cmd_q:
+            cmd = self._cmd_q.popleft()
+            purged += 1
+            self._safe_callback(cmd.callback, None)
+
+        self._rx.clear()
+        if reason:
+            self.status_message.emit("IG", f"대기 중 명령 {purged}개 폐기 ({reason})")
+        return purged
+
+
     def _safe_callback(self, callback: Callable[[Optional[str]], None], arg: Optional[str]):
         """콜백 예외가 전체 루프를 깨지 않도록 보호."""
         try:

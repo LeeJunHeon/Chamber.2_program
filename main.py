@@ -486,6 +486,11 @@ class MainWindow(QWidget):
         self.ui.RF_power_checkbox.setChecked(params.get('use_rf_power', 'F') == 'T')
         self.ui.DC_power_checkbox.setChecked(params.get('use_dc_power', 'F') == 'T')
 
+        # ★ 타겟 이름: CSV 헤더 그대로 읽어서 UI에 표시
+        self.ui.G1_target_name.setPlainText(str(params.get('G1 Target', '')).strip())
+        self.ui.G2_target_name.setPlainText(str(params.get('G2 Target', '')).strip())
+        self.ui.G3_target_name.setPlainText(str(params.get('G3 Target', '')).strip())
+
     @Slot(bool)
     def _start_next_process_from_queue(self, was_successful: bool):
         if self.process_controller.is_running and self.current_process_index > -1:
@@ -702,6 +707,11 @@ class MainWindow(QWidget):
             **vals,
         }
 
+        # ★ 수동 실행 시에도 DataLogger가 원본 헤더로 기록할 수 있도록 동기화
+        params["G1 Target"] = vals.get("G1_target_name", "")
+        params["G2 Target"] = vals.get("G2_target_name", "")
+        params["G3 Target"] = vals.get("G3_target_name", "")
+
         self.append_log("MAIN", "입력 검증 통과 → 공정 시작")
         self.process_controller.start_process(params)
 
@@ -712,6 +722,7 @@ class MainWindow(QWidget):
             return
 
         # 1) 정상 정지 요청 → 종료 시퀀스로 전환
+        print("현재 상태:", self.process_controller.get_debug_status())
         self.process_controller.request_stop()
 
         # 2) 그리고 즉시 장치 하드스톱 (큐/타이머/시리얼 정리, 파워 정지)
@@ -870,6 +881,11 @@ class MainWindow(QWidget):
                 return int(float(str(raw.get(key, default)).strip()))
             except Exception:
                 return int(default)
+            
+        # CSV 원본 타겟명 (헤더 고정)
+        g1t = str(raw.get("G1 Target", "")).strip()
+        g2t = str(raw.get("G2 Target", "")).strip()
+        g3t = str(raw.get("G3 Target", "")).strip()
 
         out = {
             # 공통 수치
@@ -905,14 +921,19 @@ class MainWindow(QWidget):
 
             # 메모(이름)
             "process_note":      raw.get("Process_name", raw.get("process_note", "")),
+
+            # ★ 내부 표준 키(하위 모듈/검증 로직용)
+            "G1_target_name":    g1t,
+            "G2_target_name":    g2t,
+            "G3_target_name":    g3t,
+
+            # ★ 원본 CSV 키 그대로도 포함(DataLogger 등에서 그대로 쓰게)
+            "G1 Target":         g1t,
+            "G2 Target":         g2t,
+            "G3 Target":         g3t,
         }
 
-        # (선택) 타겟 이름이 CSV에 있으면 그대로 전파
-        for k in ("G1_target_name","G2_target_name","G3_target_name"):
-            if k in raw: out[k] = raw[k]
         return out
-
-
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

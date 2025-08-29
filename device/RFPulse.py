@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from typing import Optional, Tuple
-from PyQt6.QtCore import QObject, QCoreApplication, QElapsedTimer, pyqtSignal as Signal, pyqtSlot as Slot
+from PyQt6.QtCore import QObject, QTimer, QCoreApplication, QElapsedTimer, pyqtSignal as Signal, pyqtSlot as Slot
 from PyQt6.QtSerialPort import QSerialPort, QSerialPort as QSP
 from lib.config import RFPULSE_PORT, RFPULSE_BAUD, RFPULSE_ADDR, RFPULSE_DEFAULT_DELAY_MS
 
@@ -24,6 +24,11 @@ CMD_REPORT_DELIVERED     = 167   # 2B W
 CMD_SET_PULSING         = 27     # 0=off, 1=int, 2=ext, 3=ext_inv, 4=int_by_ext
 CMD_SET_PULSE_FREQ      = 93     # 3 bytes (Hz, LSB first)
 CMD_SET_PULSE_DUTY      = 96     # 2 bytes (percent, LSB first)
+
+# Pulsing 리드백(보고) 명령 추가
+CMD_REPORT_PULSING      = 177   # 현재 펄싱 모드 readback (선택 사용)
+CMD_REPORT_PULSE_FREQ   = 193   # 펄스 주파수 readback (3B LSB-first, 일부 FW는 2B)
+CMD_REPORT_PULSE_DUTY   = 196   # 듀티(%) readback (2B 또는 1B)
 
 CSR_CODES = {
     0: "OK",
@@ -80,23 +85,24 @@ class RFPulseController(QObject):
         self._default_port = RFPULSE_PORT
         self._default_baud = RFPULSE_BAUD
 
+        # --- 워치독 ---
+        self._wd_timer = QTimer(self)
+        self._wd_timer.setInterval(2000)   # 2초마다 상태점검
+        self._wd_timer.timeout.connect(self._on_watchdog_tick)
+        self._wd_miss = 0
+        self._wd_miss_limit = 2           # 2회 연속 실패 시 재연결
+        self._max_retries = 5             # 설정/검증 실패시 재시도 상한
+
     # ---------- 포트 ----------
-    # RFPulseController 내부에 추가
     @Slot()
     def connect_rfpulse_device(self) -> bool:
-        """
-        기본 설정(RFPULSE_ADDR/RFPULSE_PORT/RFPULSE_BAUD)으로 포트 연결.
-        main에서 Start 전에 호출해서 미리 연결해두는 용도.
-        """
-        try:
-            # 주소는 항상 config 값으로 동기화
-            self.set_address(RFPULSE_ADDR)
-        except Exception:
-            pass
-
+        self.set_address(RFPULSE_ADDR)
         ok = self.open_port(self._default_port, self._default_baud)
         if ok:
             self.status_message.emit("RFPulse", f"연결 성공: {self._default_port}@{self._default_baud}")
+            self._wd_miss = 0
+            if not self._wd_timer.isActive():
+                self._wd_timer.start()
         else:
             self.status_message.emit("RFPulse", f"연결 실패: {self._default_port}@{self._default_baud}")
         return ok
@@ -145,6 +151,45 @@ class RFPulseController(QObject):
                 self.status_message.emit("RFPulse", "포트 닫힘")
             except Exception:
                 pass
+        # 포트 닫힐 때 워치독도 멈춤
+        if self._wd_timer.isActive():
+            self._wd_timer.stop()
+
+    # ---------- 워치독 ----------
+    def _on_watchdog_tick(self):
+        # 진행 중 긴 동작과 충돌 방지를 위해 간단 쿼리만: report status(162)
+        try:
+            self._send_query(CMD_REPORT_STATUS, b"", 500)
+            self._wd_miss = 0
+        except Exception as e:
+            self._wd_miss += 1
+            self.status_message.emit("RFPulse", f"[WD] 상태 점검 실패 {self._wd_miss}/{self._wd_miss_limit}: {e}")
+            if self._wd_miss >= self._wd_miss_limit:
+                self.status_message.emit("RFPulse", "[WD] 재연결 시도")
+                self.reconnect()
+                
+    def reconnect(self) -> bool:
+        try:
+            self.close_port()
+        except Exception:
+            pass
+        ok = self.open_port(self._default_port, self._default_baud)
+        if ok:
+            self._wd_miss = 0
+            if not self._wd_timer.isActive():
+                self._wd_timer.start()
+            self.status_message.emit("RFPulse", "[WD] 재연결 성공")
+        else:
+            self.status_message.emit("RFPulse", "[WD] 재연결 실패")
+        return ok
+
+    def _wd_pause(self):
+        if self._wd_timer.isActive():
+            self._wd_timer.stop()
+
+    def _wd_resume(self):
+        if self.is_connected() and not self._wd_timer.isActive():
+            self._wd_timer.start()
 
     # ---------- 저수준 통신 ----------
     def _delay_ms(self, ms: int):
@@ -294,6 +339,10 @@ class RFPulseController(QObject):
             raise RuntimeError(f"MODE {mode} 실패 CSR={csr}({CSR_CODES.get(csr,'?')})")
         self.status_message.emit("RFPulse", f"[MODE {mode.upper()}] OK")
         self._delay_ms(self.default_delay_ms)
+        # --- (추가) 리드백 검증 ---
+        sp, md = self._read_setpoint_mode()
+        if MODE_NAME.get(md) != "FWD":
+            raise RuntimeError(f"MODE 검증 실패: readback={MODE_NAME.get(md, md)}")
 
     def _set_power(self, watts: int):
         if watts < 0: watts = 0
@@ -304,6 +353,10 @@ class RFPulseController(QObject):
             raise RuntimeError(f"SETP {watts}W 실패 CSR={csr}({CSR_CODES.get(csr,'?')})")
         self.status_message.emit("RFPulse", f"[SETP {watts}W] OK")
         self._delay_ms(self.default_delay_ms)
+        # --- (추가) 리드백 검증 ---
+        sp, _md = self._read_setpoint_mode()
+        if sp != watts:
+            raise RuntimeError(f"SETP 검증 실패: readback={sp}W != {watts}W")
 
     def _set_pulsing(self, mode_code: int):
         k, csr = self._send_exec(CMD_SET_PULSING, bytes([mode_code & 0xFF]), 800)
@@ -321,6 +374,10 @@ class RFPulseController(QObject):
             raise RuntimeError(f"PULSE FREQ {hz} 실패 CSR={csr}")
         self.status_message.emit("RFPulse", f"[PULSE FREQ {hz}] OK")
         self._delay_ms(self.default_delay_ms)
+        # --- (추가) 리드백 검증 ---
+        rb = self._read_pulse_freq()
+        if rb is None or int(rb) != int(hz):
+            raise RuntimeError(f"PULSE FREQ 검증 실패: readback={rb} != {hz}")
 
     def _set_pulse_duty(self, duty_percent: int):
         if duty_percent < 1 or duty_percent > 99:
@@ -332,6 +389,10 @@ class RFPulseController(QObject):
             raise RuntimeError(f"PULSE DUTY {duty_percent}% 실패 CSR={csr}")
         self.status_message.emit("RFPulse", f"[PULSE DUTY {duty_percent}%] OK")
         self._delay_ms(self.default_delay_ms)
+        # --- (추가) 리드백 검증 ---
+        rb = self._read_pulse_duty()
+        if rb is None or int(rb) != int(duty_percent):
+            raise RuntimeError(f"PULSE DUTY 검증 실패: readback={rb}% != {duty_percent}%")
 
     def _rf_on(self):
         k, csr = self._send_exec(CMD_RF_ON, b"", 2500)
@@ -368,6 +429,37 @@ class RFPulseController(QObject):
         """cmd 165: u16 forward power (W)"""
         data = self._send_query(CMD_REPORT_FORWARD, b"", 800)
         return _u16le(data, 0) if len(data) >= 2 else 0
+    
+    def _read_pulsing_mode(self) -> Optional[int]:
+        try:
+            data = self._send_query(CMD_REPORT_PULSING, b"", 800)
+            return data[0] if len(data) >= 1 else None
+        except Exception:
+            return None
+
+    def _read_pulse_freq(self) -> Optional[int]:
+        try:
+            data = self._send_query(CMD_REPORT_PULSE_FREQ, b"", 1500)
+            if len(data) >= 3:
+                return _u24le(data, 0)
+            elif len(data) >= 2:
+                return _u16le(data, 0)
+            elif len(data) == 1:
+                return data[0]
+            return None
+        except Exception:
+            return None
+
+    def _read_pulse_duty(self) -> Optional[int]:
+        try:
+            data = self._send_query(CMD_REPORT_PULSE_DUTY, b"", 1500)
+            if len(data) >= 2:
+                return _u16le(data, 0)
+            elif len(data) == 1:
+                return data[0]
+            return None
+        except Exception:
+            return None
     
     # ---------- (추가) RF ON 후 검증 루틴 ----------
     def _wait_until_power_on_and_in_tol(
@@ -423,54 +515,72 @@ class RFPulseController(QObject):
 
     # ---------- 외부에서 호출 ----------
     @Slot(float, object, object)
-    def start_pulse_process(
-        self,
-        target_w: float,
-        freq_hz: Optional[int] = None,
-        duty_percent: Optional[int] = None,
-    ):
+    def start_pulse_process(self, target_w: float, freq_hz: Optional[int] = None, duty_percent: Optional[int] = None):
         """
-        순서: HOST(14) → FWD(3) → SETP(8) → (옵션: 93/96) → RF ON(2) → (검증: 162/165)
-        - freq/duty가 None이면 장비 기존값 유지
+        순서: HOST(14) → FWD(3, 검증) → SETP(8, 검증) → (옵션: 93/96, 각 검증) → RF ON(2) → (검증: 162/165)
+        검증 실패/통신 예외 시: 재연결 후 최대 self._max_retries회 재시도
         """
+        # 워치독과 충돌하지 않도록 일시 정지
+        self._wd_pause()
         try:
-            # 시작 시점에 연결 보장 (중앙집중화)
-            if not self.is_connected():
-                if not self.connect_rfpulse_device():
-                    raise RuntimeError(f"포트 '{self._default_port}' 연결 실패")
+            last_err = None
+            for attempt in range(1, self._max_retries + 1):
+                try:
+                    # 연결 보장
+                    if not self.is_connected():
+                        if not self.connect_rfpulse_device():
+                            raise RuntimeError(f"포트 '{self._default_port}' 연결 실패")
 
-            # 1) HOST 모드
-            self._host_mode()
+                    # 1) HOST
+                    self._host_mode()
 
-            # 2) 규제 모드 FWD
-            self._set_mode("fwd")  # 6 = Forward power regulation
+                    # 2) FWD 모드 (검증 내장)
+                    self._set_mode("fwd")
 
-            # 3) 파워 세트포인트
-            sp = int(round(float(target_w)))
-            self._set_power(sp)
+                    # 3) 세트포인트 (검증 내장)
+                    sp = int(round(float(target_w)))
+                    self._set_power(sp)
 
-            # 4) (옵션) pulsing freq/duty 반영
-            if freq_hz is not None:
-                self._set_pulse_freq(int(freq_hz))
-            if duty_percent is not None:
-                self._set_pulse_duty(int(duty_percent))
+                    # 4) (옵션) 펄스 파라미터 (검증 내장)
+                    if freq_hz is not None:
+                        self._set_pulse_freq(int(freq_hz))
+                    if duty_percent is not None:
+                        self._set_pulse_duty(int(duty_percent))
 
-            # 5) RF ON
-            self._rf_on()
+                    # 5) RF ON
+                    self._rf_on()
 
-            # 6) (검증) 실제 출력/허용오차 이내 도달 확인
-            self._wait_until_power_on_and_in_tol(target_w=sp)
+                    # 6) (검증) 출력/허용오차 확인
+                    self._wait_until_power_on_and_in_tol(target_w=sp)
 
-            # 완료 알림
-            self.target_reached.emit()
+                    # 성공!
+                    self.target_reached.emit()
+                    last_err = None
+                    break
 
-        except Exception as e:
-            # 실패 시 즉시 OFF
+                except Exception as e:
+                    last_err = e
+                    self.status_message.emit("RFPulse", f"[시도 {attempt}/{self._max_retries}] 실패: {e}")
+                    # 안전하게 OFF
+                    try:
+                        self._rf_off()
+                    except Exception:
+                        pass
+                    # 마지막 시도가 아니면 재연결 후 재시도
+                    if attempt < self._max_retries:
+                        self.reconnect()
+                    else:
+                        raise
+
+        except Exception as final_e:
             try:
                 self._rf_off()
             finally:
                 self.power_off_finished.emit()
-            self.target_failed.emit(str(e))
+            self.target_failed.emit(str(final_e))
+        finally:
+            # 워치독 재개
+            self._wd_resume()
 
     def is_connected(self) -> bool:
         return bool(self.port and self.port.isOpen())

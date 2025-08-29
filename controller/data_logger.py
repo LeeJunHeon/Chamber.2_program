@@ -1,4 +1,5 @@
 import csv
+import os
 from datetime import datetime
 from pathlib import Path
 from PyQt6.QtCore import QObject, pyqtSlot as Slot
@@ -10,18 +11,14 @@ class DataLogger(QObject):
     """
     def __init__(self, parent=None):
         super().__init__(parent)
-        #self.log_file = Path("Ch2_log.csv")
 
-        # Path 객체를 사용하여 네트워크 경로를 지정합니다.
+        # 로그 파일 경로
         log_directory = Path(r"\\VanaM_NAS\VanaM_Sputter\Sputter\Calib\Database")
-        
-        # 지정된 디렉토리가 존재하지 않으면 생성합니다.
-        # parents=True: 중간 경로가 없어도 모두 생성
-        # exist_ok=True: 폴더가 이미 있어도 에러를 발생시키지 않음
         log_directory.mkdir(parents=True, exist_ok=True)
-        
+
         self.log_file = log_directory / "Ch2_log.csv"
 
+        # 수집 버퍼
         self.process_params = {}
         self.ig_pressure_readings = []
 
@@ -35,7 +32,7 @@ class DataLogger(QObject):
         self.mfc_flow_readings = {"Ar": [], "O2": [], "N2": []}
         self.mfc_pressure_readings = []
         
-        # CSV 파일 헤더 정의
+        # ✅ 최종 헤더(새 컬럼 3개 포함)
         self.header = [
             "Timestamp", "Process Note", "Base Pressure",
             "G1 Target", "G2 Target", "G3 Target",
@@ -43,7 +40,56 @@ class DataLogger(QObject):
             "Working Pressure", "Process Time",
             "RF: For.P", "RF: Ref. P", 
             "DC: V", "DC: I", "DC: P",
+            "RF Pulse: P", "RF Pulse: Freq", "RF Pulse: Duty Cycle",
         ]
+
+        # ⬇︎ 기존 파일이 있으면 헤더를 새 형식으로 1회 업그레이드
+        self._ensure_header()
+
+    def _ensure_header(self):
+        """기존 Ch2_log.csv가 구헤더면 새 헤더로 업그레이드(기존 행 보존, 새 컬럼 공란)."""
+        if not self.log_file.exists():
+            return  # 파일이 없으면 그대로 새 헤더로 처음부터 씀
+
+        try:
+            with open(self.log_file, 'r', encoding='utf-8-sig', newline='') as rf:
+                reader = csv.reader(rf)
+                existing_header = next(reader, [])
+        except Exception:
+            # 읽기 실패하면 건드리지 않음(이후 첫 기록 때 새 헤더로 새 파일처럼 동작)
+            return
+
+        # 이미 최신 헤더면 아무것도 안 함
+        if existing_header == self.header:
+            return
+
+        # 기존 파일 전체를 읽어서 새 헤더로 재작성
+        # (기존 헤더의 있는 필드만 복사, 새 필드는 공란)
+        temp_path = self.log_file.with_suffix(".tmp")
+        try:
+            # 구헤더로 다시 읽기
+            with open(self.log_file, 'r', encoding='utf-8-sig', newline='') as rf:
+                old_reader = csv.DictReader(rf)
+                rows = list(old_reader)  # 전부 메모리로
+
+            # 새 헤더로 임시 파일 작성
+            with open(temp_path, 'w', encoding='utf-8-sig', newline='') as wf:
+                new_writer = csv.DictWriter(wf, fieldnames=self.header)
+                new_writer.writeheader()
+                for row in rows:
+                    new_row = {h: row.get(h, "") for h in self.header}
+                    new_writer.writerow(new_row)
+
+            # 임시 파일을 원본으로 교체 (원자적 교체)
+            os.replace(temp_path, self.log_file)
+        except Exception:
+            # 실패 시 임시파일 제거 시도 후 무시
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except Exception:
+                pass
+            # 업그레이드 실패해도 이후 append 시도는 정상 진행(헤더 mismatch 시 첫 기록에서 헤더 작성)
 
     @Slot(dict)
     def start_new_log_session(self, params: dict):
@@ -101,11 +147,18 @@ class DataLogger(QObject):
             return
 
         # --- 평균값 계산 ---
-        def _calculate_avg(data_list):
-            return sum(data_list) / len(data_list) if data_list else 0.0
+        def _avg(seq):
+            return (sum(seq) / len(seq)) if seq else 0.0
 
-        # IG는 마지막 값 또는 첫 값을 사용 (Base Pressure는 한 번만 측정됨)
-        base_pressure = self.ig_pressure_readings[0] if self.ig_pressure_readings else self.process_params.get("base_pressure", 0.0)
+        # IG는 첫 값(또는 params 기본값)
+        base_pressure = self.ig_pressure_readings[0] if self.ig_pressure_readings else \
+                        float(self.process_params.get("base_pressure", 0.0))
+
+        # ✅ RF Pulse 파라미터 (옵션은 None이면 공란)
+        use_rfp = bool(self.process_params.get("use_rf_pulse", False))
+        rfp_p   = self.process_params.get("rf_pulse_power", None)
+        rfp_f   = self.process_params.get("rf_pulse_freq", None)   # None → 미지정
+        rfp_d   = self.process_params.get("rf_pulse_duty", None)
 
         log_data = {
             "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -114,16 +167,21 @@ class DataLogger(QObject):
             "G1 Target": self.process_params.get("G1 Target", ""),
             "G2 Target": self.process_params.get("G2 Target", ""),
             "G3 Target": self.process_params.get("G3 Target", ""),
-            "Ar flow": f"{_calculate_avg(self.mfc_flow_readings['Ar']):.2f}",
-            "O2 flow": f"{_calculate_avg(self.mfc_flow_readings['O2']):.2f}",
-            "N2 flow": f"{_calculate_avg(self.mfc_flow_readings['N2']):.2f}",
-            "Working Pressure": f"{_calculate_avg(self.mfc_pressure_readings):.4f}",
+            "Ar flow": f"{_avg(self.mfc_flow_readings['Ar']):.2f}",
+            "O2 flow": f"{_avg(self.mfc_flow_readings['O2']):.2f}",
+            "N2 flow": f"{_avg(self.mfc_flow_readings['N2']):.2f}",
+            "Working Pressure": f"{_avg(self.mfc_pressure_readings):.4f}",
             "Process Time": self.process_params.get("process_time", 0.0),
-            "RF: For.P": f"{_calculate_avg(self.rf_for_p_readings):.2f}",
-            "RF: Ref. P": f"{_calculate_avg(self.rf_ref_p_readings):.2f}",
-            "DC: V": f"{_calculate_avg(self.dc_voltage_readings):.2f}",
-            "DC: I": f"{_calculate_avg(self.dc_current_readings):.2f}",
-            "DC: P": f"{_calculate_avg(self.dc_power_readings):.2f}",
+            "RF: For.P": f"{_avg(self.rf_for_p_readings):.2f}",
+            "RF: Ref. P": f"{_avg(self.rf_ref_p_readings):.2f}",
+            "DC: V": f"{_avg(self.dc_voltage_readings):.2f}",
+            "DC: I": f"{_avg(self.dc_current_readings):.2f}",
+            "DC: P": f"{_avg(self.dc_power_readings):.2f}",
+
+            # ✅ RF Pulse 3개 컬럼
+            "RF Pulse: P":          (f"{float(rfp_p):.2f}" if use_rfp and rfp_p not in (None, "") else ""),
+            "RF Pulse: Freq":       (str(int(rfp_f))        if use_rfp and rfp_f not in (None, "") else ""),
+            "RF Pulse: Duty Cycle": (str(int(rfp_d))        if use_rfp and rfp_d not in (None, "") else ""),
         }
 
         # --- 파일에 기록 ---
@@ -132,7 +190,8 @@ class DataLogger(QObject):
             with open(self.log_file, 'a', newline='', encoding='utf-8-sig') as f:
                 writer = csv.DictWriter(f, fieldnames=self.header)
                 if not file_exists:
-                    writer.writeheader() # 파일이 없으면 헤더를 먼저 씀
+                    # 새 파일이면 새 헤더로
+                    writer.writeheader()
                 writer.writerow(log_data)
         except Exception as e:
             print(f"데이터 로그 파일 작성 실패: {e}")

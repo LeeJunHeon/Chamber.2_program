@@ -4,7 +4,7 @@ import csv
 import atexit, signal
 from datetime import datetime
 from PyQt6.QtWidgets import QApplication, QWidget, QMessageBox, QFileDialog
-from PyQt6.QtCore import QCoreApplication, Qt, QMetaObject, QTimer, QThread, pyqtSlot as Slot, pyqtSignal as Signal
+from PyQt6.QtCore import QCoreApplication, Qt, QTimer, QThread, pyqtSlot as Slot, pyqtSignal as Signal
 
 # === controller import ===
 from UI import Ui_Form
@@ -16,6 +16,7 @@ from device.MFC import MFCController
 from device.OES import OESController
 from device.DCpower import DCPowerController
 from device.RFpower import RFPowerController
+from device.RFPulse import RFPulseController
 from controller.data_logger import DataLogger
 from controller.process_controller import ProcessController
 
@@ -25,11 +26,13 @@ class MainWindow(QWidget):
     request_faduino_connect = Signal()
     request_mfc_connect     = Signal()
     request_ig_connect      = Signal()
+    request_rfpulse_connect = Signal()   # ← 추가: RF Pulse 연결 요청
     request_oes_initialize  = Signal()
     request_faduino_cleanup = Signal()
     request_mfc_cleanup     = Signal()
     request_ig_cleanup      = Signal()
     request_oes_cleanup     = Signal()
+    request_rfpulse_cleanup = Signal()  # ← 추가: RF Pulse 정리 요청
 
     stop_all = Signal() # 모든 장치 하드스톱
 
@@ -45,6 +48,7 @@ class MainWindow(QWidget):
         self.graph_controller = GraphController(self.ui.RGA_Graph, self.ui.OES_Graph)
         self.dc_power_controller = DCPowerController()
         self.rf_power_controller = RFPowerController()
+        self.rf_pulse_controller = RFPulseController()  # 워커 스레드로 이동시킬 예정
 
         # === 2. 워커 스레드 및 장치 컨트롤러 ===
         # Faduino
@@ -83,6 +87,11 @@ class MainWindow(QWidget):
         self.data_logger = DataLogger(); 
         self.data_logger.moveToThread(self.data_logger_thread)
 
+        # RF Pulse (새 워커 스레드)
+        self.rf_pulse_thread = QThread(self)
+        self.rf_pulse_thread.setObjectName("RFPulseThread")
+        self.rf_pulse_controller.moveToThread(self.rf_pulse_thread)
+
         # === 3. 감독관 ===
         self.process_controller = ProcessController()
 
@@ -96,6 +105,7 @@ class MainWindow(QWidget):
         self.ig_thread.start()
         self.rga_thread.start()
         self.data_logger_thread.start()
+        self.rf_pulse_thread.start()  # ← 추가: RF Pulse 워커 시작
 
         # 공정 완료 → 다음 공정
         self.process_controller.process_finished.connect(self._start_next_process_from_queue)
@@ -143,6 +153,7 @@ class MainWindow(QWidget):
             src.status_message.connect(self.append_log)
         self.dc_power_controller.status_message.connect(self.append_log)
         self.rf_power_controller.status_message.connect(self.append_log)
+        self.rf_pulse_controller.status_message.connect(self.append_log)
         self.process_controller.log_message.connect(self.append_log)
         self.process_controller.update_process_state.connect(self.on_update_process_state)
 
@@ -173,6 +184,14 @@ class MainWindow(QWidget):
         )
         self.process_controller.rf_power_stop_requested.connect(
             self.rf_power_controller.stop_process,
+            type=Qt.ConnectionType.QueuedConnection
+        )
+        self.process_controller.rf_pulse_command_requested.connect(
+            self.rf_pulse_controller.start_pulse_process,
+            type=Qt.ConnectionType.QueuedConnection
+        )
+        self.process_controller.rf_pulse_stop_requested.connect(
+            self.rf_pulse_controller.stop_process,
             type=Qt.ConnectionType.QueuedConnection
         )
         self.process_controller.rga_external_scan_requested.connect(
@@ -251,6 +270,22 @@ class MainWindow(QWidget):
             type=Qt.ConnectionType.QueuedConnection
         )
 
+        # RF Pulse 목표 도달 → 공정 진행
+        self.rf_pulse_controller.target_reached.connect(
+            self.process_controller.on_rf_target_reached,
+            type=Qt.ConnectionType.QueuedConnection
+        )
+        # RF Pulse 실패 → 공정 실패 처리
+        self.rf_pulse_controller.target_failed.connect(
+            lambda why: self.process_controller.on_step_failed("RF Pulse", why),
+            type=Qt.ConnectionType.QueuedConnection
+        )
+        # RF Pulse OFF 완료 → 공정 다음 스텝 진행
+        self.rf_pulse_controller.power_off_finished.connect(
+            self.process_controller.on_device_step_ok,
+            type=Qt.ConnectionType.QueuedConnection
+        )
+
         # === set_polling (cross-thread) ===
         self.process_controller.set_polling.connect(
             self.faduino_controller.set_process_status,
@@ -296,9 +331,13 @@ class MainWindow(QWidget):
             self.dc_power_controller.stop_process,
             type=Qt.ConnectionType.QueuedConnection
         )
+        # 기존: stop_process → 변경: cleanup (BlockingQueued)
+        self.process_controller.process_aborted.connect(
+            self.rf_pulse_controller.cleanup,
+            type=Qt.ConnectionType.BlockingQueuedConnection
+        )
 
-        # === STOP ALL: 즉시 장치 하드스톱 ===
-        # 장치 쪽은 큐/타이머/시리얼을 정리(cleanup), 파워는 stop_process
+        # === STOP ALL: 즉시 장치 하드스톱/정리 ===
         self.stop_all.connect(
             self.mfc_controller.cleanup,
             type=Qt.ConnectionType.BlockingQueuedConnection
@@ -323,6 +362,11 @@ class MainWindow(QWidget):
             self.dc_power_controller.stop_process,
             type=Qt.ConnectionType.QueuedConnection
         )
+        # 기존: stop_process → 변경: cleanup (BlockingQueued)
+        self.stop_all.connect(
+            self.rf_pulse_controller.cleanup,
+            type=Qt.ConnectionType.BlockingQueuedConnection
+        )
 
         # === UI → 장치(연결/정리/초기화) 요청 ===
         self.request_faduino_connect.connect(
@@ -335,6 +379,10 @@ class MainWindow(QWidget):
         )
         self.request_ig_connect.connect(
             self.ig_controller.connect_ig_device,
+            type=Qt.ConnectionType.QueuedConnection
+        )
+        self.request_rfpulse_connect.connect(
+            self.rf_pulse_controller.connect_rfpulse_device,
             type=Qt.ConnectionType.QueuedConnection
         )
 
@@ -359,6 +407,10 @@ class MainWindow(QWidget):
         )
         self.request_ig_cleanup.connect(
             self.ig_controller.cleanup,
+            type=Qt.ConnectionType.BlockingQueuedConnection
+        )
+        self.request_rfpulse_cleanup.connect(
+            self.rf_pulse_controller.cleanup,
             type=Qt.ConnectionType.BlockingQueuedConnection
         )
 
@@ -394,7 +446,7 @@ class MainWindow(QWidget):
     @Slot(float, float)
     def handle_rf_power_display(self, for_p, ref_p):
         if for_p is None or ref_p is None:
-            self.append_log("Main", "for.p, ref.p 값이 비어있습니다.")
+            self.append_log("MAIN", "for.p, ref.p 값이 비어있습니다.")
             return
         self.ui.For_p_edit.setPlainText(f"{for_p:.2f}")
         self.ui.Ref_p_edit.setPlainText(f"{ref_p:.2f}")
@@ -402,7 +454,7 @@ class MainWindow(QWidget):
     @Slot(float, float, float)
     def handle_dc_power_display(self, power, voltage, current):
         if power is None or voltage is None or current is None:
-            self.append_log("Main", "power, voltage, current값이 비어있습니다.")
+            self.append_log("MAIN", "power, voltage, current값이 비어있습니다.")
             return
         self.ui.Power_edit.setPlainText(f"{power:.3f}")
         self.ui.Voltage_edit.setPlainText(f"{voltage:.3f}")
@@ -465,17 +517,31 @@ class MainWindow(QWidget):
 
         self.append_log("UI", f"다음 공정 '{params['Process_name']}'의 파라미터로 UI를 업데이트합니다.")
 
-        self.ui.RF_power_edit.setPlainText(params.get('rf_power', '0'))
-        self.ui.DC_power_edit.setPlainText(params.get('dc_power', '0'))
-        self.ui.Process_time_edit.setPlainText(params.get('process_time', '0'))
-        self.ui.Intergration_time_edit.setPlainText(params.get('integration_time', '60'))
-        self.ui.Ar_flow_edit.setPlainText(params.get('Ar_flow', '0'))
-        self.ui.O2_flow_edit.setPlainText(params.get('O2_flow', '0'))
-        self.ui.N2_flow_edit.setPlainText(params.get('N2_flow', '0'))
-        self.ui.Working_pressure_edit.setPlainText(params.get('working_pressure', '0'))
-        self.ui.Base_pressure_edit.setPlainText(params.get('base_pressure', '0'))
-        self.ui.Shutter_delay_edit.setPlainText(params.get('shutter_delay', '0'))
+        # --- 파워 / RF-Pulse ---
+        self.ui.RF_power_edit.setPlainText(str(params.get('rf_power', '0')))
+        self.ui.DC_power_edit.setPlainText(str(params.get('dc_power', '0')))
 
+        # RF Pulse UI 동기화 (CSV 컬럼명 그대로 사용)
+        self.ui.RF_pulse_checkbox.setChecked(params.get('use_rf_pulse_power', 'F') == 'T')
+        self.ui.RF_pulse_edit.setPlainText(str(params.get('rf_pulse_power', '0')))
+
+        # freq, duty: 미입력/0이면 공란으로 표시(= 변경하지 않음 의미)
+        freq_raw = str(params.get('rf_pulse_freq', '')).strip()
+        duty_raw = str(params.get('rf_pulse_duty_cycle', '')).strip()
+        self.ui.Rf_pulse_freq_edit.setPlainText('' if freq_raw in ('', '0') else freq_raw)
+        self.ui.Rf_pulse_duty_cycle_edit.setPlainText('' if duty_raw in ('', '0') else duty_raw)
+
+        # --- 시간/압력/가스 ---
+        self.ui.Process_time_edit.setPlainText(str(params.get('process_time', '0')))
+        self.ui.Intergration_time_edit.setPlainText(str(params.get('integration_time', '60')))
+        self.ui.Ar_flow_edit.setPlainText(str(params.get('Ar_flow', '0')))
+        self.ui.O2_flow_edit.setPlainText(str(params.get('O2_flow', '0')))
+        self.ui.N2_flow_edit.setPlainText(str(params.get('N2_flow', '0')))
+        self.ui.Working_pressure_edit.setPlainText(str(params.get('working_pressure', '0')))
+        self.ui.Base_pressure_edit.setPlainText(str(params.get('base_pressure', '0')))
+        self.ui.Shutter_delay_edit.setPlainText(str(params.get('shutter_delay', '0')))
+
+        # --- 체크박스들 (CSV 값이 'T'/'F'라고 가정) ---
         self.ui.G1_checkbox.setChecked(params.get('gun1', 'F') == 'T')
         self.ui.G2_checkbox.setChecked(params.get('gun2', 'F') == 'T')
         self.ui.G3_checkbox.setChecked(params.get('gun3', 'F') == 'T')
@@ -486,7 +552,7 @@ class MainWindow(QWidget):
         self.ui.RF_power_checkbox.setChecked(params.get('use_rf_power', 'F') == 'T')
         self.ui.DC_power_checkbox.setChecked(params.get('use_dc_power', 'F') == 'T')
 
-        # ★ 타겟 이름: CSV 헤더 그대로 읽어서 UI에 표시
+        # --- 타겟명 (CSV 헤더 그대로 표시) ---
         self.ui.G1_target_name.setPlainText(str(params.get('G1 Target', '')).strip())
         self.ui.G2_target_name.setPlainText(str(params.get('G2 Target', '')).strip())
         self.ui.G3_target_name.setPlainText(str(params.get('G3 Target', '')).strip())
@@ -558,6 +624,11 @@ class MainWindow(QWidget):
                 self.append_log("MAIN", "OES 초기화 실패.")
                 return False
 
+        # RF Pulse: 해당 공정에서 사용할 예정이면 선연결 (컨트롤러에서 중복/지연 연결 처리)
+        if self.ui.RF_pulse_checkbox.isChecked():
+            self.append_log("MAIN", "RF Pulse 선연결을 시도합니다…")
+            self.request_rfpulse_connect.emit()
+
         self.append_log("MAIN", "모든 장비가 성공적으로 연결되었습니다.")
         return True
 
@@ -627,9 +698,17 @@ class MainWindow(QWidget):
             n2_flow = 0.0
 
         use_rf = self.ui.RF_power_checkbox.isChecked()
+        use_rf_pulse = self.ui.RF_pulse_checkbox.isChecked()
         use_dc = self.ui.DC_power_checkbox.isChecked()
-        if not (use_rf or use_dc):
-            QMessageBox.warning(self, "선택 오류", "RF 파워 또는 DC 파워 중 하나 이상을 반드시 선택해야 합니다."); return None
+
+        if not (use_rf or use_rf_pulse or use_dc):
+            QMessageBox.warning(self, "선택 오류", "RF 파워, RF Pulse, DC 파워 중 하나 이상을 반드시 선택해야 합니다.")
+            return None
+
+        # RF 일반과 RF Pulse는 동시에 켜지 않도록 금지
+        if use_rf and use_rf_pulse:
+            QMessageBox.warning(self, "선택 오류", "RF 전원과 RF Pulse는 동시에 선택할 수 없습니다. 하나만 선택하세요.")
+            return None
 
         if use_rf:
             txt = self.ui.RF_power_edit.toPlainText().strip()
@@ -641,6 +720,48 @@ class MainWindow(QWidget):
                 QMessageBox.warning(self, "입력값 확인", "RF 파워(W)가 올바른 수치가 아닙니다."); return None
         else:
             rf_power = 0.0
+
+        # RF Pulse: target power는 필수, freq/duty는 선택(미입력 시 변경하지 않음)
+        rf_pulse_power = 0.0
+        rf_pulse_freq = None
+        rf_pulse_duty = None
+
+        if use_rf_pulse:
+            txtp = self.ui.RF_pulse_edit.toPlainText().strip()
+            if not txtp:
+                QMessageBox.warning(self, "입력값 확인", "RF Pulse Target Power(W)를 입력하세요.")
+                return None
+            try:
+                rf_pulse_power = float(txtp)
+                if rf_pulse_power <= 0:
+                    QMessageBox.warning(self, "입력값 확인", "RF Pulse Target Power(W)는 0보다 커야 합니다.")
+                    return None
+            except ValueError:
+                QMessageBox.warning(self, "입력값 확인", "RF Pulse Target Power(W)가 올바른 수치가 아닙니다.")
+                return None
+
+            # 선택 입력: 미입력 시 None → 나중에 컨트롤러가 '변경하지 않음' 처리
+            txtf = self.ui.Rf_pulse_freq_edit.toPlainText().strip()
+            if txtf:
+                try:
+                    rf_pulse_freq = int(float(txtf))
+                    if rf_pulse_freq < 1 or rf_pulse_freq > 100000:
+                        QMessageBox.warning(self, "입력값 확인", "RF Pulse Freq(Hz)는 1..100000 범위로 입력하세요.")
+                        return None
+                except ValueError:
+                    QMessageBox.warning(self, "입력값 확인", "RF Pulse Freq(Hz)가 올바른 수치가 아닙니다.")
+                    return None
+
+            txtd = self.ui.Rf_pulse_duty_cycle_edit.toPlainText().strip()
+            if txtd:
+                try:
+                    rf_pulse_duty = int(float(txtd))
+                    if rf_pulse_duty < 1 or rf_pulse_duty > 99:
+                        QMessageBox.warning(self, "입력값 확인", "RF Pulse Duty(%)는 1..99 범위로 입력하세요.")
+                        return None
+                except ValueError:
+                    QMessageBox.warning(self, "입력값 확인", "RF Pulse Duty(%)가 올바른 수치가 아닙니다.")
+                    return None
 
         if use_dc:
             txt = self.ui.DC_power_edit.toPlainText().strip()
@@ -658,8 +779,9 @@ class MainWindow(QWidget):
             "use_g1": use_g1, "use_g2": use_g2, "use_g3": use_g3,
             "use_ar": use_ar, "use_o2": use_o2, "use_n2": use_n2,
             "ar_flow": ar_flow, "o2_flow": o2_flow, "n2_flow": n2_flow,
-            "use_rf_power": use_rf, "use_dc_power": use_dc,
-            "rf_power": rf_power, "dc_power": dc_power,
+            "use_rf_power": use_rf, "use_rf_pulse": use_rf_pulse, "use_dc_power": use_dc,
+            "rf_power": rf_power, "rf_pulse_power": rf_pulse_power, "dc_power": dc_power,
+            "rf_pulse_freq": rf_pulse_freq, "rf_pulse_duty": rf_pulse_duty, 
             "G1_target_name": g1_name, "G2_target_name": g2_name, "G3_target_name": g3_name,
         }
 
@@ -763,13 +885,18 @@ class MainWindow(QWidget):
         self.ui.N2_flow_edit.setPlainText("0")
         self.ui.DC_power_edit.setPlainText("100")
         self.ui.RF_power_edit.setPlainText("100")
+        self.ui.RF_pulse_checkbox.setChecked(False)
+        self.ui.RF_pulse_edit.setPlainText("100")      # 예: 기본 100W
+        self.ui.Rf_pulse_freq_edit.setPlainText("")    # 빈칸 = 변경하지 않음
+        self.ui.Rf_pulse_duty_cycle_edit.setPlainText("")  # 빈칸 = 변경하지 않음
 
     def _reset_ui_after_process(self):
         self._set_default_ui_values()
         for cb in [
             self.ui.G1_checkbox, self.ui.G2_checkbox, self.ui.G3_checkbox,
             self.ui.Ar_checkbox, self.ui.O2_checkbox, self.ui.N2_checkbox,
-            self.ui.Main_shutter_checkbox, self.ui.RF_power_checkbox, self.ui.DC_power_checkbox
+            self.ui.Main_shutter_checkbox, self.ui.RF_power_checkbox, self.ui.RF_pulse_checkbox,
+            self.ui.DC_power_checkbox
         ]:
             cb.setChecked(False)
         self.ui.process_state.setPlainText("대기 중")
@@ -778,6 +905,10 @@ class MainWindow(QWidget):
         self.ui.Current_edit.setPlainText("0.00")
         self.ui.For_p_edit.setPlainText("0.0")
         self.ui.Ref_p_edit.setPlainText("0.0")
+        # RF Pulse 표시 리셋
+        self.ui.RF_pulse_edit.setPlainText("0")
+        self.ui.Rf_pulse_freq_edit.setPlainText("")
+        self.ui.Rf_pulse_duty_cycle_edit.setPlainText("")
 
     def closeEvent(self, event):
         self.append_log("main", "프로그램 종료 절차 시작...")
@@ -800,6 +931,8 @@ class MainWindow(QWidget):
         except Exception: pass
         try: self.request_oes_cleanup.emit()
         except Exception: pass
+        try: self.request_rfpulse_cleanup.emit()
+        except Exception: pass
 
         threads = [
             getattr(self, 'faduino_thread', None),
@@ -807,14 +940,15 @@ class MainWindow(QWidget):
             getattr(self, 'oes_thread', None),
             getattr(self, 'ig_thread', None),
             getattr(self, 'rga_thread', None),
-            getattr(self, 'data_logger_thread', None)
+            getattr(self, 'data_logger_thread', None),
+            getattr(self, 'rf_pulse_thread', None),  # ← 추가
         ]
         for thread in threads:
             if thread and thread.isRunning():
                 thread.quit()
                 thread.wait()
-                self.append_log("Main", f"{thread.objectName() or type(thread).__name__} 종료 완료.")
-        self.append_log("Main", "모든 스레드 종료. 프로그램을 닫습니다.")
+                self.append_log("MAIN", f"{thread.objectName() or type(thread).__name__} 종료 완료.")
+        self.append_log("MAIN", "모든 스레드 종료. 프로그램을 닫습니다.")
         super().closeEvent(event)
 
     @Slot()
@@ -841,6 +975,8 @@ class MainWindow(QWidget):
         except Exception: pass
         try: self.request_oes_cleanup.emit()
         except Exception: pass
+        try: self.request_rfpulse_cleanup.emit()
+        except Exception: pass
 
 
     def _emergency_cleanup(self):
@@ -864,6 +1000,8 @@ class MainWindow(QWidget):
         except Exception: pass
         try: self.request_oes_cleanup.emit()
         except Exception: pass
+        try: self.request_rfpulse_cleanup.emit()
+        except Exception: pass
 
 
     def _normalize_params_for_process(self, raw: dict) -> dict:
@@ -881,14 +1019,18 @@ class MainWindow(QWidget):
                 return int(float(str(raw.get(key, default)).strip()))
             except Exception:
                 return int(default)
-            
+
+        def iget_opt(key):
+            s = str(raw.get(key, '')).strip()
+            return int(float(s)) if s != '' else None
+
         # CSV 원본 타겟명 (헤더 고정)
         g1t = str(raw.get("G1 Target", "")).strip()
         g2t = str(raw.get("G2 Target", "")).strip()
         g3t = str(raw.get("G3 Target", "")).strip()
 
         out = {
-            # 공통 수치
+            # --- 공통 수치 ---
             "base_pressure":     fget("base_pressure", "1e-5"),
             "working_pressure":  fget("working_pressure", "0"),
             "process_time":      fget("process_time", "0"),
@@ -897,37 +1039,44 @@ class MainWindow(QWidget):
             "dc_power":          fget("dc_power", "0"),
             "rf_power":          fget("rf_power", "0"),
 
-            # 파워 사용 여부
+            # --- RF Pulse (CSV 컬럼명을 내부 표준 키로 정규화) ---
+            # 사용여부: CSV는 use_rf_pulse_power, 내부는 use_rf_pulse
+            "use_rf_pulse":      tf(raw.get("use_rf_pulse_power", "F")),
+            "rf_pulse_power":    fget("rf_pulse_power", "0"),
+            "rf_pulse_freq":     iget_opt("rf_pulse_freq"),          # '' -> None
+            "rf_pulse_duty":     iget_opt("rf_pulse_duty_cycle"),    # '' -> None
+
+            # --- 파워 사용 여부 ---
             "use_rf_power":      tf(raw.get("use_rf_power", "F")),
             "use_dc_power":      tf(raw.get("use_dc_power", "F")),
 
-            # 가스 사용 여부 (CSV 대문자 키 → 표준 키)
+            # --- 가스 사용 여부 ---
             "use_ar":            tf(raw.get("Ar", "F")),
             "use_o2":            tf(raw.get("O2", "F")),
             "use_n2":            tf(raw.get("N2", "F")),
 
-            # 가스 유량 (CSV의 대문자 키 → 소문자 표준 키)
+            # --- 가스 유량 ---
             "ar_flow":           fget("Ar_flow", "0"),
             "o2_flow":           fget("O2_flow", "0"),
             "n2_flow":           fget("N2_flow", "0"),
 
-            # 건 셔터 (gun1/gun2/gun3 → use_g1/use_g2/use_g3)
+            # --- 건 셔터 ---
             "use_g1":            tf(raw.get("gun1", "F")),
             "use_g2":            tf(raw.get("gun2", "F")),
             "use_g3":            tf(raw.get("gun3", "F")),
 
-            # 메인 셔터
+            # --- 메인 셔터 ---
             "use_ms":            tf(raw.get("main_shutter", "F")),
 
-            # 메모(이름)
+            # --- 메모(이름) ---
             "process_note":      raw.get("Process_name", raw.get("process_note", "")),
 
-            # ★ 내부 표준 키(하위 모듈/검증 로직용)
+            # --- 내부 표준 키(하위 모듈/검증 로직용) ---
             "G1_target_name":    g1t,
             "G2_target_name":    g2t,
             "G3_target_name":    g3t,
 
-            # ★ 원본 CSV 키 그대로도 포함(DataLogger 등에서 그대로 쓰게)
+            # --- 원본 CSV 키 그대로 보존(DataLogger 등에서 사용) ---
             "G1 Target":         g1t,
             "G2 Target":         g2t,
             "G3 Target":         g3t,

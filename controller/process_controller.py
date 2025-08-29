@@ -17,6 +17,8 @@ class ActionType(str, Enum):
     DC_POWER_STOP = "DC_POWER_STOP"
     RF_POWER_STOP = "RF_POWER_STOP"
     OES_RUN = "OES_RUN"
+    RF_PULSE_START = "RF_PULSE_START"
+    RF_PULSE_STOP  = "RF_PULSE_STOP"
 
 @dataclass
 class ProcessStep:
@@ -74,6 +76,8 @@ class ProcessController(QObject):
     rf_power_stop_requested = Signal()
     ig_command_requested = Signal(float)
     rga_external_scan_requested = Signal()
+    rf_pulse_command_requested = Signal(float, object, object)  # (powerW, freqHz, duty%)
+    rf_pulse_stop_requested    = Signal()
 
     # 2) UI/상태
     log_message = Signal(str, str)
@@ -115,15 +119,6 @@ class ProcessController(QObject):
         self._countdown_timer.timeout.connect(self._on_countdown_tick)
         self._countdown_remaining_ms = 0
         self._countdown_base_message = ""
-
-        # MFC 확인 화이트리스트(폴링으로 오는 READ_*는 스텝완료로 취급 X)
-        # self._mfc_ok_cmds = {
-        #     "FLOW_SET", "FLOW_ON", "FLOW_OFF",
-        #     "SP1_SET", "SP1_ON", "SP4_ON",
-        #     "MFC_ZEROING", "PS_ZEROING",
-        #     "VALVE_OPEN", "VALVE_CLOSE",
-        #     "FLOW_ONOFF_BATCH",
-        # }
 
     # ---------------- 시퀀스 구성 ----------------
     def _create_process_sequence(self, params: Dict[str, Any]) -> List[ProcessStep]:
@@ -266,8 +261,22 @@ class ProcessController(QObject):
                     message=f'Gun Shutter {shutter} 열기'
                 ))
 
+        # --- RF Pulse 사용 여부 판별 ---
+        use_rf_pulse = bool(params.get("use_rf_pulse", False)) and float(params.get("rf_pulse_power", 0)) > 0.0
+        rf_pulse_power = float(params.get("rf_pulse_power", 0))
+
+        # freq/duty: 옵션 → 미입력(None)이면 컨트롤러가 "변경하지 않음"
+        rf_pulse_freq = params.get("rf_pulse_freq", None)
+        if rf_pulse_freq is not None:
+            rf_pulse_freq = int(rf_pulse_freq)
+
+        rf_pulse_duty = params.get("rf_pulse_duty", None)
+        if rf_pulse_duty is not None:
+            rf_pulse_duty = int(rf_pulse_duty)
+
         # 파워 인가(둘 다 쓰면 병렬), 램핑 완료 대기는 각 컨트롤러 내부에서 처리 → no_wait
-        want_parallel = use_dc and use_rf
+        want_parallel = use_dc and (use_rf or use_rf_pulse)
+
         if use_dc:
             steps.append(ProcessStep(
                 action=ActionType.DC_POWER_SET,
@@ -275,7 +284,19 @@ class ProcessController(QObject):
                 message=f'DC Power {dc_power}W 설정',
                 parallel=want_parallel
             ))
-        if use_rf:
+
+        if use_rf_pulse:
+            # 메시지에도 옵션 표시(미입력 시 'keep'로 표기)
+            f_txt = f"{rf_pulse_freq}Hz" if rf_pulse_freq is not None else "keep"
+            d_txt = f"{rf_pulse_duty}%"  if rf_pulse_duty is not None else "keep"
+            steps.append(ProcessStep(
+                action=ActionType.RF_PULSE_START,
+                value=rf_pulse_power,
+                params=(rf_pulse_freq, rf_pulse_duty),
+                message=f'RF Pulse 설정 및 ON (P={rf_pulse_power}W, f={f_txt}, duty={d_txt})',
+                parallel=want_parallel
+            ))
+        elif use_rf:
             steps.append(ProcessStep(
                 action=ActionType.RF_POWER_SET,
                 value=rf_power,
@@ -314,6 +335,8 @@ class ProcessController(QObject):
             shutdown_steps.append(ProcessStep(action=ActionType.DC_POWER_STOP, message='DC Power Off'))
         if common_info['use_rf']:
             shutdown_steps.append(ProcessStep(action=ActionType.RF_POWER_STOP, message='RF Power Off'))
+        if common_info['use_rf_pulse']:
+            shutdown_steps.append(ProcessStep(action=ActionType.RF_PULSE_STOP, message='RF Pulse Off'))
 
         for gas, info in gas_info.items():
             shutdown_steps.append(ProcessStep(
@@ -345,6 +368,7 @@ class ProcessController(QObject):
             'use_ms': bool(params.get("use_ms", False)),
             'use_dc': bool(params.get("use_dc_power", False)) and float(params.get("dc_power", 0)) > 0,
             'use_rf': bool(params.get("use_rf_power", False)) and float(params.get("rf_power", 0)) > 0,
+            'use_rf_pulse': bool(params.get("use_rf_pulse", False)) and float(params.get("rf_pulse_power", 0)) > 0,
             'gas_info': {"Ar": {"channel": 1}, "O2": {"channel": 2}, "N2": {"channel": 3}},
             'gun_shutters': ["G1", "G2", "G3"]
         }
@@ -418,6 +442,12 @@ class ProcessController(QObject):
                 ActionType.DC_POWER_STOP: lambda: self.dc_power_stop_requested.emit(),
                 ActionType.RF_POWER_SET: lambda: self.rf_power_command_requested.emit(step.value),
                 ActionType.RF_POWER_STOP: lambda: self.rf_power_stop_requested.emit(),
+                ActionType.RF_PULSE_START: lambda: self.rf_pulse_command_requested.emit(
+                    float(step.value or 0.0),
+                    step.params[0] if step.params else None,   # freq or None
+                    step.params[1] if step.params else None    # duty or None
+                ),
+                ActionType.RF_PULSE_STOP:  lambda: self.rf_pulse_stop_requested.emit(),
                 ActionType.IG_CMD:       lambda: self.ig_command_requested.emit(step.value),
                 ActionType.RGA_SCAN:     lambda: self.rga_external_scan_requested.emit(),
                 ActionType.FADUINO_CMD:  lambda: self.update_faduino_port.emit(*step.params),
@@ -517,8 +547,11 @@ class ProcessController(QObject):
         
         if self._aborting:
             cs = self.current_step
-            if not cs or cs.action not in {ActionType.FADUINO_CMD, ActionType.MFC_CMD,
-                                        ActionType.DC_POWER_STOP, ActionType.RF_POWER_STOP}:
+            if not cs or cs.action not in {
+                ActionType.FADUINO_CMD, ActionType.MFC_CMD,
+                ActionType.DC_POWER_STOP, ActionType.RF_POWER_STOP,
+                ActionType.RF_PULSE_STOP
+            }:
                 return
             
         self.on_step_completed()
@@ -620,14 +653,16 @@ class ProcessController(QObject):
 
     @Slot()
     def on_rf_target_reached(self):
-        """RFPowerController.target_reached → RF_POWER_SET 스텝 완료"""
+        """RF 파워 계열 완료 신호 핸들링 (일반 RF & RF Pulse 공용)"""
         if not self.is_running:
             return
+
         if self._px is not None:
-            if any(s.action == ActionType.RF_POWER_SET for s in self._px.steps):
+            if any(s.action in (ActionType.RF_POWER_SET, ActionType.RF_PULSE_START) for s in self._px.steps):
                 self.on_device_step_ok()
             return
-        if self.current_step and self.current_step.action == ActionType.RF_POWER_SET:
+
+        if self.current_step and self.current_step.action in (ActionType.RF_POWER_SET, ActionType.RF_PULSE_START):
             self.on_device_step_ok()
 
     # ---------------- 실패 처리 ----------------
@@ -746,7 +781,7 @@ class ProcessController(QObject):
             message='[긴급] Main Shutter 즉시 닫기', no_wait=True
         ))
 
-        both = common_info['use_dc'] and common_info['use_rf']
+        both = common_info['use_dc'] and (common_info['use_rf'] or common_info['use_rf_pulse'])
         if common_info['use_dc']:
             emergency_steps.append(ProcessStep(
                 action=ActionType.DC_POWER_STOP, message='[긴급] DC Power 즉시 차단',
@@ -755,6 +790,11 @@ class ProcessController(QObject):
         if common_info['use_rf']:
             emergency_steps.append(ProcessStep(
                 action=ActionType.RF_POWER_STOP, message='[긴급] RF Power 즉시 차단',
+                parallel=both, no_wait=True
+            ))
+        if common_info['use_rf_pulse']:
+            emergency_steps.append(ProcessStep(
+                action=ActionType.RF_PULSE_STOP, message='[긴급] RF Pulse 즉시 차단',
                 parallel=both, no_wait=True
             ))
 
@@ -893,6 +933,11 @@ class ProcessController(QObject):
                 if step.action in [ActionType.DC_POWER_SET, ActionType.RF_POWER_SET, ActionType.IG_CMD]:
                     if step.value is None:
                         errors.append(f"Step {step_num}: {step.action.name} 액션에 value가 없습니다.")
+                if step.action == ActionType.RF_PULSE_START:
+                    if step.value is None:
+                        errors.append(f"Step {step_num}: RF_PULSE_START에 value(파워)가 없습니다.")
+                    if step.params is None or len(step.params) != 2:
+                        errors.append(f"Step {step_num}: RF_PULSE_START params=(freq, duty) 필요.")
                 if step.action in [ActionType.FADUINO_CMD, ActionType.MFC_CMD, ActionType.OES_RUN]:
                     if step.params is None:
                         errors.append(f"Step {step_num}: {step.action.name} 액션에 params가 없습니다.")
@@ -934,6 +979,7 @@ class ProcessController(QObject):
         self.update_faduino_port.emit('MS', False)
         self.dc_power_stop_requested.emit()
         self.rf_power_stop_requested.emit()
+        self.rf_pulse_stop_requested.emit()
         self.abort_process()
 
     def reset_controller(self):

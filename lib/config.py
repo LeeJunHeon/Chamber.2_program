@@ -15,6 +15,12 @@ MFC_BAUD = 9600
 FADUINO_PORT = "COM13"
 FADUINO_BAUD = 9600
 
+# RFPulse 기본값
+RFPULSE_PORT = "COM6"        # 또는 "/dev/ttyUSB0"
+RFPULSE_BAUD = 9600
+RFPULSE_ADDR = 1
+RFPULSE_DEFAULT_DELAY_MS = 180
+
 # === RGA ===
 # RGA_PORT = "COM17" RGA를 직접 연결하지 않고 외부 프로그램을 사용
 # RGA_BAUD = 9600

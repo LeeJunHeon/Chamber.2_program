@@ -131,8 +131,9 @@ class RFPulseController(QObject):
     # ---------- 포트/에러 ----------
     @Slot(QSerialPort.SerialPortError)
     def _on_port_error(self, err: QSerialPort.SerialPortError):
-        if err in (QSerialPort.SerialPortError.NoError, QSerialPort.SerialPortError.TimeoutError):
-            return  # ← 로그/처리 모두 생략
+        # NoError만 무시, 그 외(TimeoutError 포함)는 모두 재연결 루틴 진입
+        if err == QSerialPort.SerialPortError.NoError:
+            return 
 
         es = self.port.errorString() if self.port else ""
         err_name  = getattr(err, "name", str(err))
@@ -149,6 +150,7 @@ class RFPulseController(QObject):
             except Exception: pass
 
         self._ensure_timers_created()
+        self._want_connected = True  # ← 워치독이 실제로 붙도록 보장
         if not self._watchdog.isActive():
             self._watchdog.start()
         QTimer.singleShot(0, self._watch_connection)

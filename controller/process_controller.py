@@ -261,6 +261,14 @@ class ProcessController(QObject):
                     message=f'Gun Shutter {shutter} 열기'
                 ))
 
+        # ★ Power_select 체크되면: N2(채널3) 밸브 ON (Faduino 릴레이 #3)
+        if bool(params.get("use_power_select", False)):
+            steps.append(ProcessStep(
+                action=ActionType.FADUINO_CMD,
+                params=("N2", True),
+                message="Power_select: N2 가스 밸브(Ch3) ON"
+            ))
+
         # --- RF Pulse 사용 여부 판별 ---
         use_rf_pulse = bool(params.get("use_rf_pulse", False)) and float(params.get("rf_pulse_power", 0)) > 0.0
         rf_pulse_power = float(params.get("rf_pulse_power", 0))
@@ -303,6 +311,13 @@ class ProcessController(QObject):
                 message=f'RF Power {rf_power}W 설정',
                 parallel=want_parallel
             ))
+
+        if use_rf_pulse:
+            steps.append(ProcessStep(
+                    action=ActionType.DELAY,
+                    duration=60_000,
+                    message=f'Power Delay 60초'
+                ))
 
         steps.append(ProcessStep(
             action=ActionType.MFC_CMD,
@@ -359,6 +374,14 @@ class ProcessController(QObject):
                 shutdown_steps.append(ProcessStep(
                     action=ActionType.FADUINO_CMD, params=(shutter, False), message=f'Gun Shutter {shutter} 닫기'
                 ))
+
+        # ★ Power_select 사용 시: N2(채널3) 밸브 OFF (Faduino 릴레이 #3)
+        if bool(params.get("use_power_select", False)) or force_all:
+            shutdown_steps.append(ProcessStep(
+                action=ActionType.FADUINO_CMD,
+                params=("N2", False),
+                message="Power_select 종료: N2 가스 밸브(Ch3) OFF"
+            ))
 
         for gas in gas_info:
             shutdown_steps.append(ProcessStep(
@@ -705,8 +728,8 @@ class ProcessController(QObject):
             return
 
         full_reason = f"[{source} - {reason}]"
-        self.log_message.emit("Process", f"오류 발생: {full_reason}. 공정을 중단합니다.")
-        self.abort_process()
+        self.log_message.emit("Process", f"오류 발생: {full_reason}. 종료 절차를 시작합니다.")
+        self._start_normal_shutdown()
 
     # ---------------- 카운트다운 ----------------
     def _start_countdown(self, duration_ms: int, base_message: str):
@@ -782,6 +805,7 @@ class ProcessController(QObject):
         self.log_message.emit("Process", "공정 긴급 중단을 시작합니다...")
         self._aborting = True
         self._accept_completions = False
+        self._shutdown_in_progress = True
 
         emergency_steps = self._create_emergency_shutdown_sequence()
         if emergency_steps:

@@ -154,7 +154,7 @@ MFC_SCALE_FACTORS = {
 # - 장비값(HW) → UI:  ui = hw / MFC_PRESSURE_SCALE
 # - UI → 장비(HW):   hw = ui * MFC_PRESSURE_SCALE
 MFC_PRESSURE_SCALE = 0.1        # 예) UI 2.00 ↔ HW 0.20
-MFC_PRESSURE_DECIMALS = 2       # UI 표시에 사용할 소수 자리
+MFC_PRESSURE_DECIMALS = 3       # UI 표시에 사용할 소수 자리
 MFC_SP1_VERIFY_TOL = 0.1        # SP1_SET 검증 허용 오차(장비 단위)
 
 # 명령어는 ASCII 문자로 전송해야 되며, \r으로 끝나야 함.

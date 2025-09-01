@@ -552,6 +552,8 @@ class MainWindow(QWidget):
         self.ui.RF_power_checkbox.setChecked(params.get('use_rf_power', 'F') == 'T')
         self.ui.DC_power_checkbox.setChecked(params.get('use_dc_power', 'F') == 'T')
 
+        self.ui.Power_select_checkbox.setChecked(params.get('power_select', 'F') == 'T')
+
         # --- 타겟명 (CSV 헤더 그대로 표시) ---
         self.ui.G1_target_name.setPlainText(str(params.get('G1 Target', '')).strip())
         self.ui.G2_target_name.setPlainText(str(params.get('G2 Target', '')).strip())
@@ -783,6 +785,9 @@ class MainWindow(QWidget):
             "rf_power": rf_power, "rf_pulse_power": rf_pulse_power, "dc_power": dc_power,
             "rf_pulse_freq": rf_pulse_freq, "rf_pulse_duty": rf_pulse_duty, 
             "G1_target_name": g1_name, "G2_target_name": g2_name, "G3_target_name": g3_name,
+
+            # ★ 추가
+            "use_power_select": self.ui.Power_select_checkbox.isChecked(),
         }
 
     @Slot()
@@ -1078,6 +1083,10 @@ class MainWindow(QWidget):
             "G1 Target":         g1t,
             "G2 Target":         g2t,
             "G3 Target":         g3t,
+
+            
+            # ★ 추가: Power_select 체크 플래그
+            "use_power_select": tf(raw.get("power_select", "F")),
         }
 
         return out

@@ -637,6 +637,7 @@ class MFCController(QObject):
         if cmd == "SP1_SET":
             ui_val = float(params.get("value", 0.0))
             hw_val = self._to_hw_pressure(ui_val)
+            hw_val = round(hw_val, int(MFC_PRESSURE_DECIMALS))
 
             # 로그(혼동 방지): UI ↔ HW 모두 보여주기
             self.status_message.emit("MFC",
@@ -963,10 +964,12 @@ class MFCController(QObject):
                 s = (line or "").strip()
                 ok = False
                 try:
-                    # 응답(예: 'S1+000.20')에서 숫자만 추출
-                    cur_hw = self._parse_pressure_value(s)
-                    tol = max(float(MFC_SP1_VERIFY_TOL), 1e-9)
-                    ok = (cur_hw is not None) and (abs(cur_hw - val_hw) <= tol)
+                    #cur_ui = self._parse_pressure_value(s)                  # 'S1+003.00' → 3.00 (UI)
+                    cur_hw = self._parse_pressure_value(s)  # ★ UI→HW (3.00→0.30)
+                    if cur_hw is not None:
+                        cur_hw = round(cur_hw, int(MFC_PRESSURE_DECIMALS))
+                    tol   = max(float(MFC_SP1_VERIFY_TOL), 1e-9)
+                    ok    = (cur_hw is not None) and (abs(cur_hw - val_hw) <= tol)         # ★ HW끼리 비교
                 except Exception:
                     ok = False
 

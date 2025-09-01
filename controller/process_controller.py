@@ -324,18 +324,25 @@ class ProcessController(QObject):
                 message='Main Shutter 열기'
             ))
 
-    def _create_shutdown_sequence(self, params: Dict[str, Any]) -> List[ProcessStep]:
+    def _create_shutdown_sequence(self, params: Dict[str, Any], force_all: bool = False) -> List[ProcessStep]:
         shutdown_steps: List[ProcessStep] = []
         common_info = self._get_common_process_info(params)
-        gun_shutters, gas_info = common_info['gun_shutters'], common_info['gas_info']
 
-        shutdown_steps.append(ProcessStep(action=ActionType.FADUINO_CMD, params=('MS', False), message='Main Shutter 닫기 (항상 닫음)'))
+        use_dc       = force_all or common_info['use_dc']
+        use_rf       = force_all or common_info['use_rf']
+        use_rf_pulse = force_all or common_info['use_rf_pulse']
+        gas_info     = common_info['gas_info']
+        gun_shutters = common_info['gun_shutters']
 
-        if common_info['use_dc']:
+        shutdown_steps.append(ProcessStep(
+            action=ActionType.FADUINO_CMD, params=('MS', False), message='Main Shutter 닫기 (항상 닫음)'
+        ))
+
+        if use_dc:
             shutdown_steps.append(ProcessStep(action=ActionType.DC_POWER_STOP, message='DC Power Off'))
-        if common_info['use_rf']:
+        if use_rf:
             shutdown_steps.append(ProcessStep(action=ActionType.RF_POWER_STOP, message='RF Power Off'))
-        if common_info['use_rf_pulse']:
+        if use_rf_pulse:
             shutdown_steps.append(ProcessStep(action=ActionType.RF_PULSE_STOP, message='RF Pulse Off'))
 
         for gas, info in gas_info.items():
@@ -665,27 +672,40 @@ class ProcessController(QObject):
         if self.current_step and self.current_step.action in (ActionType.RF_POWER_SET, ActionType.RF_PULSE_START):
             self.on_device_step_ok()
 
+    @Slot()
+    def on_rf_pulse_off_finished(self):
+        """RFPulseController.power_off_finished → RF_PULSE_STOP 스텝 완료"""
+        if not self.is_running:
+            return
+        # 병렬 블록
+        if self._px is not None:
+            if any(s.action == ActionType.RF_PULSE_STOP for s in self._px.steps):
+                self.on_device_step_ok()
+            return
+        # 단일 스텝
+        if self.current_step and self.current_step.action == ActionType.RF_PULSE_STOP:
+            self.on_device_step_ok()
+
+    @Slot(str)
+    def on_rf_pulse_failed(self, why: str):
+        """RFPulseController.target_failed(str) → 표준 실패 처리"""
+        self.on_step_failed("RFPulse", why or "unknown")
+
     # ---------------- 실패 처리 ----------------
     @Slot(str, str)
     def on_step_failed(self, source: str, reason: str):
         if not self.is_running:
             return
         
-            # ✅ 종료(일반/긴급) 중에는 실패를 경고만 찍고 다음 스텝으로
+        # 종료(일반/긴급) 중에는 실패가 나와도 '계속 진행' (로그만 남김)
         if self._aborting or self._shutdown_in_progress:
             self.log_message.emit("Process",
                 f"경고: 종료 중 '{source}' 단계 검증 실패({reason}). 다음 단계로 진행합니다.")
             self.on_step_completed()
             return
 
-        if self._aborting:
-            self.log_message.emit("Process", f"경고: 종료 중 '{source}' 단계 검증 실패({reason}). 다음 단계로 진행합니다.")
-            self.on_step_completed()
-            return
-
         full_reason = f"[{source} - {reason}]"
         self.log_message.emit("Process", f"오류 발생: {full_reason}. 공정을 중단합니다.")
-        print("현재 상태:", self.get_debug_status())
         self.abort_process()
 
     # ---------------- 카운트다운 ----------------

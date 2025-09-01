@@ -223,7 +223,7 @@
   <widget class="QCheckBox" name="G1_checkbox">
    <property name="geometry">
     <rect>
-     <x>30</x>
+     <x>20</x>
      <y>210</y>
      <width>41</width>
      <height>24</height>
@@ -249,7 +249,7 @@
   <widget class="QCheckBox" name="G3_checkbox">
    <property name="geometry">
     <rect>
-     <x>170</x>
+     <x>180</x>
      <y>210</y>
      <width>41</width>
      <height>24</height>
@@ -262,7 +262,7 @@
   <widget class="QCheckBox" name="Ar_checkbox">
    <property name="geometry">
     <rect>
-     <x>30</x>
+     <x>20</x>
      <y>290</y>
      <width>41</width>
      <height>24</height>
@@ -288,7 +288,7 @@
   <widget class="QCheckBox" name="N2_checkbox">
    <property name="geometry">
     <rect>
-     <x>170</x>
+     <x>180</x>
      <y>290</y>
      <width>41</width>
      <height>24</height>
@@ -522,14 +522,14 @@
   <widget class="QCheckBox" name="Main_shutter_checkbox">
    <property name="geometry">
     <rect>
-     <x>30</x>
+     <x>20</x>
      <y>170</y>
-     <width>161</width>
+     <width>101</width>
      <height>24</height>
     </rect>
    </property>
    <property name="text">
-    <string>Main Shutter Open</string>
+    <string>M.S. Open</string>
    </property>
   </widget>
   <widget class="QPlainTextEdit" name="log_message">
@@ -741,6 +741,19 @@
      <width>201</width>
      <height>31</height>
     </rect>
+   </property>
+  </widget>
+  <widget class="QCheckBox" name="Power_select_checkbox">
+   <property name="geometry">
+    <rect>
+     <x>130</x>
+     <y>170</y>
+     <width>101</width>
+     <height>24</height>
+    </rect>
+   </property>
+   <property name="text">
+    <string>P.W. Select</string>
    </property>
   </widget>
  </widget>

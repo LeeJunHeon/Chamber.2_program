@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 ################################################################################
-## Form generated from reading UI file 'CH2jfNVWZ.ui'
+## Form generated from reading UI file 'CH2mQZNFm.ui'
 ##
 ## Created by: Qt User Interface Compiler version 6.9.1
 ##
@@ -79,22 +79,22 @@ class Ui_Form(object):
         self.Base_pressure_edit.setGeometry(QRect(20, 80, 201, 31))
         self.G1_checkbox = QCheckBox(Form)
         self.G1_checkbox.setObjectName(u"G1_checkbox")
-        self.G1_checkbox.setGeometry(QRect(30, 210, 41, 24))
+        self.G1_checkbox.setGeometry(QRect(20, 210, 41, 24))
         self.G2_checkbox = QCheckBox(Form)
         self.G2_checkbox.setObjectName(u"G2_checkbox")
         self.G2_checkbox.setGeometry(QRect(100, 210, 41, 24))
         self.G3_checkbox = QCheckBox(Form)
         self.G3_checkbox.setObjectName(u"G3_checkbox")
-        self.G3_checkbox.setGeometry(QRect(170, 210, 41, 24))
+        self.G3_checkbox.setGeometry(QRect(180, 210, 41, 24))
         self.Ar_checkbox = QCheckBox(Form)
         self.Ar_checkbox.setObjectName(u"Ar_checkbox")
-        self.Ar_checkbox.setGeometry(QRect(30, 290, 41, 24))
+        self.Ar_checkbox.setGeometry(QRect(20, 290, 41, 24))
         self.O2_checkbox = QCheckBox(Form)
         self.O2_checkbox.setObjectName(u"O2_checkbox")
         self.O2_checkbox.setGeometry(QRect(100, 290, 41, 24))
         self.N2_checkbox = QCheckBox(Form)
         self.N2_checkbox.setObjectName(u"N2_checkbox")
-        self.N2_checkbox.setGeometry(QRect(170, 290, 41, 24))
+        self.N2_checkbox.setGeometry(QRect(180, 290, 41, 24))
         self.Ar_flow_edit = QPlainTextEdit(Form)
         self.Ar_flow_edit.setObjectName(u"Ar_flow_edit")
         self.Ar_flow_edit.setGeometry(QRect(20, 330, 61, 31))
@@ -159,7 +159,7 @@ class Ui_Form(object):
         self.RGA_graph_label.setAlignment(Qt.AlignmentFlag.AlignLeading|Qt.AlignmentFlag.AlignLeft|Qt.AlignmentFlag.AlignVCenter)
         self.Main_shutter_checkbox = QCheckBox(Form)
         self.Main_shutter_checkbox.setObjectName(u"Main_shutter_checkbox")
-        self.Main_shutter_checkbox.setGeometry(QRect(30, 170, 161, 24))
+        self.Main_shutter_checkbox.setGeometry(QRect(20, 170, 101, 24))
         self.log_message = QPlainTextEdit(Form)
         self.log_message.setObjectName(u"log_message")
         self.log_message.setGeometry(QRect(240, 840, 841, 161))
@@ -216,6 +216,9 @@ class Ui_Form(object):
         self.Rf_pulse_duty_cycle_edit = QPlainTextEdit(Form)
         self.Rf_pulse_duty_cycle_edit.setObjectName(u"Rf_pulse_duty_cycle_edit")
         self.Rf_pulse_duty_cycle_edit.setGeometry(QRect(20, 540, 201, 31))
+        self.Power_select_checkbox = QCheckBox(Form)
+        self.Power_select_checkbox.setObjectName(u"Power_select_checkbox")
+        self.Power_select_checkbox.setGeometry(QRect(130, 170, 101, 24))
 
         self.retranslateUi(Form)
 
@@ -247,7 +250,7 @@ class Ui_Form(object):
         self.Stop_button.setText(QCoreApplication.translate("Form", u"STOP", None))
         self.OES_graph_label.setText(QCoreApplication.translate("Form", u"OES data", None))
         self.RGA_graph_label.setText(QCoreApplication.translate("Form", u"RGA", None))
-        self.Main_shutter_checkbox.setText(QCoreApplication.translate("Form", u"Main Shutter Open", None))
+        self.Main_shutter_checkbox.setText(QCoreApplication.translate("Form", u"M.S. Open", None))
         self.Integration_time_label.setText(QCoreApplication.translate("Form", u"Integration time", None))
         self.DC_power_checkbox.setText(QCoreApplication.translate("Form", u"DC power [W]", None))
         self.RF_power_checkbox.setText(QCoreApplication.translate("Form", u"RF power [W]", None))
@@ -256,5 +259,6 @@ class Ui_Form(object):
         self.RF_pulse_checkbox.setText(QCoreApplication.translate("Form", u"RF Pulse power [W]", None))
         self.Rf_pulse_freq_label.setText(QCoreApplication.translate("Form", u"RF Pulse Freq", None))
         self.Rf_pulse_duty_cycle_label.setText(QCoreApplication.translate("Form", u"RF Pulse Duty Cycle", None))
+        self.Power_select_checkbox.setText(QCoreApplication.translate("Form", u"P.W. Select", None))
     # retranslateUi
 

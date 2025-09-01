@@ -843,7 +843,6 @@ class MainWindow(QWidget):
             self.append_log("MAIN", "공정 미실행 상태이지만 종료 절차를 수행합니다.")
 
         # 1) 정상 정지 요청 → 종료 시퀀스로 전환
-        print("현재 상태:", self.process_controller.get_debug_status())
         self.process_controller.request_stop()
 
         # 2) 그리고 즉시 장치 하드스톱 (큐/타이머/시리얼 정리, 파워 정지)

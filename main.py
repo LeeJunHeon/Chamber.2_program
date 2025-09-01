@@ -476,7 +476,7 @@ class MainWindow(QWidget):
     @Slot(bool)
     def _on_process_status_changed(self, running: bool):
         self.ui.Start_button.setEnabled(not running)
-        self.ui.Stop_button.setEnabled(running)
+        self.ui.Stop_button.setEnabled(True)
 
     @Slot()
     @Slot(bool)
@@ -624,9 +624,9 @@ class MainWindow(QWidget):
                 self.append_log("MAIN", "OES 초기화 실패.")
                 return False
 
-        # RF Pulse: 해당 공정에서 사용할 예정이면 선연결 (컨트롤러에서 중복/지연 연결 처리)
+        # RF Pulse: 해당 공정에서 사용할 예정이면 연결 (컨트롤러에서 중복/지연 연결 처리)
         if self.ui.RF_pulse_checkbox.isChecked():
-            self.append_log("MAIN", "RF Pulse 선연결을 시도합니다…")
+            self.append_log("MAIN", "RF Pulse 연결을 시도합니다…")
             self.request_rfpulse_connect.emit()
 
         self.append_log("MAIN", "모든 장비가 성공적으로 연결되었습니다.")
@@ -840,8 +840,7 @@ class MainWindow(QWidget):
     @Slot()
     def on_stop_button_clicked(self, _checked: bool=False):
         if not self.process_controller.is_running and not self.process_queue:
-            self.append_log("MAIN", "중단할 공정이 없습니다.")
-            return
+            self.append_log("MAIN", "공정 미실행 상태이지만 종료 절차를 수행합니다.")
 
         # 1) 정상 정지 요청 → 종료 시퀀스로 전환
         print("현재 상태:", self.process_controller.get_debug_status())

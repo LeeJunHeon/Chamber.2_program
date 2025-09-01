@@ -670,6 +670,13 @@ class ProcessController(QObject):
     def on_step_failed(self, source: str, reason: str):
         if not self.is_running:
             return
+        
+            # ✅ 종료(일반/긴급) 중에는 실패를 경고만 찍고 다음 스텝으로
+        if self._aborting or self._shutdown_in_progress:
+            self.log_message.emit("Process",
+                f"경고: 종료 중 '{source}' 단계 검증 실패({reason}). 다음 단계로 진행합니다.")
+            self.on_step_completed()
+            return
 
         if self._aborting:
             self.log_message.emit("Process", f"경고: 종료 중 '{source}' 단계 검증 실패({reason}). 다음 단계로 진행합니다.")
@@ -857,10 +864,6 @@ class ProcessController(QObject):
 
     def request_stop(self):
         """✅ 수정: UI에서 호출할 일반 정지 요청 메서드"""
-        if not self.is_running:
-            self.log_message.emit("Process", "정지 요청: 실행 중인 공정이 없습니다.")
-            return
-        
         if self._aborting:
             self.log_message.emit("Process", "정지 요청: 이미 긴급 중단 처리 중입니다.")
             return
@@ -877,6 +880,18 @@ class ProcessController(QObject):
             self.log_message.emit("Process", "현재 대기 중인 타이머를 중단하고 종료 절차로 진입합니다.")
             self.step_timer.stop()
             self._stop_countdown()
+
+        # ★ 실행 중이 아니어도 '강제 종료 시퀀스' 수행
+        if not self.is_running:
+            self.log_message.emit("Process", "정지 요청: 공정 미실행 → 강제 종료 시퀀스 수행")
+            # force_all=True로 모든 장비 OFF 시퀀스를 구성
+            self.process_sequence = self._create_shutdown_sequence(self.current_params or {}, force_all=True)
+            self._shutdown_in_progress = True
+            self.is_running = True
+            self._current_step_idx = -1
+            self._accept_completions = True
+            self.on_step_completed()
+            return
         
         # 즉시 종료 절차 시작
         self._start_normal_shutdown()

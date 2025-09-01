@@ -52,7 +52,7 @@ CSR_CODES = {
 }
 
 MODE_SET  = {"fwd": 6, "load": 7, "ext": 8}
-MODE_NAME = {46: "FWD", 47: "LOAD", 48: "EXT", 6: "FWD", 7: "LOAD", 8: "EXT"}
+MODE_NAME = {6: "FWD", 7: "LOAD", 8: "EXT"}
 
 def _u16le(buf: bytes, i: int = 0) -> int:
     return buf[i] | (buf[i+1] << 8)
@@ -530,6 +530,8 @@ class RFPulseController(QObject):
 
                     sp = int(round(float(target_w)))
                     self._set_power(sp)
+
+                    self._set_pulsing(1)
 
                     if freq_hz is not None:
                         self._set_pulse_freq(int(freq_hz))

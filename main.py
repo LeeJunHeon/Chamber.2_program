@@ -19,7 +19,8 @@ from device.RFpower import RFPowerController
 from device.RFPulse import RFPulseController
 from controller.data_logger import DataLogger
 from controller.process_controller import ProcessController
-
+from controller.chat_notifier import ChatNotifier
+from lib.config import GOOGLE_CHAT_WEBHOOK, ENABLE_CHAT_NOTIFY
 
 class MainWindow(QWidget):
     # UI → 장치(워커) 요청 신호들
@@ -113,6 +114,9 @@ class MainWindow(QWidget):
         # === 종료 처리 훅 ===
         self._about_quit_called = False
         self._emergency_done = False
+
+        # Google Chat 알림
+        self.notifier = ChatNotifier(GOOGLE_CHAT_WEBHOOK) if ENABLE_CHAT_NOTIFY else None
 
         app = QCoreApplication.instance()
         if app is not None:
@@ -443,6 +447,47 @@ class MainWindow(QWidget):
         self.ui.Process_list_button.clicked.connect(self.on_process_list_button_clicked)
         self.process_controller.process_status_changed.connect(self._on_process_status_changed)
         self._on_process_status_changed(False)
+
+        # === Google Chat 알림 ===
+        if self.notifier:
+            # 공정 종료(성공/실패)
+            self.process_controller.process_finished.connect(
+                self.notifier.notify_process_finished
+            )
+            self.process_controller.process_aborted.connect(
+                lambda: self.notifier.notify_text("⛔ 공정 강제 중단")
+            )
+
+            # 장비 단위 실패들 (이미 process_controller에도 연결되어 있음)
+            self.rf_power_controller.target_failed.connect(
+                lambda why: self.notifier.notify_error_with_src("RF Power", why)
+            )
+            self.rf_pulse_controller.target_failed.connect(
+                lambda why: self.notifier.notify_error_with_src("RF Pulse", why)
+            )
+            self.oes_controller.oes_failed.connect(
+                lambda why: self.notifier.notify_error_with_src("OES", why)
+            )
+            self.rga_controller.scan_failed.connect(
+                lambda why: self.notifier.notify_error_with_src("RGA", why)
+            )
+            self.ig_controller.base_pressure_failed.connect(
+                lambda why: self.notifier.notify_error_with_src("IG", why)
+            )
+            # MFC/Faduino 실패 시그널 시그니처가 (cmd, why) 식일 수 있으니 *args 처리
+            self.mfc_controller.command_failed.connect(
+                lambda *args: self.notifier.notify_error_with_src("MFC", " ".join(map(str, args)))
+            )
+            self.faduino_controller.command_failed.connect(
+                lambda *args: self.notifier.notify_error_with_src("Faduino", " ".join(map(str, args)))
+            )
+
+            # 공정 시작 알림
+            self.process_controller.process_started.connect(
+                lambda params: self.notifier.notify_text(
+                    f"▶ 공정 시작: {params.get('process_note','') or params.get('Process_name','')}"
+                )
+            ) 
 
     # --- 표시용 슬롯 ---
     @Slot(float, float)

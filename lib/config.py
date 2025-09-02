@@ -1,5 +1,10 @@
 # lib/config.py
+import os
 from pathlib import Path
+
+# === Google Chat 알림 ===
+CHAT_WEBHOOK_URL = os.environ.get("CHAT_WEBHOOK_URL", None)
+ENABLE_CHAT_NOTIFY  = True  # 끄고 싶을 때 False
 
 # === 디버그 프린트 여부 ===
 DEBUG_PRINT = True

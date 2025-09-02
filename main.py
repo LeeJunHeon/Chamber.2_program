@@ -20,7 +20,7 @@ from device.RFPulse import RFPulseController
 from controller.data_logger import DataLogger
 from controller.process_controller import ProcessController
 from controller.chat_notifier import ChatNotifier
-from lib.config import GOOGLE_CHAT_WEBHOOK, ENABLE_CHAT_NOTIFY
+from lib.config import CHAT_WEBHOOK_URL, ENABLE_CHAT_NOTIFY
 
 class MainWindow(QWidget):
     # UI → 장치(워커) 요청 신호들
@@ -97,7 +97,7 @@ class MainWindow(QWidget):
         self.process_controller = ProcessController()
 
         # Google Chat 알림
-        self.chat_notifier = ChatNotifier(GOOGLE_CHAT_WEBHOOK) if ENABLE_CHAT_NOTIFY else None
+        self.chat_notifier = ChatNotifier(CHAT_WEBHOOK_URL) if ENABLE_CHAT_NOTIFY else None
 
         # === 4. 신호-슬롯 ===
         self._connect_signals()

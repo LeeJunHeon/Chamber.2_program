@@ -110,6 +110,11 @@ class RFPulseController(QObject):
         self._tx_epoch = QElapsedTimer(); self._tx_epoch.start()
         self._last_sent_at_ms = -10**9
 
+        # __init__() 안에 추가
+        self._io_inflight = False      # 현재 I/O 진행 중 표시
+        self._need_reopen = False      # 다음 재연결 시 포트 재오픈 필요
+        self._per_cmd_retries = 3      # 명령 단위 재시도 횟수
+
     # ---------- 내부 생성기 ----------
     def _ensure_serial_created(self):
         if self.port is not None:
@@ -140,17 +145,15 @@ class RFPulseController(QObject):
         err_value = getattr(err, "value", None)
         self.status_message.emit("RFPulse", f"시리얼 오류: {es} (err={err_name}/{err_value})")
 
-        # ✅ 타임아웃은 치명적 아님: 포트 닫거나 재연결 스케줄 하지 않음
-        if err == QSerialPort.SerialPortError.TimeoutError or err == QSerialPort.SerialPortError.NoError:
+        # 타임아웃은 장치 응답 지연일 수 있으니 별도 조치 없음(아래 재시도 로직에서 해결)
+        if err == QSerialPort.SerialPortError.TimeoutError:
             return
 
+        # ❌ 여기서 절대 close() 하지 않음. 워치독에게 맡기기.
         self._port_had_error = True
-        if self.port and self.port.isOpen():
-            try: self.port.close()
-            except Exception: pass
-
+        self._need_reopen = True           # 다음 재연결 시 안전하게 닫고 다시 열도록 표시
         self._ensure_timers_created()
-        self._want_connected = True  # ← 워치독이 실제로 붙도록 보장
+        self._want_connected = True
         if not self._watchdog.isActive():
             self._watchdog.start()
         QTimer.singleShot(0, self._watch_connection)
@@ -198,7 +201,6 @@ class RFPulseController(QObject):
         except Exception: pass
         try: self.port.setRequestToSend(False)
         except Exception: pass
-        self.port.clear(QSerialPort.Direction.AllDirections)
 
         self._configured_port = self._default_port
         self._reconnect_backoff_ms = RFPULSE_RECONNECT_BACKOFF_START_MS
@@ -234,8 +236,15 @@ class RFPulseController(QObject):
         self._reconnect_pending = False
         if (not self._want_connected) or self._stop_requested:
             return
-        if self.port and self.port.isOpen():
+        # 이미 열려 있으면 재연결 불필요
+        if self.port and self.port.isOpen() and not self._need_reopen:
             return
+
+        # 🔐 포트를 열기 전에, 재오픈이 필요하다면 여기서만 닫는다(이 시점엔 I/O 없음).
+        if self._need_reopen and self.port and self.port.isOpen():
+            try: self.port.close()
+            except Exception: pass
+            finally: self._need_reopen = False
 
         if self._open_port():
             self.status_message.emit("RFPulse", "재연결 성공")
@@ -349,23 +358,43 @@ class RFPulseController(QObject):
         if not self.is_connected():
             raise RuntimeError("Port not open")
 
-        self.port.clear(QSerialPort.Direction.AllDirections)
         pkt = _build_packet(self.addr, cmd, data)
-        self.status_message.emit(
-            "RFPulse",
-            f"TX exec(ack-only): addr={self.addr} cmd=0x{cmd:02X} data={data.hex(' ')} pkt={pkt.hex(' ')}"
-        )
-        self._tx_throttle()
-        self._last_sent_at_ms = self._tx_epoch.elapsed()
-        self.port.write(pkt)
-        self.port.waitForBytesWritten(timeout_ms)
-        kind, _ = self._recv_frame(
-            timeout_ms=timeout_ms, 
-            allow_ack_only=True,
-            allow_when_stopping=force,
-        )
-        if kind not in ("ACK_ONLY", "FRAME"):
-            raise TimeoutError("Expected ACK/FRAME not received")
+        label = f"exec 0x{cmd:02X}"
+
+        for attempt in range(1, self._per_cmd_retries + 1):
+            self.status_message.emit("RFPulse", f"TX {label}: addr={self.addr} data={data.hex(' ')} pkt={pkt.hex(' ')} (try {attempt}/{self._per_cmd_retries})")
+            self._tx_throttle()
+            self._last_sent_at_ms = self._tx_epoch.elapsed()
+
+            self._io_inflight = True
+            try:
+                # ❌ clear(AllDirections) 제거 — I/O abort 방지
+                self.port.write(pkt)
+                self.port.waitForBytesWritten(timeout_ms)
+                kind, _ = self._recv_frame(
+                    timeout_ms=timeout_ms,
+                    allow_ack_only=True,
+                    allow_when_stopping=force,
+                )
+                if kind in ("ACK_ONLY", "FRAME"):
+                    return
+                raise TimeoutError("Expected ACK/FRAME not received")
+
+            except Exception as e:
+                # 실패 → 워치독 재연결 예약 후 백오프만큼 기다렸다가 동일 명령 재시도
+                self._need_reopen = True         # 다음 재연결에서 안전 재오픈
+                self._watch_connection()         # 워치독 트리거
+                self._delay_ms(self._reconnect_backoff_ms)
+                # 재연결 시도 후 포트가 살아났는지 점검
+                if not self.is_connected():
+                    # 재연결 타이머가 다시 돌 수 있게 한 번 더 툭 쳐줌
+                    self._watch_connection()
+                if attempt >= self._per_cmd_retries:
+                    raise
+                # 루프 계속
+
+            finally:
+                self._io_inflight = False
 
     def _send_query(self, cmd: int, data: bytes=b"", timeout_ms: int=QUERY_TIMEOUT_MS) -> bytes:
         if self._stop_requested:
@@ -373,34 +402,46 @@ class RFPulseController(QObject):
         if not self.is_connected():
             raise RuntimeError("Port not open")
 
-        self.port.clear(QSerialPort.Direction.AllDirections)
         pkt = _build_packet(self.addr, cmd, data)
-        self.status_message.emit(
-            "RFPulse",
-            f"TX query: addr={self.addr} cmd=0x{cmd:02X} data={data.hex(' ')} pkt={pkt.hex(' ')}"
-        )
-        self._tx_throttle()
-        self._last_sent_at_ms = self._tx_epoch.elapsed()
-        self.port.write(pkt)
-        self.port.waitForBytesWritten(timeout_ms)
-        kind, payload = self._recv_frame(timeout_ms=timeout_ms, allow_ack_only=False)
-        if kind != "FRAME":
-            raise TimeoutError("No data frame")
-        p = payload
-        hdr = p[0]
-        rx_cmd = p[1]
-        length_bits = hdr & 0x07
-        idx = 2
-        if length_bits == 7:
-            dlen = p[idx]; idx += 1
-        else:
-            dlen = length_bits
-        data_bytes = p[idx:idx+dlen]
-        self.status_message.emit(
-            "RFPulse",
-            f"RX query FRAME: hdr=0x{hdr:02X} cmd=0x{rx_cmd:02X} dlen={dlen} data={data_bytes.hex(' ')} pkt={p.hex(' ')}"
-        )
-        return data_bytes
+        label = f"query 0x{cmd:02X}"
+
+        for attempt in range(1, self._per_cmd_retries + 1):
+            self.status_message.emit("RFPulse", f"TX {label}: addr={self.addr} data={data.hex(' ')} pkt={pkt.hex(' ')} (try {attempt}/{self._per_cmd_retries})")
+            self._tx_throttle()
+            self._last_sent_at_ms = self._tx_epoch.elapsed()
+
+            self._io_inflight = True
+            try:
+                # ❌ clear(AllDirections) 제거
+                self.port.write(pkt)
+                self.port.waitForBytesWritten(timeout_ms)
+                kind, payload = self._recv_frame(timeout_ms=timeout_ms, allow_ack_only=False)
+                if kind != "FRAME":
+                    raise TimeoutError("No data frame")
+
+                p = payload
+                hdr = p[0]
+                length_bits = hdr & 0x07
+                idx = 2
+                if length_bits == 7:
+                    dlen = p[idx]; idx += 1
+                else:
+                    dlen = length_bits
+                data_bytes = p[idx:idx+dlen]
+                self.status_message.emit("RFPulse", f"RX {label}: hdr=0x{hdr:02X} dlen={dlen} data={data_bytes.hex(' ')} pkt={p.hex(' ')}")
+                return data_bytes
+
+            except Exception as e:
+                self._need_reopen = True
+                self._watch_connection()
+                self._delay_ms(self._reconnect_backoff_ms)
+                if not self.is_connected():
+                    self._watch_connection()
+                if attempt >= self._per_cmd_retries:
+                    raise
+
+            finally:
+                self._io_inflight = False
 
     # ---------- 고수준 동작 ----------
     def _host_mode(self):
@@ -579,32 +620,18 @@ class RFPulseController(QObject):
 
     @Slot()
     def stop_process(self, also_turn_pulsing_off: bool = True):
-        """STOP/에러 시: 가능하면 실제로 장비에 OFF 명령 전송"""
         self._stop_requested = True
         self._want_connected = False
         self._reconnect_pending = False
         try:
             self._wd_pause()
-
-            # ✅ 포트가 닫혀 있으면 워치독 없이 1회 오픈 시도
             if not self.is_connected():
                 try: self._open_port()
                 except Exception: pass
-
-            # ✅ 강제 OFF 명령 (stop 중에도 전송)
-            try:
-                if also_turn_pulsing_off:
-                    self._set_pulsing(0, force=True)
-            except Exception:
-                pass
             try:
                 self._rf_off(force=True)
             except Exception:
                 pass
-
-            if self.port and self.port.isOpen():
-                try: self.port.close()
-                except Exception: pass
         finally:
             self.power_off_finished.emit()
 

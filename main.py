@@ -138,6 +138,7 @@ class MainWindow(QWidget):
         self.ig_controller.pressure_update.connect(self.data_logger.log_ig_pressure)
         self.faduino_controller.dc_power_updated.connect(self.data_logger.log_dc_power)
         self.faduino_controller.rf_power_updated.connect(self.data_logger.log_rf_power)
+        self.rf_pulse_controller.update_rf_status_display.connect(self.data_logger.log_rfpulse_power)
         self.mfc_controller.update_flow.connect(self.data_logger.log_mfc_flow)
         self.mfc_controller.update_pressure.connect(self.data_logger.log_mfc_pressure)
 
@@ -285,14 +286,15 @@ class MainWindow(QWidget):
             self.process_controller.on_device_step_ok,
             type=Qt.ConnectionType.QueuedConnection
         )
-
-        # === set_polling (cross-thread) ===
-        self.process_controller.set_polling.connect(
-            self.faduino_controller.set_process_status,
+        self.rf_pulse_controller.update_rf_status_display.connect(
+            self.handle_rf_power_display,
             type=Qt.ConnectionType.QueuedConnection
         )
-        self.process_controller.set_polling.connect(
-            self.mfc_controller.set_process_status,
+
+        # === set_polling (cross-thread) ===
+        # 추가: dict 형태의 타겟 폴링 on/off를 받아서 각 컨트롤러에 전달
+        self.process_controller.set_polling_targets.connect(
+            self._apply_polling_targets,
             type=Qt.ConnectionType.QueuedConnection
         )
 
@@ -872,6 +874,18 @@ class MainWindow(QWidget):
         except Exception as e:
             error_msg = f"[{ui_now}] [Logger] 파일 로그 작성 실패: {e}"
             self.ui.log_message.appendPlainText(error_msg)
+
+    @Slot(dict)
+    def _apply_polling_targets(self, targets: dict):
+        """
+        targets 예시: {'mfc': True/False, 'faduino': True/False, 'rfpulse': True/False}
+        - RFPulse는 장치 내부에서 자체 폴링을 켜/끄기 때문에 여기서 건드리지 않음
+        """
+        self.mfc_controller.set_process_status(bool(targets.get('mfc', False)))
+        self.faduino_controller.set_process_status(bool(targets.get('faduino', False)))
+        # RF-Pulse: 자체 폴링 (start_pulse_process에서 시작, rf_off에서 정지)
+        # 필요하면 targets['rfpulse']로 로거/표시 플래그만 활용
+
 
     @Slot(str)
     def on_update_process_state(self, message: str):

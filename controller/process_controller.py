@@ -88,6 +88,7 @@ class ProcessController(QObject):
 
     # 3) 폴링 제어
     set_polling = Signal(bool)
+    set_polling_targets = Signal(object)  # {'mfc': bool, 'faduino': bool, 'rfpulse': bool}
 
     # 4) 비상정지 브로드캐스트
     process_aborted = Signal()
@@ -119,6 +120,9 @@ class ProcessController(QObject):
         self._countdown_timer.timeout.connect(self._on_countdown_tick)
         self._countdown_remaining_ms = 0
         self._countdown_base_message = ""
+
+        self._shutdown_error = False                # 종료 중 실패 발생 여부
+        self._shutdown_failures: List[str] = []     # 실패한 단계 기록(메시지 리스트)
 
     # ---------------- 시퀀스 구성 ----------------
     def _create_process_sequence(self, params: Dict[str, Any]) -> List[ProcessStep]:
@@ -424,6 +428,8 @@ class ProcessController(QObject):
             self._accept_completions = True
             self._in_emergency = False
             self._stop_requested = False  # ✅ 새로 추가: 플래그 초기화
+            self._shutdown_error = False
+            self._shutdown_failures = []
 
             self.process_status_changed.emit(True)
             self.process_started.emit(params)
@@ -525,7 +531,7 @@ class ProcessController(QObject):
             self._px = None
 
         # 폴링 잠시 정지
-        self.set_polling.emit(False)
+        self._apply_polling(False)
 
         # 다음 스텝으로
         self._current_step_idx += 1
@@ -534,13 +540,14 @@ class ProcessController(QObject):
         self.log_message.emit("Process", f"다음 스텝으로 진행: {self._current_step_idx + 1}/{len(self.process_sequence)}")
         
         if self._current_step_idx >= len(self.process_sequence):
-            # ✅ 수정: 종료 조건 명확화
+            # 종료 절차로 들어왔다는 건 보통 '사용자 정지/오류' 흐름이므로 성공 아님
             if self._shutdown_in_progress:
-                self.log_message.emit("Process", "종료 절차가 모두 완료되었습니다.")
-                success = True  # 종료 절차 완료는 성공으로 간주
+                # ✅ 종료 절차가 끝났을 때: 실패가 1건이라도 있으면 실패로 판정(권장)
+                success = not (self._aborting or self._in_emergency or self._stop_requested or self._shutdown_error)
             else:
+                # 평시 공정 완료(정상 플로우)
                 success = not (self._aborting or self._in_emergency or self._stop_requested)
-            
+
             self._finish_process(success)
             return
 
@@ -559,13 +566,13 @@ class ProcessController(QObject):
 
             # 블록 전체에서 polling 필요 여부를 한 번만 계산
             need_polling = any(s.polling for s, _ in parallel_steps)
-            self.set_polling.emit(need_polling)
+            self._apply_polling(need_polling)
 
             self.log_message.emit("Process", f"병렬 작업 {len(parallel_steps)}개 동시 시작...")
             for step, idx in parallel_steps:
                 self._run_next_step(step, idx)
         else:
-            self.set_polling.emit(current_step.polling)
+            self._apply_polling(current_step.polling)
             self._run_next_step(current_step, self._current_step_idx)
 
     # ---------------- 장치에서 오는 완료/실패 슬롯 ----------------
@@ -715,19 +722,28 @@ class ProcessController(QObject):
         self.on_step_failed("RFPulse", why or "unknown")
 
     # ---------------- 실패 처리 ----------------
-    @Slot(str, str)
     def on_step_failed(self, source: str, reason: str):
         if not self.is_running:
             return
-        
-        # 종료(일반/긴급) 중에는 실패가 나와도 '계속 진행' (로그만 남김)
+
+        full_reason = f"[{source} - {reason}]"
+        cur = self.current_step
+
+        # ✅ 종료(일반/긴급) 중엔: 실패를 기록하고, 다음 단계로 '계속' 진행
         if self._aborting or self._shutdown_in_progress:
+            # 실패 기록(어떤 스텝이 실패했는지 남김)
+            step_no = self._current_step_idx + 1
+            act_name = cur.action.name if cur else "UNKNOWN"
+            self._shutdown_error = True
+            self._shutdown_failures.append(f"Step {step_no} {act_name}: {full_reason}")
+
             self.log_message.emit("Process",
-                f"경고: 종료 중 '{source}' 단계 검증 실패({reason}). 다음 단계로 진행합니다.")
+                f"경고: 종료 중 단계 실패 → 계속 진행합니다. ({act_name}, 사유: {full_reason})")
+            # 멈추지 않고 다음 단계로
             self.on_step_completed()
             return
 
-        full_reason = f"[{source} - {reason}]"
+        # ✅ 평시(공정 중) 실패: 안전 종료 절차로 전환
         self.log_message.emit("Process", f"오류 발생: {full_reason}. 종료 절차를 시작합니다.")
         self._start_normal_shutdown()
 
@@ -771,7 +787,7 @@ class ProcessController(QObject):
         self._px = None
         self.step_timer.stop()
         self._stop_countdown()
-        self.set_polling.emit(False)
+        self._apply_polling(False)
         self._shutdown_in_progress = False   # ✅ 해제
         self._stop_requested = False  # ✅ 플래그 리셋
 
@@ -781,13 +797,24 @@ class ProcessController(QObject):
         else:
             self.log_message.emit("Process", "=== 공정이 중단되었습니다 ===")
             self.update_process_state.emit("공정 중단됨")
+            # ✅ 종료 중 실패 요약 출력
+            if self._shutdown_failures:
+                self.log_message.emit("Process", f"[종료 중 실패 요약] 총 {len(self._shutdown_failures)}건")
+                for item in self._shutdown_failures:
+                    self.log_message.emit("Process", f" - {item}")
             if self._aborting or self._in_emergency:
-                self.process_aborted.emit()  # ✅ 진짜 비상/에러 중단에만
+                self.process_aborted.emit()
 
         self.process_status_changed.emit(False)
         self.process_finished.emit(success)
+
+        # ✅ 리셋
         self._aborting = False
         self._in_emergency = False
+        self._shutdown_in_progress = False
+        self._shutdown_error = False
+        self._shutdown_failures.clear()
+        self._stop_requested = False
 
     def abort_process(self):
         if not self.is_running:
@@ -799,7 +826,7 @@ class ProcessController(QObject):
         #self.process_aborted.emit()
         self.step_timer.stop()
         self._stop_countdown()
-        self.set_polling.emit(False)
+        self._apply_polling(False)
         self._px = None
 
         self.log_message.emit("Process", "공정 긴급 중단을 시작합니다...")
@@ -881,7 +908,7 @@ class ProcessController(QObject):
         self.log_message.emit("Process", "정지 요청 - 안전한 종료 절차를 시작합니다.")
         self.step_timer.stop()
         self._stop_countdown()
-        self.set_polling.emit(False)
+        self._apply_polling(False)
         self._px = None
         
         # ✅ 수정: 종료 절차 생성 및 실행 로직 개선
@@ -1049,6 +1076,8 @@ class ProcessController(QObject):
         self._accept_completions = True
         self._in_emergency = False
         self._stop_requested = False  # ✅ 플래그 리셋 추가
+        self._shutdown_error = False
+        self._shutdown_failures = []
         self._current_step_idx = -1
         self._px = None
         self.process_sequence.clear()
@@ -1075,3 +1104,24 @@ class ProcessController(QObject):
             'current_step_action': self.current_step.action.name if self.current_step else None,
             'current_step_message': self.current_step.message if self.current_step else None
         }
+    
+    # ---------------- polling ----------------
+    def _compute_polling_targets(self, active: bool) -> Dict[str, bool]:
+        """
+        active=False면 전부 False.
+        active=True면:
+          - RF Pulse 사용:  MFC=True, Faduino=False, RFPulse=True
+          - 그 외(DC/RF):  MFC=True, Faduino=True,  RFPulse=False
+        """
+        if not active:
+            return {'mfc': False, 'faduino': False, 'rfpulse': False}
+
+        info = self._get_common_process_info(self.current_params or {})
+        if info.get('use_rf_pulse', False):
+            return {'mfc': True, 'faduino': False, 'rfpulse': True}
+        return {'mfc': True, 'faduino': True, 'rfpulse': False}
+
+    def _apply_polling(self, active: bool):
+        """기존 set_polling과 함께 타깃 정보도 브로드캐스트"""
+        self.set_polling.emit(active)
+        self.set_polling_targets.emit(self._compute_polling_targets(active))

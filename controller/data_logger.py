@@ -29,6 +29,10 @@ class DataLogger(QObject):
         self.rf_for_p_readings = []
         self.rf_ref_p_readings = []
 
+        # RF Pulse 폴링값 ★ 추가
+        self.rf_pulse_for_p_readings = []
+        self.rf_pulse_ref_p_readings = []
+
         self.mfc_flow_readings = {"Ar": [], "O2": [], "N2": []}
         self.mfc_pressure_readings = []
         
@@ -41,6 +45,7 @@ class DataLogger(QObject):
             "RF: For.P", "RF: Ref. P", 
             "DC: V", "DC: I", "DC: P",
             "RF Pulse: P", "RF Pulse: Freq", "RF Pulse: Duty Cycle",
+            "RF Pulse: For.P", "RF Pulse: Ref.P"
         ]
 
         # ⬇︎ 기존 파일이 있으면 헤더를 새 형식으로 1회 업그레이드
@@ -104,6 +109,10 @@ class DataLogger(QObject):
         self.rf_for_p_readings.clear()
         self.rf_ref_p_readings.clear()
 
+        # RF Pulse 폴링값 초기화 ★ 추가
+        self.rf_pulse_for_p_readings.clear()
+        self.rf_pulse_ref_p_readings.clear()
+
         for gas in self.mfc_flow_readings:
             self.mfc_flow_readings[gas].clear()
         self.mfc_pressure_readings.clear()
@@ -123,6 +132,12 @@ class DataLogger(QObject):
     def log_rf_power(self, for_p, ref_p):
         self.rf_for_p_readings.append(for_p)
         self.rf_ref_p_readings.append(ref_p)
+
+    # RF Pulse 폴링 수신 슬롯 ★ 추가
+    @Slot(float, float)
+    def log_rfpulse_power(self, for_p, ref_p):
+        self.rf_pulse_for_p_readings.append(for_p)
+        self.rf_pulse_ref_p_readings.append(ref_p)
 
     @Slot(str, float)
     def log_mfc_flow(self, gas_name, flow_value):
@@ -154,11 +169,15 @@ class DataLogger(QObject):
         base_pressure = self.ig_pressure_readings[0] if self.ig_pressure_readings else \
                         float(self.process_params.get("base_pressure", 0.0))
 
-        # ✅ RF Pulse 파라미터 (옵션은 None이면 공란)
+        # 사용 플래그
+        use_rf  = bool(self.process_params.get("use_rf_power", False))
+        use_dc  = bool(self.process_params.get("use_dc_power", False))
         use_rfp = bool(self.process_params.get("use_rf_pulse", False))
-        rfp_p   = self.process_params.get("rf_pulse_power", None)
-        rfp_f   = self.process_params.get("rf_pulse_freq", None)   # None → 미지정
-        rfp_d   = self.process_params.get("rf_pulse_duty", None)
+
+        # RF Pulse 설정값(이미 하던 방식 유지)
+        rfp_p = self.process_params.get("rf_pulse_power", None)
+        rfp_f = self.process_params.get("rf_pulse_freq", None)
+        rfp_d = self.process_params.get("rf_pulse_duty", None)
 
         log_data = {
             "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -172,16 +191,31 @@ class DataLogger(QObject):
             "N2 flow": f"{_avg(self.mfc_flow_readings['N2']):.2f}",
             "Working Pressure": f"{_avg(self.mfc_pressure_readings):.4f}",
             "Process Time": self.process_params.get("process_time", 0.0),
-            "RF: For.P": f"{_avg(self.rf_for_p_readings):.2f}",
-            "RF: Ref. P": f"{_avg(self.rf_ref_p_readings):.2f}",
-            "DC: V": f"{_avg(self.dc_voltage_readings):.2f}",
-            "DC: I": f"{_avg(self.dc_current_readings):.2f}",
-            "DC: P": f"{_avg(self.dc_power_readings):.2f}",
 
-            # ✅ RF Pulse 3개 컬럼
+            # ★ 일반 RF: 사용 시에만 평균 기록, 아니면 공란
+            "RF: For.P": (f"{_avg(self.rf_for_p_readings):.2f}"
+                        if use_rf and self.rf_for_p_readings else ""),
+            "RF: Ref. P": (f"{_avg(self.rf_ref_p_readings):.2f}"
+                        if use_rf and self.rf_ref_p_readings else ""),
+
+            # ★ DC: 사용 시에만 평균 기록, 아니면 공란
+            "DC: V": (f"{_avg(self.dc_voltage_readings):.2f}"
+                    if use_dc and self.dc_voltage_readings else ""),
+            "DC: I": (f"{_avg(self.dc_current_readings):.2f}"
+                    if use_dc and self.dc_current_readings else ""),
+            "DC: P": (f"{_avg(self.dc_power_readings):.2f}"
+                    if use_dc and self.dc_power_readings else ""),
+
+            # ✅ RF Pulse 설정값 3개: 사용 시에만 기록
             "RF Pulse: P":          (f"{float(rfp_p):.2f}" if use_rfp and rfp_p not in (None, "") else ""),
             "RF Pulse: Freq":       (str(int(rfp_f))        if use_rfp and rfp_f not in (None, "") else ""),
             "RF Pulse: Duty Cycle": (str(int(rfp_d))        if use_rfp and rfp_d not in (None, "") else ""),
+
+            # ★ RF Pulse 폴링 평균값 2개: 사용 시에만 기록, 아니면 공란
+            "RF Pulse: For.P": (f"{_avg(self.rf_pulse_for_p_readings):.2f}"
+                                if use_rfp and self.rf_pulse_for_p_readings else ""),
+            "RF Pulse: Ref.P": (f"{_avg(self.rf_pulse_ref_p_readings):.2f}"
+                                if use_rfp and self.rf_pulse_ref_p_readings else ""),
         }
 
         # --- 파일에 기록 ---

@@ -83,6 +83,7 @@ class RFPulseController(QObject):
     target_reached = Signal()                    # RF ON 완료 (정상)
     target_failed  = Signal(str)                 # 실패 사유
     power_off_finished = Signal()                # RF OFF 완료
+    update_rf_status_display = Signal(float, float)   # UI로 FWD/REF 송신
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -115,6 +116,10 @@ class RFPulseController(QObject):
         self._need_reopen = False      # 다음 재연결 시 포트 재오픈 필요
         self._per_cmd_retries = 3      # 명령 단위 재시도 횟수
 
+        self._poll_timer = None                 # ← QTimer 대신 None
+        self._last_forward_w = None
+        self._last_reflected_w = None
+
     # ---------- 내부 생성기 ----------
     def _ensure_serial_created(self):
         if self.port is not None:
@@ -132,6 +137,24 @@ class RFPulseController(QObject):
             self._watchdog = QTimer(self)
             self._watchdog.setInterval(RFPULSE_WATCHDOG_INTERVAL_MS)
             self._watchdog.timeout.connect(self._watch_connection)
+
+    def _ensure_poll_timer_created(self):
+        if self._poll_timer is None:
+            from PyQt6.QtCore import QTimer
+            self._poll_timer = QTimer(self)
+            self._poll_timer.setInterval(3000)          # 3초
+            self._poll_timer.timeout.connect(self._poll_power)
+
+    def _start_power_polling(self):
+        self._ensure_poll_timer_created()
+        if not self._poll_timer.isActive():
+            self._poll_timer.start()
+            self.status_message.emit("RFPulse", "FWD/REF polling started (3초)")
+
+    def _stop_power_polling(self):
+        if self._poll_timer and self._poll_timer.isActive():
+            self._poll_timer.stop()
+            self.status_message.emit("RFPulse", "FWD/REF polling stopped")
 
     # ---------- 포트/에러 ----------
     @Slot(QSerialPort.SerialPortError)
@@ -224,9 +247,10 @@ class RFPulseController(QObject):
     def _watch_connection(self):
         if (not self._want_connected) or self._stop_requested:
             return
-        if self.port and self.port.isOpen():
-            return
         if self._reconnect_pending:
+            return
+        # ⬇️ 포트가 열려 있어도 재오픈 플래그가 있으면 '재연결 필요'로 간주
+        if self.port and self.port.isOpen() and not self._need_reopen:
             return
         self._reconnect_pending = True
         self.status_message.emit("RFPulse", f"재연결 시도... ({self._reconnect_backoff_ms} ms)")
@@ -263,7 +287,7 @@ class RFPulseController(QObject):
         if self._watchdog and (not self._watchdog.isActive()) and self._want_connected:
             self._watchdog.start()
 
-    # ---------- 저수준 통신 ----------
+    # ---------- 시리얼 통신 ----------
     def _delay_ms(self, ms: int):
         t = QElapsedTimer(); t.start()
         while t.elapsed() < ms:
@@ -443,7 +467,7 @@ class RFPulseController(QObject):
             finally:
                 self._io_inflight = False
 
-    # ---------- 고수준 동작 ----------
+    # ---------- 장비 제어 동작 ----------
     def _host_mode(self):
         self._send_exec_ack(CMD_SET_ACTIVE_CTRL, b"\x02", ACK_TIMEOUT_MS)
         self.status_message.emit("RFPulse", "[HOST] sent (ack-only)")
@@ -492,12 +516,43 @@ class RFPulseController(QObject):
         self.status_message.emit("RFPulse", "[RF ON] sent (ack-only)")
 
     def _rf_off(self, *, force: bool=False):
+        self._send_exec_ack(CMD_RF_OFF, b"", timeout_ms=max(ACK_TIMEOUT_MS, 2500), force=force)
+        self._stop_power_polling()
+        tag = " (force)" if force else ""
+        self.status_message.emit("RFPulse", f"[RF OFF] sent (ack-only){tag}")
+
+    @Slot()
+    def _poll_power(self):
+        # 다른 명령 I/O 중이면 이번 틱은 건너뛴다
+        if self._io_inflight or self._stop_requested:
+            return
+        if not self.is_connected():
+            self._watch_connection()
+            return
+    
+        if not self.is_connected():
+            self._watch_connection()
+            return
+
+        fwd = None; ref = None
         try:
-            self._send_exec_ack(CMD_RF_OFF, b"", timeout_ms=max(ACK_TIMEOUT_MS, 2500), force=force)
-            tag = " (force)" if force else ""
-            self.status_message.emit("RFPulse", f"[RF OFF] sent (ack-only){tag}")
+            fwd = float(self._read_forward_power())   # CMD 165
+            self._last_forward_w = fwd
         except Exception as e:
-            self.status_message.emit("RFPulse", f"[RF OFF] 예외(무시): {e}")
+            self.status_message.emit("RFPulse", f"[POLL] forward read failed: {e}")
+
+        try:
+            # reflected는 helper 없으면 아래처럼 직접:
+            data = self._send_query(CMD_REPORT_REFLECTED, b"", QUERY_TIMEOUT_MS)  # CMD 166
+            ref = float(_u16le(data, 0) if len(data) >= 2 else 0)
+            self._last_reflected_w = ref
+        except Exception as e:
+            self.status_message.emit("RFPulse", f"[POLL] reflected read failed: {e}")
+
+        out_f = self._last_forward_w if fwd is None else fwd
+        out_r = self._last_reflected_w if ref is None else ref
+        if (out_f is not None) and (out_r is not None):
+            self.update_rf_status_display.emit(out_f, out_r)
 
     # ---------- (선택) 리드백 ----------
     def _report_process_status(self) -> tuple[int, int, bytes]:
@@ -574,16 +629,17 @@ class RFPulseController(QObject):
                     sp = int(round(float(target_w)))
                     self._set_power(sp)
 
-                    self._set_pulsing(1)
-
                     if freq_hz is not None:
                         self._set_pulse_freq(int(freq_hz))
                     if duty_percent is not None:
                         self._set_pulse_duty(int(duty_percent))
 
+                    self._set_pulsing(1)
+
                     self._rf_on()
 
                     self.target_reached.emit()
+                    self._start_power_polling()
                     last_err = None
                     break
 
@@ -591,6 +647,7 @@ class RFPulseController(QObject):
                     last_err = e
                     self.status_message.emit("RFPulse", f"[시도 {attempt}/{self._max_retries}] 실패: {e}")
                     try:
+                        self._stop_power_polling()
                         self._rf_off()
                     except Exception:
                         pass
@@ -609,31 +666,50 @@ class RFPulseController(QObject):
         except Exception as final_e:
             try:
                 self._rf_off()
-            finally:
-                self.power_off_finished.emit()
+            except Exception as off_e:
+                self.status_message.emit("RFPulse", f"[RF OFF during failure] 실패: {off_e}")
+            # ❌ 더 이상 power_off_finished.emit() 하지 않음
             self.target_failed.emit(str(final_e))
-        finally:
-            self._wd_resume()
 
     def is_connected(self) -> bool:
         return bool(self.port and self.port.isOpen())
-
+    
     @Slot()
     def stop_process(self, also_turn_pulsing_off: bool = True):
+        # ✅ 정지 중에도 재연결/재시도가 돌 수 있게 설정
+        self._stop_power_polling()
         self._stop_requested = True
-        self._want_connected = False
+        self._want_connected = True          # ← was False (삭제)
         self._reconnect_pending = False
-        try:
-            self._wd_pause()
-            if not self.is_connected():
-                try: self._open_port()
-                except Exception: pass
+        self._wd_resume()                    # ← was _wd_pause() (반대로)
+
+        last_err = None
+        for attempt in range(1, self._max_retries + 1):
             try:
+                # 포트가 닫혀 있으면 정상 루틴처럼 연결 시도
+                if not self.is_connected():
+                    if not self.connect_rfpulse_device():
+                        raise RuntimeError(f"포트 '{self._default_port}' 연결 실패")
+
+                # ⬇ force=True → stop 상태여도 I/O 허용(allow_when_stopping)
                 self._rf_off(force=True)
-            except Exception:
-                pass
-        finally:
-            self.power_off_finished.emit()
+
+                # 성공시에만 완료 신호
+                self.power_off_finished.emit()
+                return
+
+            except Exception as e:
+                last_err = e
+                self.status_message.emit("RFPulse",
+                    f"[RF OFF(stop)] 시도 {attempt}/{self._max_retries} 실패: {e}")
+
+                # 정상 루틴과 동일하게 워치독 트리거 + 백오프 대기 후 재시도
+                self._watch_connection()
+                self._delay_ms(self._reconnect_backoff_ms)
+                continue
+
+        # 모든 시도 실패 → 실패 알림(컨트롤러가 실패 처리)
+        self.target_failed.emit(str(last_err))
 
     @Slot()
     def cleanup(self):

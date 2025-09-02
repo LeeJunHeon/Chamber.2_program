@@ -96,6 +96,9 @@ class MainWindow(QWidget):
         # === 3. 감독관 ===
         self.process_controller = ProcessController()
 
+        # Google Chat 알림
+        self.chat_notifier = ChatNotifier(GOOGLE_CHAT_WEBHOOK) if ENABLE_CHAT_NOTIFY else None
+
         # === 4. 신호-슬롯 ===
         self._connect_signals()
 
@@ -114,9 +117,6 @@ class MainWindow(QWidget):
         # === 종료 처리 훅 ===
         self._about_quit_called = False
         self._emergency_done = False
-
-        # Google Chat 알림
-        self.notifier = ChatNotifier(GOOGLE_CHAT_WEBHOOK) if ENABLE_CHAT_NOTIFY else None
 
         app = QCoreApplication.instance()
         if app is not None:
@@ -449,45 +449,51 @@ class MainWindow(QWidget):
         self._on_process_status_changed(False)
 
         # === Google Chat 알림 ===
-        if self.notifier:
-            # 공정 종료(성공/실패)
-            self.process_controller.process_finished.connect(
-                self.notifier.notify_process_finished
+        if self.chat_notifier is not None:
+            # 공정 시작/종료
+            self.process_controller.process_started.connect(
+                self.chat_notifier.notify_process_started,
+                type=Qt.ConnectionType.QueuedConnection
             )
+            self.process_controller.process_finished.connect(
+                self.chat_notifier.notify_process_finished,
+                type=Qt.ConnectionType.QueuedConnection
+            )
+            # 중단 통지
             self.process_controller.process_aborted.connect(
-                lambda: self.notifier.notify_text("⛔ 공정 강제 중단")
+                lambda: self.chat_notifier.notify_text("🛑 공정이 중단되었습니다."),
+                type=Qt.ConnectionType.QueuedConnection
             )
 
-            # 장비 단위 실패들 (이미 process_controller에도 연결되어 있음)
+            # 장비/단계 오류 알림
             self.rf_power_controller.target_failed.connect(
-                lambda why: self.notifier.notify_error_with_src("RF Power", why)
+                lambda why: self.chat_notifier.notify_error_with_src("RF Power", why),
+                type=Qt.ConnectionType.QueuedConnection
             )
             self.rf_pulse_controller.target_failed.connect(
-                lambda why: self.notifier.notify_error_with_src("RF Pulse", why)
+                lambda why: self.chat_notifier.notify_error_with_src("RF Pulse", why),
+                type=Qt.ConnectionType.QueuedConnection
             )
-            self.oes_controller.oes_failed.connect(
-                lambda why: self.notifier.notify_error_with_src("OES", why)
-            )
-            self.rga_controller.scan_failed.connect(
-                lambda why: self.notifier.notify_error_with_src("RGA", why)
-            )
-            self.ig_controller.base_pressure_failed.connect(
-                lambda why: self.notifier.notify_error_with_src("IG", why)
-            )
-            # MFC/Faduino 실패 시그널 시그니처가 (cmd, why) 식일 수 있으니 *args 처리
             self.mfc_controller.command_failed.connect(
-                lambda *args: self.notifier.notify_error_with_src("MFC", " ".join(map(str, args)))
+                lambda why: self.chat_notifier.notify_error_with_src("MFC", why),
+                type=Qt.ConnectionType.QueuedConnection
             )
             self.faduino_controller.command_failed.connect(
-                lambda *args: self.notifier.notify_error_with_src("Faduino", " ".join(map(str, args)))
+                lambda why: self.chat_notifier.notify_error_with_src("Faduino", why),
+                type=Qt.ConnectionType.QueuedConnection
             )
-
-            # 공정 시작 알림
-            self.process_controller.process_started.connect(
-                lambda params: self.notifier.notify_text(
-                    f"▶ 공정 시작: {params.get('process_note','') or params.get('Process_name','')}"
-                )
-            ) 
+            self.ig_controller.base_pressure_failed.connect(
+                self.chat_notifier.notify_error,  # reason만 옴
+                type=Qt.ConnectionType.QueuedConnection
+            )
+            self.oes_controller.oes_failed.connect(
+                self.chat_notifier.notify_error,  # reason만 옴
+                type=Qt.ConnectionType.QueuedConnection
+            )
+            self.rga_controller.scan_failed.connect(
+                self.chat_notifier.notify_error,  # reason만 옴
+                type=Qt.ConnectionType.QueuedConnection
+            )
 
     # --- 표시용 슬롯 ---
     @Slot(float, float)

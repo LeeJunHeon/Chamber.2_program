@@ -175,6 +175,11 @@ class RFPulseController(QObject):
         # ❌ 여기서 절대 close() 하지 않음. 워치독에게 맡기기.
         self._port_had_error = True
         self._need_reopen = True           # 다음 재연결 시 안전하게 닫고 다시 열도록 표시
+
+        # ⬇️ 추가: 종료/정지 중이면 재연결 로직 건너뜀
+        if self._stop_requested:
+            return
+
         self._ensure_timers_created()
         self._want_connected = True
         if not self._watchdog.isActive():
@@ -526,9 +531,6 @@ class RFPulseController(QObject):
         # 다른 명령 I/O 중이면 이번 틱은 건너뛴다
         if self._io_inflight or self._stop_requested:
             return
-        if not self.is_connected():
-            self._watch_connection()
-            return
     
         if not self.is_connected():
             self._watch_connection()
@@ -679,47 +681,53 @@ class RFPulseController(QObject):
         # ✅ 정지 중에도 재연결/재시도가 돌 수 있게 설정
         self._stop_power_polling()
         self._stop_requested = True
-        self._want_connected = True          # ← was False (삭제)
+        self._want_connected = False    # ★ 재연결 금지      
         self._reconnect_pending = False
-        self._wd_resume()                    # ← was _wd_pause() (반대로)
+        self._wd_pause()                # ★ 워치독 중지
 
-        last_err = None
-        for attempt in range(1, self._max_retries + 1):
-            try:
-                # 포트가 닫혀 있으면 정상 루틴처럼 연결 시도
-                if not self.is_connected():
-                    if not self.connect_rfpulse_device():
-                        raise RuntimeError(f"포트 '{self._default_port}' 연결 실패")
+        # 베스트-에포트로만 OFF 시도, 연결 안돼 있으면 재연결하지 않음
+        try:
+            if self.is_connected():
+                if also_turn_pulsing_off:
+                    try:
+                        self._set_pulsing(0, force=True)
+                    except Exception:
+                        pass
+                try:
+                    self._rf_off(force=True)
+                except Exception:
+                    pass
 
-                # ⬇ force=True → stop 상태여도 I/O 허용(allow_when_stopping)
-                self._rf_off(force=True)
-
-                # 성공시에만 완료 신호
-                self.power_off_finished.emit()
-                return
-
-            except Exception as e:
-                last_err = e
-                self.status_message.emit("RFPulse",
-                    f"[RF OFF(stop)] 시도 {attempt}/{self._max_retries} 실패: {e}")
-
-                # 정상 루틴과 동일하게 워치독 트리거 + 백오프 대기 후 재시도
-                self._watch_connection()
-                self._delay_ms(self._reconnect_backoff_ms)
-                continue
-
-        # 모든 시도 실패 → 실패 알림(컨트롤러가 실패 처리)
-        self.target_failed.emit(str(last_err))
+            # 바로 다음 단계로 진행시켜 종료 시퀀스 막힘 방지
+            self.power_off_finished.emit()
+        except Exception as e:
+            self.target_failed.emit(str(e))
 
     @Slot()
     def cleanup(self):
-        """워커 스레드에서 안전 종료: stop → close"""
+        """워커 스레드에서 안전 종료: stop → close (재연결 금지, 빠른 반환)"""
+        self._stop_requested = True
+        self._want_connected = False
+        self._wd_pause()
+        self._stop_power_polling()
+
         try:
-            self.stop_process()
+            if self.is_connected():
+                try:
+                    self._set_pulsing(0, force=True)
+                except Exception:
+                    pass
+                try:
+                    self._rf_off(force=True)
+                except Exception:
+                    pass
         except Exception:
             pass
+
+        # 포트는 조용히 닫기
         try:
             self.close_port()
         except Exception:
             pass
-        # 타이머/포트 deleteLater는 여기선 불필요(컨트롤러 생명주기와 함께 파괴됨)
+        # deleteLater 불필요: 객체 수명 주기 종료 시 파괴
+

@@ -757,6 +757,46 @@
    </property>
   </widget>
  </widget>
+ <tabstops>
+  <tabstop>Base_pressure_edit</tabstop>
+  <tabstop>Intergration_time_edit</tabstop>
+  <tabstop>Main_shutter_checkbox</tabstop>
+  <tabstop>Power_select_checkbox</tabstop>
+  <tabstop>G1_checkbox</tabstop>
+  <tabstop>G2_checkbox</tabstop>
+  <tabstop>G3_checkbox</tabstop>
+  <tabstop>G1_target_name</tabstop>
+  <tabstop>G2_target_name</tabstop>
+  <tabstop>G3_target_name</tabstop>
+  <tabstop>Ar_checkbox</tabstop>
+  <tabstop>O2_checkbox</tabstop>
+  <tabstop>N2_checkbox</tabstop>
+  <tabstop>Ar_flow_edit</tabstop>
+  <tabstop>O2_flow_edit</tabstop>
+  <tabstop>N2_flow_edit</tabstop>
+  <tabstop>Working_pressure_edit</tabstop>
+  <tabstop>RF_pulse_checkbox</tabstop>
+  <tabstop>RF_pulse_edit</tabstop>
+  <tabstop>Rf_pulse_freq_edit</tabstop>
+  <tabstop>Rf_pulse_duty_cycle_edit</tabstop>
+  <tabstop>RF_power_checkbox</tabstop>
+  <tabstop>RF_power_edit</tabstop>
+  <tabstop>DC_power_checkbox</tabstop>
+  <tabstop>DC_power_edit</tabstop>
+  <tabstop>Shutter_delay_edit</tabstop>
+  <tabstop>Process_time_edit</tabstop>
+  <tabstop>For_p_edit</tabstop>
+  <tabstop>Ref_p_edit</tabstop>
+  <tabstop>Power_edit</tabstop>
+  <tabstop>Voltage_edit</tabstop>
+  <tabstop>Current_edit</tabstop>
+  <tabstop>Process_list_button</tabstop>
+  <tabstop>Start_button</tabstop>
+  <tabstop>Stop_button</tabstop>
+  <tabstop>process_state</tabstop>
+  <tabstop>note_edit</tabstop>
+  <tabstop>log_message</tabstop>
+ </tabstops>
  <resources/>
  <connections/>
 </ui>

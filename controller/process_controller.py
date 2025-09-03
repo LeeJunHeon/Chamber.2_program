@@ -319,8 +319,8 @@ class ProcessController(QObject):
         if use_rf_pulse:
             steps.append(ProcessStep(
                     action=ActionType.DELAY,
-                    duration=60_000,
-                    message=f'Power Delay 60초'
+                    duration=20_000,
+                    message=f'Power Delay 20초'
                 ))
 
         steps.append(ProcessStep(

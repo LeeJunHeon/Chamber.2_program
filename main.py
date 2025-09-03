@@ -34,6 +34,8 @@ class MainWindow(QWidget):
     request_ig_cleanup      = Signal()
     request_oes_cleanup     = Signal()
     request_rfpulse_cleanup = Signal()  # ← 추가: RF Pulse 정리 요청
+    mfc_polling_request = Signal(bool)
+    faduino_polling_request = Signal(bool)
 
     stop_all = Signal() # 모든 장치 하드스톱
 
@@ -41,6 +43,23 @@ class MainWindow(QWidget):
         super().__init__()
         self.ui = Ui_Form()
         self.ui.setupUi(self)
+
+        single_line_edits = [
+            self.ui.Base_pressure_edit,
+            self.ui.Intergration_time_edit,
+            self.ui.G1_target_name, self.ui.G2_target_name, self.ui.G3_target_name,
+            self.ui.Ar_flow_edit, self.ui.O2_flow_edit, self.ui.N2_flow_edit,
+            self.ui.Working_pressure_edit,
+            self.ui.RF_power_edit, self.ui.DC_power_edit,
+            self.ui.Shutter_delay_edit, self.ui.Process_time_edit,
+            self.ui.For_p_edit, self.ui.Ref_p_edit,
+            self.ui.Power_edit, self.ui.Voltage_edit, self.ui.Current_edit,
+            self.ui.RF_pulse_edit, self.ui.Rf_pulse_freq_edit, self.ui.Rf_pulse_duty_cycle_edit,
+        ]
+
+        for w in single_line_edits:
+            w.setTabChangesFocus(True)
+
         self._set_default_ui_values()
         self.process_queue = []
         self.current_process_index = -1
@@ -447,6 +466,16 @@ class MainWindow(QWidget):
         self.ui.Process_list_button.clicked.connect(self.on_process_list_button_clicked)
         self.process_controller.process_status_changed.connect(self._on_process_status_changed)
         self._on_process_status_changed(False)
+
+        # === 폴링 요청 ===
+        self.mfc_polling_request.connect(
+            self.mfc_controller.set_process_status,
+            type=Qt.ConnectionType.QueuedConnection
+        )
+        self.faduino_polling_request.connect(
+            self.faduino_controller.set_process_status,
+            type=Qt.ConnectionType.QueuedConnection
+        )
 
         # === Google Chat 알림 ===
         if self.chat_notifier is not None:
@@ -932,8 +961,8 @@ class MainWindow(QWidget):
         targets 예시: {'mfc': True/False, 'faduino': True/False, 'rfpulse': True/False}
         - RFPulse는 장치 내부에서 자체 폴링을 켜/끄기 때문에 여기서 건드리지 않음
         """
-        self.mfc_controller.set_process_status(bool(targets.get('mfc', False)))
-        self.faduino_controller.set_process_status(bool(targets.get('faduino', False)))
+        self.mfc_polling_request.emit(bool(targets.get('mfc', False)))
+        self.faduino_polling_request.emit(bool(targets.get('faduino', False)))
         # RF-Pulse: 자체 폴링 (start_pulse_process에서 시작, rf_off에서 정지)
         # 필요하면 targets['rfpulse']로 로거/표시 플래그만 활용
 

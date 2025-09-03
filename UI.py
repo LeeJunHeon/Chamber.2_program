@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 ################################################################################
-## Form generated from reading UI file 'CH2mQZNFm.ui'
+## Form generated from reading UI file 'CH2fiygYb.ui'
 ##
 ## Created by: Qt User Interface Compiler version 6.9.1
 ##
@@ -219,6 +219,43 @@ class Ui_Form(object):
         self.Power_select_checkbox = QCheckBox(Form)
         self.Power_select_checkbox.setObjectName(u"Power_select_checkbox")
         self.Power_select_checkbox.setGeometry(QRect(130, 170, 101, 24))
+        QWidget.setTabOrder(self.Base_pressure_edit, self.Intergration_time_edit)
+        QWidget.setTabOrder(self.Intergration_time_edit, self.Main_shutter_checkbox)
+        QWidget.setTabOrder(self.Main_shutter_checkbox, self.Power_select_checkbox)
+        QWidget.setTabOrder(self.Power_select_checkbox, self.G1_checkbox)
+        QWidget.setTabOrder(self.G1_checkbox, self.G2_checkbox)
+        QWidget.setTabOrder(self.G2_checkbox, self.G3_checkbox)
+        QWidget.setTabOrder(self.G3_checkbox, self.G1_target_name)
+        QWidget.setTabOrder(self.G1_target_name, self.G2_target_name)
+        QWidget.setTabOrder(self.G2_target_name, self.G3_target_name)
+        QWidget.setTabOrder(self.G3_target_name, self.Ar_checkbox)
+        QWidget.setTabOrder(self.Ar_checkbox, self.O2_checkbox)
+        QWidget.setTabOrder(self.O2_checkbox, self.N2_checkbox)
+        QWidget.setTabOrder(self.N2_checkbox, self.Ar_flow_edit)
+        QWidget.setTabOrder(self.Ar_flow_edit, self.O2_flow_edit)
+        QWidget.setTabOrder(self.O2_flow_edit, self.N2_flow_edit)
+        QWidget.setTabOrder(self.N2_flow_edit, self.Working_pressure_edit)
+        QWidget.setTabOrder(self.Working_pressure_edit, self.RF_pulse_checkbox)
+        QWidget.setTabOrder(self.RF_pulse_checkbox, self.RF_pulse_edit)
+        QWidget.setTabOrder(self.RF_pulse_edit, self.Rf_pulse_freq_edit)
+        QWidget.setTabOrder(self.Rf_pulse_freq_edit, self.Rf_pulse_duty_cycle_edit)
+        QWidget.setTabOrder(self.Rf_pulse_duty_cycle_edit, self.RF_power_checkbox)
+        QWidget.setTabOrder(self.RF_power_checkbox, self.RF_power_edit)
+        QWidget.setTabOrder(self.RF_power_edit, self.DC_power_checkbox)
+        QWidget.setTabOrder(self.DC_power_checkbox, self.DC_power_edit)
+        QWidget.setTabOrder(self.DC_power_edit, self.Shutter_delay_edit)
+        QWidget.setTabOrder(self.Shutter_delay_edit, self.Process_time_edit)
+        QWidget.setTabOrder(self.Process_time_edit, self.For_p_edit)
+        QWidget.setTabOrder(self.For_p_edit, self.Ref_p_edit)
+        QWidget.setTabOrder(self.Ref_p_edit, self.Power_edit)
+        QWidget.setTabOrder(self.Power_edit, self.Voltage_edit)
+        QWidget.setTabOrder(self.Voltage_edit, self.Current_edit)
+        QWidget.setTabOrder(self.Current_edit, self.Process_list_button)
+        QWidget.setTabOrder(self.Process_list_button, self.Start_button)
+        QWidget.setTabOrder(self.Start_button, self.Stop_button)
+        QWidget.setTabOrder(self.Stop_button, self.process_state)
+        QWidget.setTabOrder(self.process_state, self.note_edit)
+        QWidget.setTabOrder(self.note_edit, self.log_message)
 
         self.retranslateUi(Form)
 

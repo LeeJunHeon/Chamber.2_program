@@ -223,13 +223,22 @@ class RFPulseController(QObject):
             self.status_message.emit("RFPulse", f"{self._default_port} 연결 실패: {self.port.errorString()}")
             return False
         
+        try:
+            self.port.setDataTerminalReady(True)   # 어댑터 깨우기: DTR HIGH
+        except Exception:
+            pass
+        try:
+            self.port.setRequestToSend(True)       # 어댑터 깨우기: RTS HIGH (기존 False → True)
+        except Exception:
+            pass
+        try:
+            # 오픈 직후 한 번만 전체 클리어(잔여 바이트 제거)
+            from PyQt6.QtSerialPort import QSerialPort as _QSP
+            self.port.clear(_QSP.Direction.AllDirections)
+        except Exception:
+            pass
+        
         self._port_had_error = False
-
-        try: self.port.setDataTerminalReady(True)
-        except Exception: pass
-        try: self.port.setRequestToSend(False)
-        except Exception: pass
-
         self._configured_port = self._default_port
         self._reconnect_backoff_ms = RFPULSE_RECONNECT_BACKOFF_START_MS
         self._reconnect_pending = False
@@ -296,6 +305,8 @@ class RFPulseController(QObject):
     def _delay_ms(self, ms: int):
         t = QElapsedTimer(); t.start()
         while t.elapsed() < ms:
+            if self._stop_requested:
+                break
             QCoreApplication.processEvents()
 
     def _read_bytes(self, need: int, deadline_ms: int) -> Optional[bytes]:
@@ -385,6 +396,8 @@ class RFPulseController(QObject):
         if self._stop_requested and not force:
             raise RuntimeError("Stop requested (skip I/O)")
         if not self.is_connected():
+            if force:
+                return
             raise RuntimeError("Port not open")
 
         pkt = _build_packet(self.addr, cmd, data)
@@ -397,7 +410,15 @@ class RFPulseController(QObject):
 
             self._io_inflight = True
             try:
-                # ❌ clear(AllDirections) 제거 — I/O abort 방지
+                try:
+                    # Qt6: 입력만 비우기 (출력은 비우지 말 것!)
+                    from PyQt6.QtSerialPort import QSerialPort as _QSP
+                    self.port.clear(_QSP.Direction.Input)
+                except Exception:
+                    # fallback: 남은 바이트 다 빼내기
+                    while self.port.bytesAvailable():
+                        self.port.readAll()
+
                 self.port.write(pkt)
                 self.port.waitForBytesWritten(timeout_ms)
                 kind, _ = self._recv_frame(
@@ -410,6 +431,8 @@ class RFPulseController(QObject):
                 raise TimeoutError("Expected ACK/FRAME not received")
 
             except Exception as e:
+                if self._stop_requested and not force:
+                    raise RuntimeError("Stop requested") from e
                 # 실패 → 워치독 재연결 예약 후 백오프만큼 기다렸다가 동일 명령 재시도
                 self._need_reopen = True         # 다음 재연결에서 안전 재오픈
                 self._watch_connection()         # 워치독 트리거
@@ -441,7 +464,15 @@ class RFPulseController(QObject):
 
             self._io_inflight = True
             try:
-                # ❌ clear(AllDirections) 제거
+                try:
+                    # Qt6: 입력만 비우기 (출력은 비우지 말 것!)
+                    from PyQt6.QtSerialPort import QSerialPort as _QSP
+                    self.port.clear(_QSP.Direction.Input)
+                except Exception:
+                    # fallback: 남은 바이트 다 빼내기
+                    while self.port.bytesAvailable():
+                        self.port.readAll()
+
                 self.port.write(pkt)
                 self.port.waitForBytesWritten(timeout_ms)
                 kind, payload = self._recv_frame(timeout_ms=timeout_ms, allow_ack_only=False)
@@ -461,6 +492,8 @@ class RFPulseController(QObject):
                 return data_bytes
 
             except Exception as e:
+                if self._stop_requested:   # ★ 추가
+                    raise RuntimeError("Stop requested") from e
                 self._need_reopen = True
                 self._watch_connection()
                 self._delay_ms(self._reconnect_backoff_ms)

@@ -3,7 +3,14 @@ import os
 from pathlib import Path
 
 # === Google Chat 알림 ===
-CHAT_WEBHOOK_URL = os.environ.get("CHAT_WEBHOOK_URL", None)
+def _get_local(name, default=None):
+    try:
+        from . import config_local as _cl  # 없으면 ImportError
+        return getattr(_cl, name, default)
+    except Exception:
+        return default
+    
+CHAT_WEBHOOK_URL = os.environ.get("CHAT_WEBHOOK_URL") or _get_local("CHAT_WEBHOOK_URL") or None
 ENABLE_CHAT_NOTIFY  = True  # 끄고 싶을 때 False
 
 # === 디버그 프린트 여부 ===

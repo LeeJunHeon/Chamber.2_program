@@ -857,11 +857,6 @@ class MainWindow(QWidget):
             self.current_process_index = -1
             self._start_next_process_from_queue(True)
             return  # ← 중요: 아래 단일 실행 코드로 낙하 방지
-        
-        # ★ 단일 실행: 여기서만 장비 체크
-        if not self._check_and_connect_devices():
-            QMessageBox.critical(self, "장비 연결 오류", "필수 장비 연결에 실패했습니다. 로그를 확인하세요.")
-            return
 
         try:
             base_pressure = float(self.ui.Base_pressure_edit.toPlainText() or 1e-5)
@@ -875,6 +870,11 @@ class MainWindow(QWidget):
 
         vals = self._validate_single_run_inputs()
         if vals is None:
+            return
+        
+        # ★ 단일 실행: 여기서만 장비 체크
+        if not self._check_and_connect_devices():
+            QMessageBox.critical(self, "장비 연결 오류", "필수 장비 연결에 실패했습니다. 로그를 확인하세요.")
             return
 
         params = {

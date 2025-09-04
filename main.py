@@ -484,8 +484,9 @@ class MainWindow(QWidget):
                 self.chat_notifier.notify_process_started,
                 type=Qt.ConnectionType.QueuedConnection
             )
-            self.process_controller.process_finished.connect(
-                self.chat_notifier.notify_process_finished,
+            # (변경) 종료 알림: 상세 신호에 연결
+            self.process_controller.process_finished_detail.connect(
+                self.chat_notifier.notify_process_finished_detail,
                 type=Qt.ConnectionType.QueuedConnection
             )
             # 중단 통지

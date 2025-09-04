@@ -86,6 +86,7 @@ class ProcessController(QObject):
     process_status_changed = Signal(bool)
     process_started = Signal(dict)
     process_finished = Signal(bool)
+    process_finished_detail = Signal(bool, dict)   # ★ 추가: (ok, detail)
     update_process_state = Signal(str)
 
     # 3) 폴링 제어
@@ -806,6 +807,18 @@ class ProcessController(QObject):
         self._apply_polling(False)
         self._shutdown_in_progress = False   # ✅ 해제
         self._stop_requested = False  # ✅ 플래그 리셋
+
+        # --- 여기서 종료 컨텍스트 캡처(리셋되기 전에) ---
+        finish_ctx = {
+            "process_name": self.current_params.get("process_note", self.current_params.get("Process_name", "무제")),
+            "stopped": self._stop_requested,
+            "aborting": (self._aborting or self._in_emergency),
+            "errors": list(self._shutdown_failures),
+        }
+        try:
+            self.process_finished_detail.emit(success, finish_ctx)  # ★ 상세 신호 먼저
+        except Exception:
+            pass
 
         if success:
             self.log_message.emit("Process", "=== 공정이 성공적으로 완료되었습니다 ===")

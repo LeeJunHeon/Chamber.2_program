@@ -10,7 +10,8 @@ class ChatNotifier(QObject):
     변경점:
     - 전송 지연 모드(기본 on): 공정 중 발생하는 모든 알림을 버퍼에 쌓고,
       공정이 완전히 끝난 뒤(process_finished) 한 번에 전송하여 UI 멈춤을 방지.
-    - 공정 시작 알림은 반드시 즉시 전송(urgent=True).
+    - 공정 '시작' 알림은 반드시 즉시 전송(urgent=True), 이전 버퍼/상태 초기화.
+    - 종료 알림은 정상/사용자중지/오류 종료를 구분해 표시.
     - 네트워크 오류는 삼켜서 UI를 멈추지 않음.
     """
 
@@ -22,7 +23,12 @@ class ChatNotifier(QObject):
         # === 전송 지연 모드/버퍼 ===
         self._defer: bool = True           # 공정 중엔 전송하지 않고 모아두기 (기본 True)
         self._buffer: List[dict] = []      # 전송 대기 payload들
-        self._last_started_params: Optional[dict] = None  # (선택) 시작 정보 보관
+
+        # === 상태 기억 ===
+        self._last_started_params: Optional[dict] = None
+        self._stop_pressed: bool = False
+        self._last_error_src: Optional[str] = None
+        self._last_error_reason: Optional[str] = None
 
     # ---------- 지연 전송 제어 ----------
     def set_defer(self, on: bool):
@@ -53,7 +59,7 @@ class ChatNotifier(QObject):
             with urllib.request.urlopen(req, timeout=3, context=self._ctx) as resp:
                 resp.read()
         except Exception:
-            # 로그를 남기고 싶다면 여기서 print나 별도 Signal로 전달
+            # 필요 시 여기서 로그 출력/Signal 처리 가능
             pass
 
     def _post_json(self, payload: dict, urgent: bool = False):
@@ -92,7 +98,10 @@ class ChatNotifier(QObject):
 
         # 3) keyValue(필드)
         if fields:
+            # dict의 삽입 순서가 유지되므로, 구성 순서대로 나옵니다.
             for k, v in fields.items():
+                if v is None or v == "":
+                    continue
                 widgets.append({
                     "decoratedText": {
                         "topLabel": str(k),
@@ -118,41 +127,152 @@ class ChatNotifier(QObject):
         }
         self._post_json(payload, urgent=urgent)
 
+    # ---------- 포맷 유틸 ----------
+    def _fmt_min(self, v) -> str:
+        try:
+            m = float(v)
+        except Exception:
+            return "-"
+        if m <= 0:
+            return "0 min"
+        sec = int(round(m * 60.0))
+        return f"{m:g} min ({sec}s)"
+
+    def _fmt_power(self, on: bool, watts) -> str:
+        if not on:
+            return "-"
+        try:
+            w = float(watts)
+        except Exception:
+            w = 0.0
+        return f"{w:g} W"
+
+    def _build_start_fields(self, params: dict) -> dict:
+        # 공정 이름
+        process_name = (params.get("process_note") or
+                        params.get("Process_name") or "-")
+
+        # 사용 Gun + 타겟
+        guns_used = []
+        per_gun = []
+        for g in ("G1", "G2", "G3"):
+            used = bool(params.get(f"use_{g.lower()}", False))
+            tgt = (params.get(f"{g} Target") or "").strip()
+            if used:
+                guns_used.append(g)
+                per_gun.append(f"{g}: {tgt or '-'}")
+        guns_field = ", ".join(guns_used) if guns_used else "-"
+
+        # 파워 (RF / RF Pulse / DC)
+        use_rf = bool(params.get("use_rf_power", False))
+        use_rfp = bool(params.get("use_rf_pulse", False))
+        use_dc = bool(params.get("use_dc_power", False))
+
+        rf_w = self._fmt_power(use_rf, params.get("rf_power", 0))
+        dc_w = self._fmt_power(use_dc, params.get("dc_power", 0))
+
+        # RF Pulse는 (W, 선택적으로 f, duty)
+        if use_rfp:
+            try:
+                pw = float(params.get("rf_pulse_power", 0))
+            except Exception:
+                pw = 0.0
+            freq = params.get("rf_pulse_freq", None)
+            duty = params.get("rf_pulse_duty", None)
+            parts = [f"{pw:g} W"]
+            if freq is not None:
+                parts.append(f"{int(freq)} Hz")
+            if duty is not None:
+                parts.append(f"{int(duty)} %")
+            rfp_txt = ", ".join(parts)
+        else:
+            rfp_txt = "-"
+
+        # Shutter Delay / Process Time (분)
+        shutter_delay_min = params.get("shutter_delay", 0)
+        process_time_min  = params.get("process_time", 0)
+
+        fields = {}
+        fields["공정 이름"]   = process_name
+        fields["사용 Gun"]   = guns_field
+        if per_gun:
+            fields["타겟"]       = " / ".join(per_gun)  # G1: Ti / G2: ... 형태
+        fields["RF Power"]  = rf_w
+        fields["RF Pulse"]  = rfp_txt
+        fields["DC Power"]  = dc_w
+        fields["Shutter Delay"] = self._fmt_min(shutter_delay_min)
+        fields["Process Time"]  = self._fmt_min(process_time_min)
+        return fields
+
     # ========== 슬롯들 ==========
     @Slot(dict)
     def notify_process_started(self, params: dict):
         """
         공정 시작 알림: 시작 알림은 즉시 전송(urgent=True).
-        이전 실행에서 남았을 수 있는 버퍼는 정리.
+        이전 실행에서 남았을 수 있는 버퍼/상태는 초기화.
         """
+        # 상태 초기화
         self._last_started_params = dict(params) if params else None
+        self._stop_pressed = False
+        self._last_error_src = None
+        self._last_error_reason = None
+
         # 이전 공정의 잔여 버퍼 제거(보수적으로)
         if self._buffer:
             self._buffer.clear()
 
-        note = params.get("process_note", "") or params.get("Process_name", "")
+        # 카드 전송
+        fields = self._build_start_fields(self._last_started_params or {})
+        subtitle = fields.pop("공정 이름", "")
         self._post_card(
             "공정 시작",
-            note,
+            subtitle,
             "INFO",
-            fields={
-                "Targets": f"{params.get('G1 Target','')}, {params.get('G2 Target','')}, {params.get('G3 Target','')}".strip(", "),
-                "RF": f"{params.get('rf_power',0)} W" if params.get("use_rf_power") else "-",
-                "RF Pulse": f"{params.get('rf_pulse_power',0)} W" if params.get("use_rf_pulse") else "-",
-                "DC": f"{params.get('dc_power',0)} W" if params.get("use_dc_power") else "-",
-                "Time": f"{params.get('process_time',0)} s"
-            },
+            fields=fields,
             urgent=True  # ★ 시작은 즉시 전송
         )
 
     @Slot(bool)
     def notify_process_finished(self, ok: bool):
         """
-        공정 종료 알림: 종료 카드 생성 후 버퍼를 한 번에 전송(flush).
+        공정 종료 알림: 정상/중지/오류를 구분해서 카드 생성 후,
+        버퍼를 한 번에 전송(flush).
         """
-        self._post_card("공정 종료", "성공" if ok else "실패",
-                        "SUCCESS" if ok else "FAIL")
+        if ok:
+            subtitle = "정상 종료"
+            status = "SUCCESS"
+            fields = None
+        else:
+            # 우선순위: 오류 기록 > stop 눌림 > 일반 중단
+            if self._last_error_reason:
+                src = f"[{self._last_error_src}] " if self._last_error_src else ""
+                subtitle = "오류로 종료"
+                status = "FAIL"
+                fields = {"사유": f"{src}{self._last_error_reason}"}
+            elif self._stop_pressed:
+                subtitle = "사용자 중지"
+                status = "INFO"
+                fields = None
+            else:
+                subtitle = "중단됨"
+                status = "INFO"
+                fields = None
+
+        self._post_card("공정 종료", subtitle, status, fields=fields, urgent=False)
         self.flush()
+
+        # 종료 후 상태 리셋(다음 공정을 위해)
+        self._last_error_src = None
+        self._last_error_reason = None
+        self._stop_pressed = False
+
+    @Slot()
+    def notify_stop_pressed(self):
+        """
+        사용자가 Stop 버튼을 눌렀음을 기록.
+        연결하면 종료 시 '사용자 중지'로 표시됩니다.
+        """
+        self._stop_pressed = True
 
     @Slot(str)
     def notify_text(self, text: str):
@@ -161,10 +281,16 @@ class ChatNotifier(QObject):
 
     @Slot(str)
     def notify_error(self, reason: str):
-        # 오류도 공정 종료 후에 보내려면 urgent=False 유지
-        # 즉시 보내고 싶다면 urgent=True로 변경
-        self._post_card("장비 오류", reason, "FAIL", urgent=False)
+        """
+        장비/프로세스 오류를 기록하고(종료 카드에 반영),
+        메시지는 지연 모드면 버퍼에 쌓아 둔다.
+        """
+        self._last_error_src = None
+        self._last_error_reason = reason or "unknown error"
+        self._post_card("장비 오류", self._last_error_reason, "FAIL", urgent=False)
 
     @Slot(str, str)
     def notify_error_with_src(self, src: str, reason: str):
+        self._last_error_src = (src or "").strip() or None
+        self._last_error_reason = reason or "unknown error"
         self._post_card("장비 오류", f"[{src}] {reason}", "FAIL", urgent=False)

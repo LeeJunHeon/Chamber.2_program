@@ -19,6 +19,13 @@ RECV_FRAME_TIMEOUT_MS  = 4000   # _recv_frame 기본 타임아웃
 CMD_GAP_MS             = 1500   # 명령 간 최소 간격(밀리초)
 POST_WRITE_DELAY_MS    = 1500   # 각 쓰기 명령 후 여유 대기(밀리초)
 
+# ★ ACK 뒤 CSR 프레임을 잠깐 기다려서 소진하는 그레이스 윈도우
+ACK_FOLLOWUP_GRACE_MS  = 200    # 150~250ms 사이 권장
+
+# 폴링 전용
+POLL_INTERVAL_MS       = 3000   # 폴링 주기
+POLL_QUERY_TIMEOUT_MS  = 7000   # 폴링 시 쿼리 타임아웃(ACK 후 지연 데이터 프레임 대비)
+
 # 워치독/재연결(지수 백오프)
 RFPULSE_WATCHDOG_INTERVAL_MS        = 2000
 RFPULSE_RECONNECT_BACKOFF_START_MS  = 2000
@@ -139,6 +146,7 @@ class RFPulseController(QObject):
 
         # 폴링
         self._poll_timer: Optional[QTimer] = None
+        self._poll_busy: bool = False
         self._last_forward_w: Optional[float] = None
         self._last_reflected_w: Optional[float] = None
 
@@ -168,14 +176,14 @@ class RFPulseController(QObject):
     def _ensure_poll_timer_created(self):
         if self._poll_timer is None:
             self._poll_timer = QTimer(self)
-            self._poll_timer.setInterval(3000)          # 3초
+            self._poll_timer.setInterval(POLL_INTERVAL_MS)
             self._poll_timer.timeout.connect(self._enqueue_poll_cycle)
 
     def _start_power_polling(self):
         self._ensure_poll_timer_created()
         if not self._poll_timer.isActive():
             self._poll_timer.start()
-            self.status_message.emit("RFPulse", "FWD/REF polling started (3초)")
+            self.status_message.emit("RFPulse", f"FWD/REF polling started ({POLL_INTERVAL_MS//1000}초)")
 
     def _stop_power_polling(self):
         if self._poll_timer and self._poll_timer.isActive():
@@ -214,7 +222,7 @@ class RFPulseController(QObject):
         self._ensure_timers_created()
         self._want_connected = True
         self._need_reopen = True
-        if not self._watchdog.isActive():
+        if not self._watchdog or not self._watchdog.isActive():
             self._watchdog.start()
         QTimer.singleShot(0, self._watch_connection)
 
@@ -346,9 +354,18 @@ class RFPulseController(QObject):
             raise RuntimeError("Stopped or port closed")
 
         seen_ack = False
+        ack_grace_deadline = None  # ★ ACK를 본 후 더 기다릴 마감 시각
+
         t = QElapsedTimer(); t.start()
         while t.elapsed() < timeout_ms:
-            if not self.port.waitForReadyRead(max(1, timeout_ms - t.elapsed())):
+            remain = max(1, timeout_ms - t.elapsed())
+
+            # ★ ACK-only 모드에서 ACK는 봤지만 프레임이 아직 없고,
+            #    그레이스 시간이 끝났다면 이제 ACK_ONLY로 반환
+            if allow_ack_only and seen_ack and ack_grace_deadline is not None and t.elapsed() >= ack_grace_deadline:
+                return ("ACK_ONLY", None)
+
+            if not self.port.waitForReadyRead(remain):
                 continue
             b = bytes(self.port.read(1))
             if not b:
@@ -358,9 +375,11 @@ class RFPulseController(QObject):
                 raise RuntimeError("NAK(0x15) received")
             if b == b"\x06":
                 self.status_message.emit("RFPulse", "RX: ACK")
-                if allow_ack_only:
-                    return ("ACK_ONLY", None)
+                # ★ 예전엔 allow_ack_only이면 즉시 반환했지만,
+                #    이제는 CSR 프레임이 뒤따를 수 있으므로 짧게 더 기다린다.
                 seen_ack = True
+                if allow_ack_only and ack_grace_deadline is None:
+                    ack_grace_deadline = min(timeout_ms, t.elapsed() + ACK_FOLLOWUP_GRACE_MS)
                 continue
 
             hdr = b[0]
@@ -398,10 +417,50 @@ class RFPulseController(QObject):
                 continue
             return ("FRAME", pkt)
 
+        # ★ 전체 타임아웃 전에도 위에서 그레이스가 끝나면 반환됨
         if allow_ack_only and seen_ack:
             return ("ACK_ONLY", None)
+
         self.status_message.emit("RFPulse", "RX: timeout waiting frame")
         raise TimeoutError("No response header")
+
+    # 기대 cmd/주소 일치 프레임만 돌려주는 래퍼
+    def _recv_matching_frame(self, expected_cmd: int, timeout_ms: int) -> bytes:
+        t = QElapsedTimer(); t.start()
+        while t.elapsed() < timeout_ms:
+            remain = max(1, timeout_ms - t.elapsed())
+            try:
+                kind, payload = self._recv_frame(timeout_ms=remain, allow_ack_only=False)
+            except TimeoutError:
+                break
+            except Exception:
+                self._need_reopen = True
+                self._watch_connection()
+                break
+
+            if kind != "FRAME" or not payload:
+                continue
+
+            hdr = payload[0]
+            cmd_b = payload[1]
+            rx_addr = (hdr >> 3) & 0x1F
+            if rx_addr != self.addr:
+                # 다른 주소 → 무시
+                continue
+            if cmd_b != expected_cmd:
+                # 기대 cmd가 아님 → 계속
+                continue
+
+            length_bits = hdr & 0x07
+            idx = 2
+            if length_bits == 7:
+                dlen = payload[idx]; idx += 1
+            else:
+                dlen = length_bits
+            data_bytes = payload[idx:idx+dlen]
+            return bytes(data_bytes)
+
+        raise TimeoutError("No matching frame")
 
     # 안전 drain (clear 대신)
     def _drain_input_soft(self, max_bytes: int = 1024, budget_ms: int = 10):
@@ -467,12 +526,22 @@ class RFPulseController(QObject):
             self._tx_throttle()
             self._last_sent_at_ms = self._tx_epoch.elapsed()
 
-            # 충돌 방지: exec만 소프트 드레인
-            if cmd.kind == "exec":
-                self._drain_input_soft()
+            # 충돌 방지: exec/query 모두 직전에 소프트 드레인
+            self._drain_input_soft()
 
             pkt = _build_packet(self.addr, cmd.cmd, cmd.data)
             self.status_message.emit("RFPulse", f"TX {cmd.tag or ('exec' if cmd.kind=='exec' else 'query')} cmd=0x{cmd.cmd:02X} data={cmd.data.hex(' ')}")
+
+            # ★ 전송 직전 입력 버퍼 하드 클리어(가능 시)
+            try:
+                from PyQt6.QtSerialPort import QSerialPort as _QSP
+                self.port.clear(_QSP.Direction.Input)
+                # self.status_message.emit("RFPulse", "Input buffer cleared (hard)")
+            except Exception:
+                # 일부 환경에서 clear가 미동작하면 소프트 드레인으로 대체
+                self._drain_input_soft(max_bytes=4096, budget_ms=50)
+                # self.status_message.emit("RFPulse", "Input buffer drained (soft)")
+
             self.port.write(pkt)
             self.port.flush()
             self.port.waitForBytesWritten(cmd.timeout_ms)
@@ -489,22 +558,16 @@ class RFPulseController(QObject):
                         kind, _ = self._recv_frame(timeout_ms=cmd.timeout_ms, allow_ack_only=True)
                         ok = (kind in ("ACK_ONLY", "FRAME"))
                         result = b"\x06" if ok else None
+
+                        if ok and cmd.cmd == CMD_RF_ON:
+                            self.status_message.emit("RFPulse", "RF ON: ACK received → target_reached()")
+                            QTimer.singleShot(0, self.target_reached.emit)
                 else:
-                    kind, payload = self._recv_frame(timeout_ms=cmd.timeout_ms, allow_ack_only=False)
-                    if kind != "FRAME":
-                        raise TimeoutError("No data frame")
-                    p = payload
-                    hdr = p[0]
-                    length_bits = hdr & 0x07
-                    idx = 2
-                    if length_bits == 7:
-                        dlen = p[idx]; idx += 1
-                    else:
-                        dlen = length_bits
-                    data_bytes = p[idx:idx+dlen]
-                    self.status_message.emit("RFPulse", f"RX {cmd.tag or 'query'}: dlen={dlen} data={data_bytes.hex(' ')}")
+                    # ★ 기대 cmd/주소가 맞는 프레임만 수신
+                    data_bytes = self._recv_matching_frame(cmd.cmd, timeout_ms=cmd.timeout_ms)
+                    self.status_message.emit("RFPulse", f"RX {cmd.tag or 'query'}: dlen={len(data_bytes)} data={data_bytes.hex(' ')}")
                     ok = True
-                    result = bytes(data_bytes)
+                    result = data_bytes
             except TimeoutError:
                 ok = False
                 result = None
@@ -544,33 +607,48 @@ class RFPulseController(QObject):
     def _enqueue_poll_cycle(self):
         if self._closing or not self.is_connected():
             return
+        # 이전 사이클/인플라이트/큐가 남아 있으면 스킵(겹침 방지)
+        if self._poll_busy or self._inflight is not None or len(self._cmd_q) > 0:
+            return
 
+        self._poll_busy = True
         tmp: dict = {}
 
-        def on_fwd(b: Optional[bytes]):
-            if b is None:
-                self.status_message.emit("RFPulse", "[POLL] forward read timeout/fail")
-                return
-            fwd = float(_u16le(b, 0) if len(b) >= 2 else 0)
-            tmp['fwd'] = fwd
+        def _finish():
+            self._poll_busy = False
 
         def on_ref(b: Optional[bytes]):
             if b is None:
                 self.status_message.emit("RFPulse", "[POLL] reflected read timeout/fail")
-                return
-            ref = float(_u16le(b, 0) if len(b) >= 2 else 0)
-            tmp['ref'] = ref
-            # 두 값 모두 있으면 UI 업데이트
-            f = tmp.get('fwd', self._last_forward_w)
-            r = tmp.get('ref', self._last_reflected_w)
-            if f is not None and r is not None:
-                self._last_forward_w = f
-                self._last_reflected_w = r
-                self.update_rf_status_display.emit(f, r)
+            else:
+                ref = float(_u16le(b, 0) if len(b) >= 2 else 0)
+                tmp['ref'] = ref
+                f = tmp.get('fwd', self._last_forward_w)
+                r = tmp.get('ref', self._last_reflected_w)
+                if f is not None and r is not None:
+                    self._last_forward_w = f
+                    self._last_reflected_w = r
+                    self.update_rf_status_display.emit(f, r)
+            _finish()
 
-        # 순서 보장: FWD → REF
-        self.enqueue_query(CMD_REPORT_FORWARD, b"", tag="[POLL FWD]", callback=on_fwd)
-        self.enqueue_query(CMD_REPORT_REFLECTED, b"", tag="[POLL REF]", callback=on_ref)
+        def on_fwd(b: Optional[bytes]):
+            if b is None:
+                self.status_message.emit("RFPulse", "[POLL] forward read timeout/fail")
+            else:
+                fwd = float(_u16le(b, 0) if len(b) >= 2 else 0)
+                tmp['fwd'] = fwd
+            # REF 이어서
+            self.enqueue_query(CMD_REPORT_REFLECTED, b"", tag="[POLL REF]",
+                               timeout_ms=POLL_QUERY_TIMEOUT_MS, callback=on_ref)
+
+        def after_wake(_b: Optional[bytes]):
+            # WAKE 성공/실패와 무관하게 FWD 시도
+            self.enqueue_query(CMD_REPORT_FORWARD, b"", tag="[POLL FWD]",
+                               timeout_ms=POLL_QUERY_TIMEOUT_MS, callback=on_fwd)
+
+        # 1) STATUS로 깨우기(잔여 프레임/지연 응답 흡수용)
+        self.enqueue_query(CMD_REPORT_STATUS, b"", tag="[POLL WAKE]",
+                           timeout_ms=POLL_QUERY_TIMEOUT_MS, callback=after_wake)
 
     # ---------- (선택) 리드백(큐 버전) ----------
     def _read_forward_power_enq(self, cb: Callable[[Optional[int]], None]):
@@ -605,7 +683,6 @@ class RFPulseController(QObject):
                 return fail("RF ON 실패")
             # 안정화 후 폴링 시작
             QTimer.singleShot(300, lambda: self.set_process_status(True))
-            self.target_reached.emit()
 
         def step5_pulsing_on(_b: Optional[bytes]):
             if _b is None:
@@ -682,9 +759,16 @@ class RFPulseController(QObject):
         self.enqueue_exec(CMD_SET_PULSING, bytes([0]), tag="[SAFE PULSING 0]",
                           allow_no_reply=True, allow_when_closing=True,
                           timeout_ms=ACK_TIMEOUT_MS, callback=lambda _b: None)
+        
+        def _safe_off_cb(_b: Optional[bytes]):
+            # 시작 시퀀스의 ‘안전 초기화’에서는 완료 이벤트를 내보내지 않음.
+            # 진짜 정지(stop)나 종료(cleanup)일 때만 공정 쪽에 OFF 완료 신호를 전달.
+            if self._stop_requested or self._closing:
+                self.power_off_finished.emit()
+
         self.enqueue_exec(CMD_RF_OFF, b"", tag="[SAFE RF OFF]",
-                          allow_no_reply=True, allow_when_closing=True,
-                          timeout_ms=max(ACK_TIMEOUT_MS, 2500), callback=lambda _b: self.power_off_finished.emit())
+                        allow_no_reply=True, allow_when_closing=True,
+                        timeout_ms=max(ACK_TIMEOUT_MS, 2500), callback=_safe_off_cb)
 
     @Slot()
     def stop_process(self):
@@ -745,5 +829,8 @@ class RFPulseController(QObject):
                 self._last_forward_w = f
                 self._last_reflected_w = r
                 self.update_rf_status_display.emit(f, r)
-        self.enqueue_query(CMD_REPORT_FORWARD, b"", tag="[ONCE FWD]", callback=_f)
-        self.enqueue_query(CMD_REPORT_REFLECTED, b"", tag="[ONCE REF]", callback=_r)
+        # WAKE → FWD → REF
+        self.enqueue_query(CMD_REPORT_STATUS, b"", tag="[ONCE WAKE]", timeout_ms=POLL_QUERY_TIMEOUT_MS, callback=lambda _b:
+            self.enqueue_query(CMD_REPORT_FORWARD, b"", tag="[ONCE FWD]", timeout_ms=POLL_QUERY_TIMEOUT_MS, callback=_f)
+        )
+        self.enqueue_query(CMD_REPORT_REFLECTED, b"", tag="[ONCE REF]", timeout_ms=POLL_QUERY_TIMEOUT_MS, callback=_r)

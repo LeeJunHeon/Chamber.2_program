@@ -444,7 +444,7 @@ class ProcessController(QObject):
             self.process_status_changed.emit(True)
             self.process_started.emit(params)
 
-            process_name = params.get('process_note', '무제')
+            process_name = params.get('process_note', 'Untitled')
             self.log_message.emit("Process", f"=== '{process_name}' 공정 시작 (총 {len(self.process_sequence)}단계) ===")
 
             self.on_step_completed()  # 첫 스텝으로 진입
@@ -803,7 +803,7 @@ class ProcessController(QObject):
         
         # --- 여기서 종료 컨텍스트 캡처(리셋되기 전에) ---
         finish_ctx = {
-            "process_name": self.current_params.get("process_note", self.current_params.get("Process_name", "무제")),
+            "process_name": self.current_params.get("process_note", self.current_params.get("Process_name", "Untitled")),
             "stopped": self._stop_requested,
             "aborting": (self._aborting or self._in_emergency),
             "errors": list(self._shutdown_failures),
@@ -1028,7 +1028,7 @@ class ProcessController(QObject):
                 'message': self.current_step.message,
                 'parallel': self.current_step.parallel
             } if self.current_step else None),
-            'process_name': self.current_params.get('process_note', '무제'),
+            'process_name': self.current_params.get('process_note', 'Untitled'),
             'stop_requested': self._stop_requested,  # ✅ 정지 요청 상태 추가
             'aborting': self._aborting
         }

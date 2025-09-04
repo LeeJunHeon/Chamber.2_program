@@ -14,17 +14,20 @@ from lib.config import RFPULSE_PORT, RFPULSE_BAUD, RFPULSE_ADDR
 
 # ===== 타이밍/타임아웃 상수 =====
 ACK_TIMEOUT_MS         = 2000   # 쓰기(설정) 명령 후 ACK/프레임 대기 시간
-QUERY_TIMEOUT_MS       = 4500   # 읽기(리드백) 프레임 대기 시간
+QUERY_TIMEOUT_MS       = 4500   # 읽기(리드백) 명령 후 전체 대기 시간
 RECV_FRAME_TIMEOUT_MS  = 4000   # _recv_frame 기본 타임아웃
 CMD_GAP_MS             = 1500   # 명령 간 최소 간격(밀리초)
 POST_WRITE_DELAY_MS    = 1500   # 각 쓰기 명령 후 여유 대기(밀리초)
 
-# ★ ACK 뒤 CSR 프레임을 잠깐 기다려서 소진하는 그레이스 윈도우
-ACK_FOLLOWUP_GRACE_MS  = 200    # 150~250ms 사이 권장
+# ★ ACK 뒤 CSR/데이터 프레임을 잠깐 더 기다려서 흡수하는 그레이스 윈도우 (확대)
+ACK_FOLLOWUP_GRACE_MS  = 500    # 400~600ms 권장
 
 # 폴링 전용
 POLL_INTERVAL_MS       = 3000   # 폴링 주기
-POLL_QUERY_TIMEOUT_MS  = 7000   # 폴링 시 쿼리 타임아웃(ACK 후 지연 데이터 프레임 대비)
+POLL_QUERY_TIMEOUT_MS  = 9000   # 폴링 시 쿼리 타임아웃(ACK 후 지연 데이터 프레임 대비, 확대)
+
+# RF ON 직후 폴링 시작 지연(장비 안정화 대기)
+POLL_START_DELAY_AFTER_RF_ON_MS = 800
 
 # 워치독/재연결(지수 백오프)
 RFPULSE_WATCHDOG_INTERVAL_MS        = 2000
@@ -134,6 +137,7 @@ class RFPulseController(QObject):
         self._port_had_error = False
         self._closing = False
         self._stop_requested = False
+        self._need_reopen = False
 
         # 큐/인플라이트
         self._cmd_q: Deque[RfCommand] = deque()
@@ -195,14 +199,14 @@ class RFPulseController(QObject):
     def _on_port_error(self, err: QSerialPort.SerialPortError):
         if err == QSerialPort.SerialPortError.NoError:
             return
+        # ★ TimeoutError는 재시도/폴링 로직에서 처리 → 에러 로그/재연결 트리거하지 않음
+        if err == QSerialPort.SerialPortError.TimeoutError:
+            return
+
         es = self.port.errorString() if self.port else ""
         err_name  = getattr(err, "name", str(err))
         err_value = getattr(err, "value", None)
         self.status_message.emit("RFPulse", f"시리얼 오류: {es} (err={err_name}/{err_value})")
-
-        # Timeout은 재연결 트리거로 쓰지 않음
-        if err == QSerialPort.SerialPortError.TimeoutError:
-            return
 
         self._port_had_error = True
         if self._closing:
@@ -337,7 +341,8 @@ class RFPulseController(QObject):
         buf = bytearray()
         t = QElapsedTimer(); t.start()
         while t.elapsed() < deadline_ms:
-            if self.port.waitForReadyRead(max(1, deadline_ms - t.elapsed())):
+            wait_ms = max(1, deadline_ms - t.elapsed())
+            if self.port.waitForReadyRead(wait_ms):
                 chunk: bytes = self.port.read(need - len(buf))
                 if chunk:
                     buf.extend(chunk)
@@ -375,8 +380,7 @@ class RFPulseController(QObject):
                 raise RuntimeError("NAK(0x15) received")
             if b == b"\x06":
                 self.status_message.emit("RFPulse", "RX: ACK")
-                # ★ 예전엔 allow_ack_only이면 즉시 반환했지만,
-                #    이제는 CSR 프레임이 뒤따를 수 있으므로 짧게 더 기다린다.
+                # ★ allow_ack_only이면 즉시 반환하지 않고 짧게 더 기다린다.
                 seen_ack = True
                 if allow_ack_only and ack_grace_deadline is None:
                     ack_grace_deadline = min(timeout_ms, t.elapsed() + ACK_FOLLOWUP_GRACE_MS)
@@ -424,6 +428,28 @@ class RFPulseController(QObject):
         self.status_message.emit("RFPulse", "RX: timeout waiting frame")
         raise TimeoutError("No response header")
 
+    def _try_log_other_frame(self, payload: bytes):
+        """기대 cmd/주소가 아닌 프레임은 원인 파악을 위해 가볍게 로깅"""
+        try:
+            hdr = payload[0]; cmd_b = payload[1]
+            length_bits = hdr & 0x07
+            idx = 2
+            if length_bits == 7:
+                dlen = payload[idx]; idx += 1
+            else:
+                dlen = length_bits
+            data_bytes = payload[idx:idx+dlen]
+            rx_addr = (hdr >> 3) & 0x1F
+
+            if len(data_bytes) == 1 and data_bytes[0] in CSR_CODES:
+                self.status_message.emit("RFPulse",
+                    f"RX CSR cmd=0x{cmd_b:02X} addr={rx_addr} csr={data_bytes[0]}({CSR_CODES.get(data_bytes[0],'?')})")
+            else:
+                self.status_message.emit("RFPulse",
+                    f"RX other frame cmd=0x{cmd_b:02X} addr={rx_addr} dlen={len(data_bytes)} data={data_bytes.hex(' ')}")
+        except Exception:
+            pass
+
     # 기대 cmd/주소 일치 프레임만 돌려주는 래퍼
     def _recv_matching_frame(self, expected_cmd: int, timeout_ms: int) -> bytes:
         t = QElapsedTimer(); t.start()
@@ -444,31 +470,28 @@ class RFPulseController(QObject):
             hdr = payload[0]
             cmd_b = payload[1]
             rx_addr = (hdr >> 3) & 0x1F
-            if rx_addr != self.addr:
-                # 다른 주소 → 무시
-                continue
-            if cmd_b != expected_cmd:
-                # 기대 cmd가 아님 → 계속
-                continue
+            if rx_addr == self.addr and cmd_b == expected_cmd:
+                length_bits = hdr & 0x07
+                idx = 2
+                if length_bits == 7:
+                    dlen = payload[idx]; idx += 1
+                else:
+                    dlen = length_bits
+                data_bytes = payload[idx:idx+dlen]
+                return bytes(data_bytes)
 
-            length_bits = hdr & 0x07
-            idx = 2
-            if length_bits == 7:
-                dlen = payload[idx]; idx += 1
-            else:
-                dlen = length_bits
-            data_bytes = payload[idx:idx+dlen]
-            return bytes(data_bytes)
+            # 기대가 아니면 정보만 남기고 계속 기다림(ACK 뒤 CSR/상태 프레임 흡수)
+            self._try_log_other_frame(payload)
 
         raise TimeoutError("No matching frame")
 
     # 안전 drain (clear 대신)
-    def _drain_input_soft(self, max_bytes: int = 1024, budget_ms: int = 10):
+    def _drain_input_soft(self, max_bytes: int = 4096, budget_ms: int = 250):
+        """하드 clear(Input) 대신 부드럽게 잔여 프레임 흡수"""
         t = QElapsedTimer(); t.start()
-        n = 0
-        while n < max_bytes and t.elapsed() < budget_ms and self.port and self.port.bytesAvailable():
+        while t.elapsed() < budget_ms and self.port and self.port.bytesAvailable():
             self.port.readAll()
-            n += 1
+            QCoreApplication.processEvents()
 
     # ---------- 큐 API ----------
     def enqueue_exec(self, cmd: int, data: bytes=b"", *,
@@ -526,35 +549,27 @@ class RFPulseController(QObject):
             self._tx_throttle()
             self._last_sent_at_ms = self._tx_epoch.elapsed()
 
-            # 충돌 방지: exec/query 모두 직전에 소프트 드레인
-            self._drain_input_soft()
+            # 충돌 방지: exec/query 모두 전송 직전 소프트 드레인
+            self._drain_input_soft(max_bytes=4096, budget_ms=250)
 
             pkt = _build_packet(self.addr, cmd.cmd, cmd.data)
             self.status_message.emit("RFPulse", f"TX {cmd.tag or ('exec' if cmd.kind=='exec' else 'query')} cmd=0x{cmd.cmd:02X} data={cmd.data.hex(' ')}")
 
-            # ★ 전송 직전 입력 버퍼 하드 클리어(가능 시)
-            try:
-                from PyQt6.QtSerialPort import QSerialPort as _QSP
-                self.port.clear(_QSP.Direction.Input)
-                # self.status_message.emit("RFPulse", "Input buffer cleared (hard)")
-            except Exception:
-                # 일부 환경에서 clear가 미동작하면 소프트 드레인으로 대체
-                self._drain_input_soft(max_bytes=4096, budget_ms=50)
-                # self.status_message.emit("RFPulse", "Input buffer drained (soft)")
-
             self.port.write(pkt)
             self.port.flush()
-            self.port.waitForBytesWritten(cmd.timeout_ms)
+            # ★ waitForBytesWritten(...) 제거 (허위 타임아웃 방지)
 
             ok = False
             result: Optional[bytes] = None
 
             try:
                 if cmd.kind == "exec":
+                    # === 쓰기(설정) 명령 처리 ===
                     if cmd.allow_no_reply:
                         ok = True
                         result = b""  # 전송만 보장
                     else:
+                        # ACK만 와도 성공(ACK 그레이스 동안 뒤따르는 프레임은 _recv_frame에서 흡수)
                         kind, _ = self._recv_frame(timeout_ms=cmd.timeout_ms, allow_ack_only=True)
                         ok = (kind in ("ACK_ONLY", "FRAME"))
                         result = b"\x06" if ok else None
@@ -562,12 +577,24 @@ class RFPulseController(QObject):
                         if ok and cmd.cmd == CMD_RF_ON:
                             self.status_message.emit("RFPulse", "RF ON: ACK received → target_reached()")
                             QTimer.singleShot(0, self.target_reached.emit)
+
                 else:
-                    # ★ 기대 cmd/주소가 맞는 프레임만 수신
-                    data_bytes = self._recv_matching_frame(cmd.cmd, timeout_ms=cmd.timeout_ms)
+                    # === 읽기(리드백) 명령 처리 ===
+                    # 2단계: (1) 짧게 ACK 소거 → (2) 남은 시간 동안 기대 cmd 데이터 프레임 대기
+                    t = QElapsedTimer(); t.start()
+                    ack_phase = min(ACK_TIMEOUT_MS, cmd.timeout_ms // 3)
+                    try:
+                        self._recv_frame(timeout_ms=ack_phase, allow_ack_only=True)  # ACK 있으면 소거
+                    except Exception:
+                        # ACK가 없어도 데이터 프레임이 바로 올 수 있으므로 무시
+                        pass
+
+                    remain = max(1, cmd.timeout_ms - t.elapsed())
+                    data_bytes = self._recv_matching_frame(cmd.cmd, timeout_ms=remain)
                     self.status_message.emit("RFPulse", f"RX {cmd.tag or 'query'}: dlen={len(data_bytes)} data={data_bytes.hex(' ')}")
                     ok = True
                     result = data_bytes
+
             except TimeoutError:
                 ok = False
                 result = None
@@ -681,8 +708,8 @@ class RFPulseController(QObject):
         def step6_rf_on(_b: Optional[bytes]):
             if _b is None:
                 return fail("RF ON 실패")
-            # 안정화 후 폴링 시작
-            QTimer.singleShot(300, lambda: self.set_process_status(True))
+            # 안정화 후 폴링 시작 (약간 더 여유를 둠)
+            QTimer.singleShot(POLL_START_DELAY_AFTER_RF_ON_MS, lambda: self.set_process_status(True))
 
         def step5_pulsing_on(_b: Optional[bytes]):
             if _b is None:

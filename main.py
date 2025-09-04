@@ -115,8 +115,10 @@ class MainWindow(QWidget):
         # === 3. 감독관 ===
         self.process_controller = ProcessController()
 
-        # Google Chat 알림
+        # Google Chat 알림 (비동기 워커 시작)
         self.chat_notifier = ChatNotifier(CHAT_WEBHOOK_URL) if ENABLE_CHAT_NOTIFY else None
+        if self.chat_notifier:
+            self.chat_notifier.start()
 
         # === 4. 신호-슬롯 ===
         self._connect_signals()
@@ -140,6 +142,9 @@ class MainWindow(QWidget):
         app = QCoreApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self._on_about_to_quit)
+            if self.chat_notifier:
+                # 앱 종료 직전에 버퍼 flush + 워커 스레드 종료
+                app.aboutToQuit.connect(self.chat_notifier.shutdown)
 
         atexit.register(self._emergency_cleanup)
 
@@ -1041,6 +1046,13 @@ class MainWindow(QWidget):
             getattr(self, 'data_logger_thread', None),
             getattr(self, 'rf_pulse_thread', None),  # ← 추가
         ]
+
+        try:
+            if self.chat_notifier:
+                self.chat_notifier.shutdown()
+        except Exception:
+            pass
+
         for thread in threads:
             if thread and thread.isRunning():
                 thread.quit()
@@ -1061,6 +1073,13 @@ class MainWindow(QWidget):
                 for _ in range(6):
                     QCoreApplication.processEvents()
                     QThread.msleep(20)
+        except Exception:
+            pass
+
+        # ▼ 이중 안전장치(이미 connect 해놔도 무해)
+        try:
+            if self.chat_notifier:
+                self.chat_notifier.shutdown()
         except Exception:
             pass
 

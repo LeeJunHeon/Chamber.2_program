@@ -1,7 +1,39 @@
 # controller/chat_notifier.py
-from PyQt6.QtCore import QObject, pyqtSlot as Slot
+from PyQt6.QtCore import (
+    QObject, QThread, Qt,
+    pyqtSignal as Signal, pyqtSlot as Slot
+)
 import json, urllib.request, urllib.error, ssl
 from typing import Optional, List, Dict, Any
+
+
+class _HttpWorker(QObject):
+    """
+    실제 네트워크 전송을 담당하는 워커(별도 스레드).
+    메인/UI 스레드를 막지 않도록 모든 HTTP는 여기서만 수행한다.
+    """
+    def __init__(self, webhook_url: str, parent=None):
+        super().__init__(parent)
+        self.webhook_url = (webhook_url or "").strip()
+        self._ctx = ssl.create_default_context()
+
+    @Slot(dict)
+    def post(self, payload: dict):
+        if not self.webhook_url or not payload:
+            return
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            self.webhook_url, data=data,
+            headers={"Content-Type": "application/json"}
+        )
+        try:
+            # 네트워크 지연/오류는 여기서만 발생하고, UI는 전혀 영향 없음
+            with urllib.request.urlopen(req, timeout=3, context=self._ctx) as resp:
+                resp.read()
+        except Exception:
+            # 네트워크 실패는 삼킴(로그를 남기려면 여기서 처리)
+            pass
+
 
 class ChatNotifier(QObject):
     """
@@ -9,13 +41,14 @@ class ChatNotifier(QObject):
 
     - 시작 알림은 즉시 전송(urgent=True).
     - 공정 중 알림/오류는 버퍼에 쌓고, process_finished 시 한 번에 flush.
-    - 네트워크 오류는 삼켜서 UI에 영향 없음.
+    - 모든 HTTP는 전용 워커스레드에서 비동기로 수행하여 UI 프리징을 방지.
     """
+    # ChatNotifier -> _HttpWorker (스레드 경계) 신호
+    _post_payload = Signal(dict)
 
     def __init__(self, webhook_url: Optional[str], parent=None):
         super().__init__(parent)
         self.webhook_url = (webhook_url or "").strip()
-        self._ctx = ssl.create_default_context()
 
         # 전송 지연 & 버퍼
         self._defer: bool = True
@@ -26,32 +59,45 @@ class ChatNotifier(QObject):
         self._errors: List[str] = []          # 종료 카드 요약용 오류 모음
         self._finished_sent: bool = False     # 종료 카드 중복 방지
 
+        # ---- 전송 워커 스레드 구성 ----
+        self._thread = QThread(self)
+        self._worker = _HttpWorker(self.webhook_url)
+        self._worker.moveToThread(self._thread)
+        self._thread.setObjectName("ChatNotifierThread")
+        self._post_payload.connect(self._worker.post, type=Qt.ConnectionType.QueuedConnection)
+
+        # ▶ 추가: 스레드 종료 시 워커를 그 스레드 안에서 안전하게 삭제
+        self._thread.finished.connect(self._worker.deleteLater)
+
+    # ---------- 라이프사이클 ----------
+    def start(self):
+        """메인에서 ChatNotifier 생성 직후 한 번 호출."""
+        if not self._thread.isRunning():
+            self._thread.start()
+
+    def shutdown(self):
+        """앱 종료 시 안전하게 버퍼 flush 후 스레드 종료."""
+        self.flush()
+        self._thread.quit()
+        self._thread.wait(2000)
+
+    # ---------- 내부 전송 ----------
+    def _do_post(self, payload: dict):
+        if not self._thread.isRunning():
+            self._thread.start()
+        self._post_payload.emit(payload)
+
     # ---------- 지연 전송 ----------
     def set_defer(self, on: bool):
         self._defer = bool(on)
 
     def flush(self):
-        if not self.webhook_url or not self._buffer:
+        if not self._buffer:
             self._buffer.clear()
             return
         for payload in self._buffer:
             self._do_post(payload)
         self._buffer.clear()
-
-    # ---------- HTTP ----------
-    def _do_post(self, payload: dict):
-        if not self.webhook_url:
-            return
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            self.webhook_url, data=data,
-            headers={"Content-Type": "application/json"}
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=3, context=self._ctx) as resp:
-                resp.read()
-        except Exception:
-            pass
 
     def _post_json(self, payload: dict, urgent: bool = False):
         if self._defer and not urgent:
@@ -142,7 +188,7 @@ class ChatNotifier(QObject):
         self._finished_sent = False
         self._buffer.clear()  # 이전 잔여 버퍼 방지
 
-        name = (params or {}).get("process_note") or (params or {}).get("Process_name") or "무제"
+        name = (params or {}).get("process_note") or (params or {}).get("Process_name") or "Untitled"
         guns = self._guns_and_targets(params or {})
         pwr  = self._power_summary(params or {})
         sh_delay = self._fmt_min((params or {}).get("shutter_delay", 0))
@@ -158,7 +204,7 @@ class ChatNotifier(QObject):
                 "Shutter Delay": sh_delay,
                 "Process Time": proc_time,
             },
-            urgent=True
+            urgent=True    # 시작 알림은 즉시 전송
         )
 
     @Slot(bool, dict)
@@ -173,11 +219,10 @@ class ChatNotifier(QObject):
             'errors': List[str]      # 종료 중 누적 실패
           }
         """
-        name = (detail or {}).get("process_name") or (self._last_started_params or {}).get("process_note") or "무제"
+        name = (detail or {}).get("process_name") or (self._last_started_params or {}).get("process_note") or "Untitled"
         stopped = bool((detail or {}).get("stopped"))
         aborting = bool((detail or {}).get("aborting"))
         errs: List[str] = list((detail or {}).get("errors") or [])
-        # 버퍼에 쌓인 별도 오류 카드들도 요약 문자열로 저장되어 있을 수 있음
         if not errs and self._errors:
             errs = list(self._errors)
 
@@ -194,7 +239,6 @@ class ChatNotifier(QObject):
                 fields = {"공정 이름": name}
             else:
                 subtitle = "오류로 종료"
-                # 가장 중요한 1~3건만 요약
                 if errs:
                     preview = " • " + "\n • ".join(errs[:3])
                     if len(errs) > 3:
@@ -220,7 +264,7 @@ class ChatNotifier(QObject):
             return
         self._post_card("공정 종료", "성공" if ok else "실패",
                         "SUCCESS" if ok else "FAIL",
-                        fields={"공정 이름": (self._last_started_params or {}).get("process_note", "무제")})
+                        fields={"공정 이름": (self._last_started_params or {}).get("process_note", "Untitled")})
         self.flush()
         self._finished_sent = True
 

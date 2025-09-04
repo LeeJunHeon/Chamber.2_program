@@ -1,1 +1,1 @@
-CHAT_WEBHOOK_URL = "https://chat.googleapis.com/v1/spaces/AAQAR-7GrlI/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=prOEgkZwkDr-kXEjbnlYdjf1lLyIvFKqAfE7CECY9FY"
+CHAT_WEBHOOK_URL = "https://chat.googleapis.com/v1/spaces/AAQASJlTcDg/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=34LfbgS0TXRLuDgGby3BJd3mUomJMhem6LZPIkRcYBs"

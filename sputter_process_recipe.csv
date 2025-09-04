@@ -1,4 +1,6 @@
 ﻿#,base_pressure,main_shutter,gun1,gun2,gun3,G1 Target,G2 Target,G3 Target,Ar,O2,N2,Ar_flow,O2_flow,N2_flow,working_pressure,rf_power,rf_pulse_power,dc_power,use_rf_power,use_rf_pulse_power,use_dc_power,shutter_delay,process_time,rf_pulse_freq,rf_pulse_duty_cycle,power_select
-1,9.00E-06,F,F,T,F,test1,test2,test3,T,F,F,20,0,0,2,0,100,0,F,T,F,0.1,0.1,,,T
-2,9.00E-06,F,F,T,F,test4,test5,test6,T,T,F,20,5,0,2,0,100,0,F,T,F,0.1,0.1,,,T
-3,9.00E-06,F,F,T,F,test7,test8,test9,T,F,F,20,0,5,2,0,100,0,F,T,F,0.1,0.1,,,T
+1,9.00E-06,F,F,F,T,test1,test2,test3,T,F,F,20,0,0,2,0,100,0,F,T,F,0.5,0.5,,,T
+delay1m,,,,,,,,,,,,,,,,,,,,,,,,,,
+2,9.00E-06,F,F,F,T,test4,test5,test6,T,F,F,20,0,0,2,0,100,0,F,T,F,0.5,0.5,,,T
+delay10m,,,,,,,,,,,,,,,,,,,,,,,,,,
+3,9.00E-06,F,F,F,T,test7,test8,test9,T,F,F,20,0,0,2,0,100,0,F,T,F,0.5,0.5,,,T

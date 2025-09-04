@@ -1,7 +1,9 @@
 # main.py
+import re
 import sys
 import csv
 import atexit, signal
+from typing import Optional
 from datetime import datetime
 from PyQt6.QtWidgets import QApplication, QWidget, QMessageBox, QFileDialog
 from PyQt6.QtCore import QCoreApplication, Qt, QTimer, QThread, pyqtSlot as Slot, pyqtSignal as Signal
@@ -43,6 +45,7 @@ class MainWindow(QWidget):
         super().__init__()
         self.ui = Ui_Form()
         self.ui.setupUi(self)
+        self._delay_timer: Optional[QTimer] = None  # ★ delay 단계를 위한 타이머
 
         single_line_edits = [
             self.ui.Base_pressure_edit,
@@ -665,6 +668,11 @@ class MainWindow(QWidget):
         if self.current_process_index < len(self.process_queue):
             params = self.process_queue[self.current_process_index]
             self._update_ui_from_params(params)
+
+            # ★ delay 단계면 장비 공정 대신 대기만 수행하고 리턴
+            if self._try_handle_delay_step(params):
+                return
+            
             QTimer.singleShot(100, lambda p=params: self._safe_start_process(self._normalize_params_for_process(p)))
         else:
             self.append_log("MAIN", "모든 공정이 완료되었습니다.")
@@ -941,6 +949,9 @@ class MainWindow(QWidget):
         # 2) 그리고 즉시 장치 하드스톱 (큐/타이머/시리얼 정리, 파워 정지)
         #self.stop_all.emit()
 
+        # 대기 타이머 취소 ★
+        self._cancel_delay_timer()
+
         if self.process_queue:
             self.append_log("MAIN", "자동 시퀀스가 사용자에 의해 중단되었습니다.")
             self.process_queue = []
@@ -1016,6 +1027,9 @@ class MainWindow(QWidget):
     def closeEvent(self, event):
         self.append_log("main", "프로그램 종료 절차 시작...")
 
+        # 대기 타이머 취소 ★
+        self._cancel_delay_timer()
+
         try:
             if getattr(self.process_controller, "is_running", False):
                 self.process_controller.abort_process()
@@ -1067,6 +1081,9 @@ class MainWindow(QWidget):
             return
         self._about_quit_called = True
 
+        # 대기 타이머 취소 ★
+        self._cancel_delay_timer()
+
         try:
             if getattr(self.process_controller, "is_running", False):
                 self.process_controller.abort_process()
@@ -1100,6 +1117,9 @@ class MainWindow(QWidget):
         if self._emergency_done:
             return
         self._emergency_done = True
+
+        # 대기 타이머 취소 ★
+        self._cancel_delay_timer()
 
         try:
             if getattr(self, "process_controller", None) and \
@@ -1204,6 +1224,55 @@ class MainWindow(QWidget):
         }
 
         return out
+    
+    # ★ delay 파싱 및 처리 --------------------------------------------
+    def _cancel_delay_timer(self):
+        """대기 단계 중 Stop/종료 시 타이머 취소"""
+        if getattr(self, "_delay_timer", None):
+            try:
+                self._delay_timer.stop()
+                self._delay_timer.deleteLater()
+            except Exception:
+                pass
+            self._delay_timer = None
+
+    def _on_delay_step_done(self, step_name: str):
+        """delay 타임아웃 완료 → 다음 공정으로"""
+        self._delay_timer = None
+        self.append_log("Process", f"'{step_name}' 지연 완료 → 다음 공정으로 진행")
+        self._start_next_process_from_queue(True)
+
+    def _try_handle_delay_step(self, params: dict) -> bool:
+        """
+        Process_name(또는 process_note)에 'delay100m' 같은 형태가 있으면
+        실제 장비 공정 대신 타이머로 대기만 수행하고 True 반환.
+        지원 단위: s(초), m(분, 기본), h(시간), d(일)
+        예) delay30s, delay5m, delay2h, delay1d, delay15  ← 접미사가 없으면 분으로 처리
+        """
+        name = str(params.get("Process_name") or params.get("process_note", "")).strip()
+        if not name:
+            return False
+        m = re.match(r"^\s*delay\s*(\d+)\s*([smhd]?)\s*$", name, re.IGNORECASE)
+        if not m:
+            return False
+
+        amount = int(m.group(1))
+        unit = (m.group(2) or "m").lower()  # 접미사 없으면 분
+        factor = {"s": 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000}[unit]
+        duration_ms = amount * factor
+
+        # 로그/상태 표시
+        unit_txt = {"s": "초", "m": "분", "h": "시간", "d": "일"}[unit]
+        self.append_log("Process", f"'{name}' 단계 감지: {amount}{unit_txt} 대기 시작")
+        self.ui.process_state.setPlainText(f"지연 대기 중: {amount}{unit_txt}")
+
+        # 타이머 시작
+        self._cancel_delay_timer()
+        self._delay_timer = QTimer(self)
+        self._delay_timer.setSingleShot(True)
+        self._delay_timer.timeout.connect(lambda: self._on_delay_step_done(name))
+        self._delay_timer.start(duration_ms)
+        return True
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

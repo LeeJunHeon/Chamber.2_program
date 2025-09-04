@@ -87,7 +87,7 @@ class RFPulseController(QObject):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        # ★★ 지연 생성(스레드 안전) — 포트/타이머는 None으로 두고 워커 스레드에서 생성
+        # ★★ 지연 생성(스레드 안전)
         self.port: Optional[QSerialPort] = None
         self._watchdog: Optional[QTimer] = None
 
@@ -111,14 +111,13 @@ class RFPulseController(QObject):
         self._tx_epoch = QElapsedTimer(); self._tx_epoch.start()
         self._last_sent_at_ms = -10**9
 
-        # __init__() 안에 추가
-        self._io_inflight = False      # 현재 I/O 진행 중 표시
-        self._need_reopen = False      # 다음 재연결 시 포트 재오픈 필요
-        self._per_cmd_retries = 3      # 명령 단위 재시도 횟수
+        self._io_inflight = False
+        self._need_reopen = False
+        self._per_cmd_retries = 3
 
-        self._poll_timer = None                 # ← QTimer 대신 None
-        self._last_forward_w = None
-        self._last_reflected_w = None
+        self._poll_timer: Optional[QTimer] = None
+        self._last_forward_w: Optional[float] = None
+        self._last_reflected_w: Optional[float] = None
 
     # ---------- 내부 생성기 ----------
     def _ensure_serial_created(self):
@@ -140,7 +139,6 @@ class RFPulseController(QObject):
 
     def _ensure_poll_timer_created(self):
         if self._poll_timer is None:
-            from PyQt6.QtCore import QTimer
             self._poll_timer = QTimer(self)
             self._poll_timer.setInterval(3000)          # 3초
             self._poll_timer.timeout.connect(self._poll_power)
@@ -159,24 +157,18 @@ class RFPulseController(QObject):
     # ---------- 포트/에러 ----------
     @Slot(QSerialPort.SerialPortError)
     def _on_port_error(self, err: QSerialPort.SerialPortError):
-        # NoError만 무시, 그 외(TimeoutError 포함)는 모두 재연결 루틴 진입
         if err == QSerialPort.SerialPortError.NoError:
-            return 
-
+            return
         es = self.port.errorString() if self.port else ""
         err_name  = getattr(err, "name", str(err))
         err_value = getattr(err, "value", None)
         self.status_message.emit("RFPulse", f"시리얼 오류: {es} (err={err_name}/{err_value})")
 
-        # 타임아웃은 장치 응답 지연일 수 있으니 별도 조치 없음(아래 재시도 로직에서 해결)
         if err == QSerialPort.SerialPortError.TimeoutError:
             return
 
-        # ❌ 여기서 절대 close() 하지 않음. 워치독에게 맡기기.
         self._port_had_error = True
-        self._need_reopen = True           # 다음 재연결 시 안전하게 닫고 다시 열도록 표시
-
-        # ⬇️ 추가: 종료/정지 중이면 재연결 로직 건너뜀
+        self._need_reopen = True
         if self._stop_requested:
             return
 
@@ -197,10 +189,9 @@ class RFPulseController(QObject):
     @Slot()
     def connect_rfpulse_device(self) -> bool:
         if self._stop_requested:
-            self._stop_requested = False  # 재가동
+            self._stop_requested = False
         self._ensure_serial_created()
         self._ensure_timers_created()
-
         self._want_connected = True
         ok = self._open_port()
         if self._watchdog:
@@ -211,7 +202,6 @@ class RFPulseController(QObject):
         if self.port and self.port.isOpen():
             return True
 
-        # 포트 존재 확인(선택)
         available = {p.portName() for p in QSerialPortInfo.availablePorts()}
         if self._default_port not in available:
             self.status_message.emit("RFPulse",
@@ -223,16 +213,11 @@ class RFPulseController(QObject):
             self.status_message.emit("RFPulse", f"{self._default_port} 연결 실패: {self.port.errorString()}")
             return False
         
+        try: self.port.setDataTerminalReady(True)
+        except Exception: pass
+        try: self.port.setRequestToSend(True)
+        except Exception: pass
         try:
-            self.port.setDataTerminalReady(True)   # 어댑터 깨우기: DTR HIGH
-        except Exception:
-            pass
-        try:
-            self.port.setRequestToSend(True)       # 어댑터 깨우기: RTS HIGH (기존 False → True)
-        except Exception:
-            pass
-        try:
-            # 오픈 직후 한 번만 전체 클리어(잔여 바이트 제거)
             from PyQt6.QtSerialPort import QSerialPort as _QSP
             self.port.clear(_QSP.Direction.AllDirections)
         except Exception:
@@ -263,7 +248,6 @@ class RFPulseController(QObject):
             return
         if self._reconnect_pending:
             return
-        # ⬇️ 포트가 열려 있어도 재오픈 플래그가 있으면 '재연결 필요'로 간주
         if self.port and self.port.isOpen() and not self._need_reopen:
             return
         self._reconnect_pending = True
@@ -274,11 +258,9 @@ class RFPulseController(QObject):
         self._reconnect_pending = False
         if (not self._want_connected) or self._stop_requested:
             return
-        # 이미 열려 있으면 재연결 불필요
         if self.port and self.port.isOpen() and not self._need_reopen:
             return
 
-        # 🔐 포트를 열기 전에, 재오픈이 필요하다면 여기서만 닫는다(이 시점엔 I/O 없음).
         if self._need_reopen and self.port and self.port.isOpen():
             try: self.port.close()
             except Exception: pass
@@ -345,7 +327,6 @@ class RFPulseController(QObject):
             if b == b"\x06":
                 self.status_message.emit("RFPulse", "RX: ACK")
                 if allow_ack_only:
-                    # ✅ ACK-only면 바로 반환 (타임아웃까지 기다리지 않음)
                     return ("ACK_ONLY", None)
                 seen_ack = True
                 continue
@@ -379,7 +360,6 @@ class RFPulseController(QObject):
                     continue
                 pkt = bytes([hdr]) + cmd_b + data + cs
 
-            # checksum
             calc = 0
             for x in pkt[:-1]: calc ^= x
             if (calc ^ pkt[-1]) != 0:
@@ -411,11 +391,9 @@ class RFPulseController(QObject):
             self._io_inflight = True
             try:
                 try:
-                    # Qt6: 입력만 비우기 (출력은 비우지 말 것!)
                     from PyQt6.QtSerialPort import QSerialPort as _QSP
                     self.port.clear(_QSP.Direction.Input)
                 except Exception:
-                    # fallback: 남은 바이트 다 빼내기
                     while self.port.bytesAvailable():
                         self.port.readAll()
 
@@ -433,18 +411,13 @@ class RFPulseController(QObject):
             except Exception as e:
                 if self._stop_requested and not force:
                     raise RuntimeError("Stop requested") from e
-                # 실패 → 워치독 재연결 예약 후 백오프만큼 기다렸다가 동일 명령 재시도
-                self._need_reopen = True         # 다음 재연결에서 안전 재오픈
-                self._watch_connection()         # 워치독 트리거
+                self._need_reopen = True
+                self._watch_connection()
                 self._delay_ms(self._reconnect_backoff_ms)
-                # 재연결 시도 후 포트가 살아났는지 점검
                 if not self.is_connected():
-                    # 재연결 타이머가 다시 돌 수 있게 한 번 더 툭 쳐줌
                     self._watch_connection()
                 if attempt >= self._per_cmd_retries:
                     raise
-                # 루프 계속
-
             finally:
                 self._io_inflight = False
 
@@ -465,11 +438,9 @@ class RFPulseController(QObject):
             self._io_inflight = True
             try:
                 try:
-                    # Qt6: 입력만 비우기 (출력은 비우지 말 것!)
                     from PyQt6.QtSerialPort import QSerialPort as _QSP
                     self.port.clear(_QSP.Direction.Input)
                 except Exception:
-                    # fallback: 남은 바이트 다 빼내기
                     while self.port.bytesAvailable():
                         self.port.readAll()
 
@@ -492,7 +463,7 @@ class RFPulseController(QObject):
                 return data_bytes
 
             except Exception as e:
-                if self._stop_requested:   # ★ 추가
+                if self._stop_requested:
                     raise RuntimeError("Stop requested") from e
                 self._need_reopen = True
                 self._watch_connection()
@@ -501,7 +472,6 @@ class RFPulseController(QObject):
                     self._watch_connection()
                 if attempt >= self._per_cmd_retries:
                     raise
-
             finally:
                 self._io_inflight = False
 
@@ -555,31 +525,26 @@ class RFPulseController(QObject):
 
     def _rf_off(self, *, force: bool=False):
         self._send_exec_ack(CMD_RF_OFF, b"", timeout_ms=max(ACK_TIMEOUT_MS, 2500), force=force)
-        #self._stop_power_polling()
-        tag = " (force)" if force else ""
-        self.status_message.emit("RFPulse", f"[RF OFF] sent (ack-only){tag}")
+        self.status_message.emit("RFPulse", f"[RF OFF] sent (ack-only){' (force)' if force else ''}")
 
     @Slot()
     def _poll_power(self):
         # 다른 명령 I/O 중이면 이번 틱은 건너뛴다
         if self._io_inflight or self._stop_requested:
             return
-    
         if not self.is_connected():
             self._watch_connection()
             return
 
         fwd = None; ref = None
         try:
-            fwd = float(self._read_forward_power())   # CMD 165
+            fwd = float(self._read_forward_power())
             self._last_forward_w = fwd
         except Exception as e:
             self.status_message.emit("RFPulse", f"[POLL] forward read failed: {e}")
 
         try:
-            # reflected는 helper 없으면 아래처럼 직접:
-            data = self._send_query(CMD_REPORT_REFLECTED, b"", QUERY_TIMEOUT_MS)  # CMD 166
-            ref = float(_u16le(data, 0) if len(data) >= 2 else 0)
+            ref = float(self._read_reflected_power())
             self._last_reflected_w = ref
         except Exception as e:
             self.status_message.emit("RFPulse", f"[POLL] reflected read failed: {e}")
@@ -604,6 +569,10 @@ class RFPulseController(QObject):
 
     def _read_forward_power(self) -> int:
         data = self._send_query(CMD_REPORT_FORWARD, b"", QUERY_TIMEOUT_MS)
+        return _u16le(data, 0) if len(data) >= 2 else 0
+
+    def _read_reflected_power(self) -> int:
+        data = self._send_query(CMD_REPORT_REFLECTED, b"", QUERY_TIMEOUT_MS)
         return _u16le(data, 0) if len(data) >= 2 else 0
 
     def _read_pulsing_mode(self) -> Optional[int]:
@@ -643,7 +612,7 @@ class RFPulseController(QObject):
         """
         HOST(14) → FWD(3) → SETP(8) → (옵션: 93/96) → RF ON(2)
         - 검증/리드백 제거(ACK만 확인)
-        - 실패 시 워치독 재연결(지수 백오프)에 맡기고 재시도
+        - 실패 시 워치독 재연결(지수 백오프)
         - Stop 요청 시 즉시 중단
         """
         self._wd_pause()
@@ -670,11 +639,13 @@ class RFPulseController(QObject):
                         self._set_pulse_duty(int(duty_percent))
 
                     self._set_pulsing(1)
-
                     self._rf_on()
 
+                    # ★ RF ON 성공 → 주기 리드백 시작
+                    self._delay_ms(300)  # 초기 안정화 살짝 대기
+                    self._start_power_polling()
+
                     self.target_reached.emit()
-                    #self._start_power_polling()
                     last_err = None
                     break
 
@@ -682,16 +653,14 @@ class RFPulseController(QObject):
                     last_err = e
                     self.status_message.emit("RFPulse", f"[시도 {attempt}/{self._max_retries}] 실패: {e}")
                     try:
-                        #self._stop_power_polling()
                         self._rf_off()
                     except Exception:
                         pass
 
                     if self._stop_requested:
-                        raise  # Stop이면 즉시 탈출
+                        raise
 
                     if attempt < self._max_retries:
-                        # ⬇︎ 워치독에게 맡기고, 현재 백오프 시간만큼 대기 후 다음 루프
                         self._watch_connection()
                         self._delay_ms(self._reconnect_backoff_ms)
                         continue
@@ -703,7 +672,6 @@ class RFPulseController(QObject):
                 self._rf_off()
             except Exception as off_e:
                 self.status_message.emit("RFPulse", f"[RF OFF during failure] 실패: {off_e}")
-            # ❌ 더 이상 power_off_finished.emit() 하지 않음
             self.target_failed.emit(str(final_e))
 
     def is_connected(self) -> bool:
@@ -711,14 +679,14 @@ class RFPulseController(QObject):
     
     @Slot()
     def stop_process(self, also_turn_pulsing_off: bool = True):
-        # ✅ 정지 중에도 재연결/재시도가 돌 수 있게 설정
-        #self._stop_power_polling()
         self._stop_requested = True
-        self._want_connected = False    # ★ 재연결 금지      
+        self._want_connected = False
         self._reconnect_pending = False
-        self._wd_pause()                # ★ 워치독 중지
+        self._wd_pause()
 
-        # 베스트-에포트로만 OFF 시도, 연결 안돼 있으면 재연결하지 않음
+        # ★ 주기 리드백 중지
+        self._stop_power_polling()
+
         try:
             if self.is_connected():
                 if also_turn_pulsing_off:
@@ -730,19 +698,17 @@ class RFPulseController(QObject):
                     self._rf_off(force=True)
                 except Exception:
                     pass
-
-            # 바로 다음 단계로 진행시켜 종료 시퀀스 막힘 방지
             self.power_off_finished.emit()
         except Exception as e:
             self.target_failed.emit(str(e))
 
     @Slot()
     def cleanup(self):
-        """워커 스레드에서 안전 종료: stop → close (재연결 금지, 빠른 반환)"""
+        """워커 스레드에서 안전 종료: stop → close"""
         self._stop_requested = True
         self._want_connected = False
         self._wd_pause()
-        #self._stop_power_polling()
+        self._stop_power_polling()
 
         try:
             if self.is_connected():
@@ -757,10 +723,20 @@ class RFPulseController(QObject):
         except Exception:
             pass
 
-        # 포트는 조용히 닫기
         try:
             self.close_port()
         except Exception:
             pass
-        # deleteLater 불필요: 객체 수명 주기 종료 시 파괴
 
+    # ---------- 유틸: 즉시 1회 리드 ----------
+    @Slot()
+    def poll_once(self):
+        """원할 때 즉시 한 번 FWD/REF 리드 → update_rf_status_display.emit"""
+        try:
+            f = float(self._read_forward_power())
+            r = float(self._read_reflected_power())
+            self._last_forward_w = f
+            self._last_reflected_w = r
+            self.update_rf_status_display.emit(f, r)
+        except Exception as e:
+            self.status_message.emit("RFPulse", f"[poll_once] read failed: {e}")

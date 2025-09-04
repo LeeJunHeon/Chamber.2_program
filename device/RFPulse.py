@@ -555,7 +555,7 @@ class RFPulseController(QObject):
 
     def _rf_off(self, *, force: bool=False):
         self._send_exec_ack(CMD_RF_OFF, b"", timeout_ms=max(ACK_TIMEOUT_MS, 2500), force=force)
-        self._stop_power_polling()
+        #self._stop_power_polling()
         tag = " (force)" if force else ""
         self.status_message.emit("RFPulse", f"[RF OFF] sent (ack-only){tag}")
 
@@ -674,7 +674,7 @@ class RFPulseController(QObject):
                     self._rf_on()
 
                     self.target_reached.emit()
-                    self._start_power_polling()
+                    #self._start_power_polling()
                     last_err = None
                     break
 
@@ -682,7 +682,7 @@ class RFPulseController(QObject):
                     last_err = e
                     self.status_message.emit("RFPulse", f"[시도 {attempt}/{self._max_retries}] 실패: {e}")
                     try:
-                        self._stop_power_polling()
+                        #self._stop_power_polling()
                         self._rf_off()
                     except Exception:
                         pass
@@ -712,7 +712,7 @@ class RFPulseController(QObject):
     @Slot()
     def stop_process(self, also_turn_pulsing_off: bool = True):
         # ✅ 정지 중에도 재연결/재시도가 돌 수 있게 설정
-        self._stop_power_polling()
+        #self._stop_power_polling()
         self._stop_requested = True
         self._want_connected = False    # ★ 재연결 금지      
         self._reconnect_pending = False
@@ -742,7 +742,7 @@ class RFPulseController(QObject):
         self._stop_requested = True
         self._want_connected = False
         self._wd_pause()
-        self._stop_power_polling()
+        #self._stop_power_polling()
 
         try:
             if self.is_connected():

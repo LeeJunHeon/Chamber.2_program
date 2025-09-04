@@ -1,7 +1,9 @@
 # process_controller.py
 
+import math
+from time import monotonic_ns
 from typing import Optional, List, Tuple, Dict, Any
-from PyQt6.QtCore import QObject, QTimer, pyqtSignal as Signal, pyqtSlot as Slot
+from PyQt6.QtCore import Qt, QObject, QTimer, pyqtSignal as Signal, pyqtSlot as Slot
 from dataclasses import dataclass
 from enum import Enum
 
@@ -109,6 +111,7 @@ class ProcessController(QObject):
         # 스텝 타이머
         self.step_timer = QTimer(self)
         self.step_timer.setSingleShot(True)
+        self.step_timer.setTimerType(Qt.TimerType.PreciseTimer) # 타이머 변경
         self.step_timer.timeout.connect(self.on_step_completed)
 
         # 병렬 실행 관리자
@@ -116,13 +119,19 @@ class ProcessController(QObject):
 
         # 카운트다운
         self._countdown_timer = QTimer(self)
+        self._countdown_timer.setTimerType(Qt.TimerType.PreciseTimer) # 타이머 변경
         self._countdown_timer.setInterval(1000)
         self._countdown_timer.timeout.connect(self._on_countdown_tick)
-        self._countdown_remaining_ms = 0
         self._countdown_base_message = ""
 
         self._shutdown_error = False                # 종료 중 실패 발생 여부
         self._shutdown_failures: List[str] = []     # 실패한 단계 기록(메시지 리스트)
+
+        # 추가: 지연(딜레이)·카운트다운 측정용 상태
+        self._delay_total_ms = 0
+        self._delay_start_ns = 0
+        self._countdown_total_ms = 0
+        self._countdown_start_ns = 0
 
     # ---------------- 시퀀스 구성 ----------------
     def _create_process_sequence(self, params: Dict[str, Any]) -> List[ProcessStep]:
@@ -168,7 +177,7 @@ class ProcessController(QObject):
 
             steps.append(ProcessStep(
                 action=ActionType.DELAY,
-                duration=int(process_time_sec * 1000),
+                duration=self._ms_from_sec(process_time_sec),  # ★ 변경: 반올림
                 message=f'메인 공정 진행 ({process_time_min}분)',
                 polling=True  # 메인 공정 중 데이터 폴링
             ))
@@ -332,7 +341,7 @@ class ProcessController(QObject):
         if shutter_delay_sec > 0:
             steps.append(ProcessStep(
                 action=ActionType.DELAY,
-                duration=int(shutter_delay_sec * 1000),
+                duration=self._ms_from_sec(shutter_delay_sec),  # ★ 변경: 반올림
                 message=f'Shutter Delay {shutter_delay_min}분'
             ))
 
@@ -466,11 +475,7 @@ class ProcessController(QObject):
         try:
             if action == ActionType.DELAY:
                 duration = step.duration or 100
-                self.step_timer.start(duration)
-                if duration >= 1000:
-                    self._start_countdown(duration, message)
-                else:
-                    self._stop_countdown()
+                self._start_precise_delay(duration, message)
                 return
 
             handlers = {
@@ -750,34 +755,45 @@ class ProcessController(QObject):
     # ---------------- 카운트다운 ----------------
     def _start_countdown(self, duration_ms: int, base_message: str):
         self._countdown_active = True
-        self._countdown_remaining_ms = duration_ms
+        self._countdown_total_ms = int(duration_ms)
+        self._countdown_start_ns = monotonic_ns()
         self._countdown_base_message = base_message
-        self._countdown_timer.start()
-        self._on_countdown_tick()
+        if not self._countdown_timer.isActive():
+            self._countdown_timer.start()
+        self._on_countdown_tick()  # 첫 표시 즉시
 
     def _stop_countdown(self):
         self._countdown_timer.stop()
-        self._countdown_remaining_ms = 0
+        self._countdown_total_ms = 0
+        self._countdown_start_ns = 0
         self._countdown_base_message = ""
         self._countdown_active = False
 
     def _on_countdown_tick(self):
-        # ✅ 카운트다운 중에도 정지 요청 체크
+        # 정지 요청 즉시 처리 (기존 로직 유지)
         if self._stop_requested and not (self._aborting or self._shutdown_in_progress):
             self.log_message.emit("Process", "정지 요청 감지 - 종료 절차를 시작합니다.")
             self._stop_countdown()
             self._start_normal_shutdown()
             return
 
-        if self._countdown_remaining_ms <= 0:
+        if not self._countdown_active or self._countdown_total_ms <= 0:
             self._stop_countdown()
             return
-        remaining_sec = self._countdown_remaining_ms // 1000
+
+        # ★ 단조시계 기반 경과/잔여 계산 (감산·누적 없음)
+        elapsed_ms = (monotonic_ns() - self._countdown_start_ns) // 1_000_000
+        remaining_ms = max(0, self._countdown_total_ms - int(elapsed_ms))
+
+        remaining_sec = remaining_ms // 1000
         minutes = remaining_sec // 60
         seconds = remaining_sec % 60
         time_str = f"{minutes}분 {seconds}초" if minutes > 0 else f"{seconds}초"
         self.update_process_state.emit(f"{self._countdown_base_message} (남은 시간: {time_str})")
-        self._countdown_remaining_ms -= 1000
+
+        if remaining_ms == 0:
+            # 표시는 0이 되었고, 실제 종료는 step_timer가 on_step_completed로 처리
+            self._stop_countdown()
 
     # ---------------- 종료/비상 ----------------
     def _finish_process(self, success: bool):
@@ -1125,3 +1141,29 @@ class ProcessController(QObject):
         """기존 set_polling과 함께 타깃 정보도 브로드캐스트"""
         self.set_polling.emit(active)
         self.set_polling_targets.emit(self._compute_polling_targets(active))
+
+    # ---------------- timer ----------------
+    def _now_ms(self) -> int:
+        """monotonic 기반 현재 ms (시스템 시간 변경 영향 없음)"""
+        return monotonic_ns() // 1_000_000
+
+    def _ms_from_sec(self, sec: float) -> int:
+        """초→ms 반올림 (잘림 편향 제거)"""
+        return int(round(sec * 1000.0))
+
+    def _start_precise_delay(self, duration_ms: int, message: str):
+        """
+        DELAY 스텝 진입 시 호출.
+        - 끝나는 시각은 step_timer가 담당(PreciseTimer)
+        - 진행/표시는 카운트다운 타이머가 monotonic으로 계산
+        """
+        self._delay_total_ms = int(duration_ms)
+        self._delay_start_ns = monotonic_ns()
+
+        # 종료 타이머 가동 (남은시간 = 총 - 경과)
+        elapsed_ms = 0
+        remaining_ms = max(0, self._delay_total_ms - elapsed_ms)
+        self.step_timer.start(remaining_ms)
+
+        # 카운트다운 시작
+        self._start_countdown(self._delay_total_ms, message)

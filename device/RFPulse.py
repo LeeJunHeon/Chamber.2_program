@@ -8,8 +8,8 @@ from lib.config import RFPULSE_PORT, RFPULSE_BAUD, RFPULSE_ADDR
 
 # ===== 타이밍/타임아웃 상수 =====
 ACK_TIMEOUT_MS         = 2000   # 쓰기(설정) 명령 후 ACK/프레임 대기 시간
-QUERY_TIMEOUT_MS       = 2500   # 읽기(리드백) 명령 후 데이터 프레임 대기 시간
-RECV_FRAME_TIMEOUT_MS  = 2000   # _recv_frame 기본 타임아웃
+QUERY_TIMEOUT_MS       = 4500   # ★ CHANGED: 읽기(리드백) 프레임 대기 여유 확대
+RECV_FRAME_TIMEOUT_MS  = 4000   # ★ CHANGED: _recv_frame 기본 타임아웃 확대
 CMD_GAP_MS             = 1500   # 명령 간 최소 간격(밀리초)
 POST_WRITE_DELAY_MS    = 1500   # 각 쓰기 명령 후 여유 대기(밀리초)
 
@@ -126,7 +126,7 @@ class RFPulseController(QObject):
         self.port = QSerialPort(self)
         self.port.setBaudRate(self._default_baud)
         self.port.setDataBits(QSerialPort.DataBits.Data8)
-        self.port.setParity(QSerialPort.Parity.OddParity)    # 8O1
+        self.port.setParity(QSerialPort.Parity.OddParity)    # 8O1 (Odd parity) - 매뉴얼
         self.port.setStopBits(QSerialPort.StopBits.OneStop)
         self.port.setFlowControl(QSerialPort.FlowControl.NoFlowControl)
         self.port.errorOccurred.connect(self._on_port_error)
@@ -291,6 +291,13 @@ class RFPulseController(QObject):
                 break
             QCoreApplication.processEvents()
 
+    # ★ CHANGED: 다른 I/O가 끝날 때까지 기다리기
+    def _wait_for_idle(self, max_ms: int = 3000) -> bool:
+        t = QElapsedTimer(); t.start()
+        while self._io_inflight and t.elapsed() < max_ms:
+            QCoreApplication.processEvents()
+        return not self._io_inflight
+
     def _read_bytes(self, need: int, deadline_ms: int) -> Optional[bytes]:
         buf = bytearray()
         t = QElapsedTimer(); t.start()
@@ -446,6 +453,8 @@ class RFPulseController(QObject):
 
                 self.port.write(pkt)
                 self.port.waitForBytesWritten(timeout_ms)
+
+                # ★ 쿼리는 데이터 프레임까지 한 트랜잭션 — ACK가 먼저 와도 계속 프레임을 기다린다
                 kind, payload = self._recv_frame(timeout_ms=timeout_ms, allow_ack_only=False)
                 if kind != "FRAME":
                     raise TimeoutError("No data frame")
@@ -462,9 +471,19 @@ class RFPulseController(QObject):
                 self.status_message.emit("RFPulse", f"RX {label}: hdr=0x{hdr:02X} dlen={dlen} data={data_bytes.hex(' ')} pkt={p.hex(' ')}")
                 return data_bytes
 
+            except TimeoutError as e:  # ★ CHANGED: 타임아웃은 포트 에러로 보지 않음(재연결 금지)
+                if self._stop_requested:
+                    raise RuntimeError("Stop requested") from e
+                if attempt >= self._per_cmd_retries:
+                    raise
+                # 소폭 휴지 후 재시도 (트랜잭션 충돌 방지)
+                self._delay_ms(150)
+                continue
+
             except Exception as e:
                 if self._stop_requested:
                     raise RuntimeError("Stop requested") from e
+                # 진짜 포트 오류만 재연결 경로로
                 self._need_reopen = True
                 self._watch_connection()
                 self._delay_ms(self._reconnect_backoff_ms)
@@ -472,6 +491,7 @@ class RFPulseController(QObject):
                     self._watch_connection()
                 if attempt >= self._per_cmd_retries:
                     raise
+
             finally:
                 self._io_inflight = False
 
@@ -529,7 +549,7 @@ class RFPulseController(QObject):
 
     @Slot()
     def _poll_power(self):
-        # 다른 명령 I/O 중이면 이번 틱은 건너뛴다
+        # 다른 명령 I/O 중이면 이번 틱은 건너뛴다 (트랜잭션 충돌 방지)
         if self._io_inflight or self._stop_requested:
             return
         if not self.is_connected():
@@ -538,13 +558,14 @@ class RFPulseController(QObject):
 
         fwd = None; ref = None
         try:
-            fwd = float(self._read_forward_power())
+            fwd = float(self._read_forward_power())   # CMD 165
             self._last_forward_w = fwd
         except Exception as e:
             self.status_message.emit("RFPulse", f"[POLL] forward read failed: {e}")
 
         try:
-            ref = float(self._read_reflected_power())
+            data = self._send_query(CMD_REPORT_REFLECTED, b"", QUERY_TIMEOUT_MS)  # CMD 166
+            ref = float(_u16le(data, 0) if len(data) >= 2 else 0)
             self._last_reflected_w = ref
         except Exception as e:
             self.status_message.emit("RFPulse", f"[POLL] reflected read failed: {e}")
@@ -684,8 +705,9 @@ class RFPulseController(QObject):
         self._reconnect_pending = False
         self._wd_pause()
 
-        # ★ 주기 리드백 중지
+        # ★ 주기 리드백 중지 → I/O 완료까지 대기 → OFF 순서
         self._stop_power_polling()
+        self._wait_for_idle(2000)  # ★ CHANGED: 폴링 쿼리와 ACK 충돌 방지
 
         try:
             if self.is_connected():
@@ -694,6 +716,7 @@ class RFPulseController(QObject):
                         self._set_pulsing(0, force=True)
                     except Exception:
                         pass
+                self._wait_for_idle(1500)  # ★ CHANGED: pulsing off 뒤에도 잠깐 대기
                 try:
                     self._rf_off(force=True)
                 except Exception:
@@ -709,6 +732,7 @@ class RFPulseController(QObject):
         self._want_connected = False
         self._wd_pause()
         self._stop_power_polling()
+        self._wait_for_idle(2000)  # ★ CHANGED
 
         try:
             if self.is_connected():
@@ -716,6 +740,7 @@ class RFPulseController(QObject):
                     self._set_pulsing(0, force=True)
                 except Exception:
                     pass
+                self._wait_for_idle(1000)  # ★ CHANGED
                 try:
                     self._rf_off(force=True)
                 except Exception:

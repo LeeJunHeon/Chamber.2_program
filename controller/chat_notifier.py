@@ -10,6 +10,7 @@ class ChatNotifier(QObject):
     변경점:
     - 전송 지연 모드(기본 on): 공정 중 발생하는 모든 알림을 버퍼에 쌓고,
       공정이 완전히 끝난 뒤(process_finished) 한 번에 전송하여 UI 멈춤을 방지.
+    - 공정 시작 알림은 반드시 즉시 전송(urgent=True).
     - 네트워크 오류는 삼켜서 UI를 멈추지 않음.
     """
 
@@ -121,17 +122,28 @@ class ChatNotifier(QObject):
     @Slot(dict)
     def notify_process_started(self, params: dict):
         """
-        공정 시작 알림: 지연 모드에서는 즉시 전송하지 않고 버퍼에 쌓임.
+        공정 시작 알림: 시작 알림은 즉시 전송(urgent=True).
+        이전 실행에서 남았을 수 있는 버퍼는 정리.
         """
         self._last_started_params = dict(params) if params else None
+        # 이전 공정의 잔여 버퍼 제거(보수적으로)
+        if self._buffer:
+            self._buffer.clear()
+
         note = params.get("process_note", "") or params.get("Process_name", "")
-        self._post_card("공정 시작", note, "INFO", fields={
-            "Targets": f"{params.get('G1 Target','')}, {params.get('G2 Target','')}, {params.get('G3 Target','')}".strip(", "),
-            "RF": f"{params.get('rf_power',0)} W" if params.get("use_rf_power") else "-",
-            "RF Pulse": f"{params.get('rf_pulse_power',0)} W" if params.get("use_rf_pulse") else "-",
-            "DC": f"{params.get('dc_power',0)} W" if params.get("use_dc_power") else "-",
-            "Time": f"{params.get('process_time',0)} s"
-        })
+        self._post_card(
+            "공정 시작",
+            note,
+            "INFO",
+            fields={
+                "Targets": f"{params.get('G1 Target','')}, {params.get('G2 Target','')}, {params.get('G3 Target','')}".strip(", "),
+                "RF": f"{params.get('rf_power',0)} W" if params.get("use_rf_power") else "-",
+                "RF Pulse": f"{params.get('rf_pulse_power',0)} W" if params.get("use_rf_pulse") else "-",
+                "DC": f"{params.get('dc_power',0)} W" if params.get("use_dc_power") else "-",
+                "Time": f"{params.get('process_time',0)} s"
+            },
+            urgent=True  # ★ 시작은 즉시 전송
+        )
 
     @Slot(bool)
     def notify_process_finished(self, ok: bool):

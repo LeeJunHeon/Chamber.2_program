@@ -505,11 +505,11 @@ class MainWindow(QWidget):
                 type=Qt.ConnectionType.QueuedConnection
             )
             self.mfc_controller.command_failed.connect(
-                lambda why: self.chat_notifier.notify_error_with_src("MFC", why),
+                lambda cmd, why: self.chat_notifier.notify_error_with_src("MFC", f"{cmd}: {why}"),
                 type=Qt.ConnectionType.QueuedConnection
             )
             self.faduino_controller.command_failed.connect(
-                lambda why: self.chat_notifier.notify_error_with_src("Faduino", why),
+                lambda cmd, why: self.chat_notifier.notify_error_with_src("Faduino", f"{cmd}: {why}"),
                 type=Qt.ConnectionType.QueuedConnection
             )
             self.ig_controller.base_pressure_failed.connect(

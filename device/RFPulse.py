@@ -706,6 +706,11 @@ class RFPulseController(QObject):
             try:
                 if ok:
                     self.status_message.emit("RFPulse", f"OK  {tag_disp} {self._cmd_label(cmd.cmd)}")
+
+                    # SAFE류처럼 allow_no_reply=True로 쏜 exec 뒤에 늦게 오는 ACK/CSR 흡수
+                    if cmd.kind == "exec" and cmd.allow_no_reply:
+                        self._drain_input_soft(max_bytes=4096, budget_ms=300)
+
                     try: cmd.callback(result)
                     finally:
                         self._inflight = None
@@ -736,8 +741,16 @@ class RFPulseController(QObject):
     def _enqueue_poll_cycle(self):
         if self._closing or not self.is_connected():
             return
-        if self._poll_busy or self._inflight is not None or len(self._cmd_q) > 0:
+        if self._poll_busy:
             return
+        # 진행 중이 'exec(쓰기)'일 때만 폴링 보류
+        if self._inflight is not None and self._inflight.kind == "exec":
+            return
+        # 큐 맨 앞이 exec(쓰기)일 때만 폴링 보류
+        if self._cmd_q:
+            head = self._cmd_q[0]
+            if head.kind == "exec":
+                return
 
         self._poll_busy = True
         tmp: dict = {}
@@ -783,6 +796,9 @@ class RFPulseController(QObject):
             # FWD 이어서
             self.enqueue_query(CMD_REPORT_FORWARD, b"", tag="[POLL FWD]",
                                timeout_ms=POLL_QUERY_TIMEOUT_MS, callback=on_fwd)
+            
+        # 폴링 사이클 시작 직전 소량 드레인 (선택)
+        self._drain_input_soft(max_bytes=4096, budget_ms=20)
 
         # 1) STATUS로 깨우기(잔여 프레임/지연 응답 흡수용)
         self.enqueue_query(CMD_REPORT_STATUS, b"", tag="[POLL WAKE]",
@@ -1004,7 +1020,7 @@ class RFPulseController(QObject):
             self.status_message.emit("RFPulse", "STATUS payload too short")
             return None
         b1, b2, b3, b4 = data[0], data[1], data[2], data[3]
-        return RFPulseController.RfStatus(
+        return RfStatus(
             rf_output_on      = bool(b1 & (1 << 5)),
             rf_on_requested   = bool(b1 & (1 << 6)),
             setpoint_mismatch = bool(b1 & (1 << 7)),

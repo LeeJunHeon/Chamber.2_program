@@ -138,6 +138,14 @@ class MainWindow(QWidget):
         # 공정 완료 → 다음 공정
         self.process_controller.process_finished.connect(self._start_next_process_from_queue)
 
+        self.ui.log_message.setMaximumBlockCount(2000)  # 오래된 줄 자동 제거
+        self._log_ui_buf = []
+        self._log_file_buf = []
+        self._log_flush_timer = QTimer(self)
+        self._log_flush_timer.setInterval(100)
+        self._log_flush_timer.timeout.connect(self._flush_logs)
+        self._log_flush_timer.start()
+
         # === 종료 처리 훅 ===
         self._about_quit_called = False
         self._emergency_done = False
@@ -959,18 +967,30 @@ class MainWindow(QWidget):
 
     @Slot(str, str)
     def append_log(self, source: str, msg: str):
-        ui_now = datetime.now().strftime("%H:%M:%S")
-        ui_msg = f"[{ui_now}] [{source}] {msg}"
-        self.ui.log_message.appendPlainText(ui_msg)
+        now_ui   = datetime.now().strftime("%H:%M:%S")
+        now_file = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._log_ui_buf.append(f"[{now_ui}] [{source}] {msg}")
+        self._log_file_buf.append(f"[{now_file}] [{source}] {msg}\n")
 
-        try:
-            file_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            file_msg = f"[{file_now}] [{source}] {msg}\n"
-            with open("log.txt", "a", encoding="utf-8") as f:
-                f.write(file_msg)
-        except Exception as e:
-            error_msg = f"[{ui_now}] [Logger] 파일 로그 작성 실패: {e}"
-            self.ui.log_message.appendPlainText(error_msg)
+    def _flush_logs(self):
+        # UI에 한 번에 그리기
+        if self._log_ui_buf:
+            block = "\n".join(self._log_ui_buf) + "\n"
+            self._log_ui_buf.clear()
+            cursor = self.ui.log_message.textCursor()
+            cursor.movePosition(cursor.End)
+            self.ui.log_message.setTextCursor(cursor)
+            self.ui.log_message.insertPlainText(block)
+
+        # 파일도 한 번에 쓰기
+        if self._log_file_buf:
+            try:
+                with open("log.txt", "a", encoding="utf-8") as f:
+                    f.writelines(self._log_file_buf)
+            except Exception as e:
+                self.ui.log_message.appendPlainText(f"[Logger] 파일 로그 실패: {e}")
+            finally:
+                self._log_file_buf.clear()
 
     @Slot(dict)
     def _apply_polling_targets(self, targets: dict):

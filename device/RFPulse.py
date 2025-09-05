@@ -23,7 +23,7 @@ POST_WRITE_DELAY_MS    = 1500   # 각 쓰기 명령 후 여유 대기(밀리초)
 ACK_FOLLOWUP_GRACE_MS  = 500    # 400~600ms 권장
 
 # 폴링 전용
-POLL_INTERVAL_MS       = 3000   # 폴링 주기
+POLL_INTERVAL_MS       = 30_000   # 폴링 주기
 POLL_QUERY_TIMEOUT_MS  = 9000   # 폴링 시 쿼리 타임아웃(ACK 후 지연 데이터 프레임 대비)
 
 # RF ON 직후 폴링 시작 지연(장비 안정화 대기)

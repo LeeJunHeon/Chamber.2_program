@@ -133,6 +133,11 @@ class ProcessController(QObject):
         self._delay_start_ns = 0
         self._countdown_total_ms = 0
         self._countdown_start_ns = 0
+        
+        # ★ 추가: DELAY 타이머 가드
+        self._delay_guard = QTimer(self)
+        self._delay_guard.setSingleShot(True)
+        self._delay_guard.timeout.connect(self._on_delay_guard)
 
     # ---------------- 시퀀스 구성 ----------------
     def _create_process_sequence(self, params: Dict[str, Any]) -> List[ProcessStep]:
@@ -476,7 +481,15 @@ class ProcessController(QObject):
         try:
             if action == ActionType.DELAY:
                 duration = step.duration or 100
-                self._start_precise_delay(duration, message)
+
+                if step.polling:
+                    # 폴링 ON을 먼저 브로드캐스트하고, 다음 틱에서 딜레이 시작
+                    def _start_delay_with_polling():
+                        self._apply_polling(True)
+                        self._start_precise_delay(duration, message)
+                    QTimer.singleShot(0, _start_delay_with_polling)
+                else:
+                    self._start_precise_delay(duration, message)
                 return
 
             handlers = {
@@ -514,6 +527,9 @@ class ProcessController(QObject):
         sender = self.sender()
         if sender is self.step_timer:
             self._stop_countdown()
+            # ★ DELAY 가드도 함께 정지
+            if self._delay_guard.isActive():
+                self._delay_guard.stop()
 
         # ✅ 수정: 정지 요청 체크를 종료 절차 중에는 하지 않음
         if (self._stop_requested and 
@@ -1175,10 +1191,32 @@ class ProcessController(QObject):
         self._delay_total_ms = int(duration_ms)
         self._delay_start_ns = monotonic_ns()
 
-        # 종료 타이머 가동 (남은시간 = 총 - 경과)
-        elapsed_ms = 0
-        remaining_ms = max(0, self._delay_total_ms - elapsed_ms)
-        self.step_timer.start(remaining_ms)
+        # 메인 타이머 시작
+        self.step_timer.start(self._delay_total_ms)
 
-        # 카운트다운 시작
+        # 카운트다운 시작(표시용)
         self._start_countdown(self._delay_total_ms, message)
+
+        # ★ 가드 타이머: 메인 타이머 + 2초 버퍼 후 안전 확인
+        guard_ms = self._delay_total_ms + 2000
+        if self._delay_guard.isActive():
+            self._delay_guard.stop()
+        self._delay_guard.start(guard_ms)
+
+        # 디버깅 로그(선택)
+        self.log_message.emit(
+            "Process",
+            f"[DELAY start] {message} / {self._delay_total_ms}ms, guard={guard_ms}ms"
+    )
+
+    def _on_delay_guard(self):
+        if not self.is_running:
+            return
+        step = self.current_step
+        if step and step.action == ActionType.DELAY:
+            elapsed_ms = (monotonic_ns() - self._delay_start_ns) // 1_000_000
+            if elapsed_ms >= self._delay_total_ms:
+                if self.step_timer.isActive():
+                    self.step_timer.stop()  # 중복 완료 방지
+                self.log_message.emit("Process", "[DELAY guard] 메인 타이머 지연/유실 감지 → 강제 완료")
+                self.on_step_completed()

@@ -499,16 +499,8 @@ class MFCController(QObject):
             self._gap_timer.start(cmd.gap_ms)
 
     def _is_poll_read_cmd(self, cmd_str: str, tag: str = "") -> bool:
-        """
-        MFC에서 '폴링으로만' 날리는 읽기 명령인지 판별.
-        - 주기 폴링: [POLL R60], [POLL PRESS] 등
-        - 안전망: 실제 전송문자도 검사 (R60, R5 계열)
-        ※ 검증/제어용 읽기(R69, SP1?, M?, V? 등)는 건드리지 않음
-        """
-        if (tag or "").startswith("[POLL "):
-            return True
-        s = (cmd_str or "").lstrip().upper()
-        return s.startswith("R60") or s.startswith("R5")  # 유량/압력 폴링만
+        # 주기 폴링으로만 넣은 것들만 폴링으로 간주
+        return (tag or "").startswith("[POLL ")
 
     def _purge_poll_reads_only(self, cancel_inflight: bool = True, reason: str = "") -> int:
         """
@@ -566,6 +558,9 @@ class MFCController(QObject):
         R60(전체유량) → (콜백에서) R5(압력) → 사이클 종료
         진행/대기 중 폴링 읽기가 있으면 이번 틱은 건너뜀.
         """
+        # 포트가 닫혀 있으면 이번 틱 스킵(적체 방지)
+        if not (self.serial_mfc and self.serial_mfc.isOpen()):
+            return
         # ★ 중첩 금지: 이미 진행/대기 중이면 스킵
         if self._poll_cycle_active or self._has_pending_poll_reads():
             return

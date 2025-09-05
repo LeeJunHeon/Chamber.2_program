@@ -89,6 +89,19 @@ CMD_NAMES = {
     CMD_REPORT_PULSE_DUTY: "REPORT_PULSE_DUTY",
 }
 
+# ---- REPORT_STATUS(0xA2) 파싱/검증 ----
+@dataclass
+class RfStatus:
+    rf_output_on: bool          # Byte1 bit5
+    rf_on_requested: bool       # Byte1 bit6
+    setpoint_mismatch: bool     # Byte1 bit7 (True면 아직 목표 미도달)
+    interlock_open: bool        # Byte2 bit7
+    overtemp: bool              # Byte2 bit3
+    current_limit: bool         # Byte4 bit0
+    extended_fault: bool        # Byte4 bit5
+    cex_lock: bool              # Byte4 bit7
+    raw: bytes = b""
+
 def _u16le(buf: bytes, i: int = 0) -> int:
     return buf[i] | (buf[i+1] << 8)
 
@@ -128,6 +141,7 @@ class RFPulseController(QObject):
 
     # 최소 로그(명령 전송/성공/실패)
     status_message = Signal(str, str)
+    rf_status_updated = Signal(object)   # RfStatus 객체 전달
 
     # 공정 컨트롤러 연동
     target_reached = Signal()                    # RF ON 완료 (정상)
@@ -173,6 +187,8 @@ class RFPulseController(QObject):
         self._poll_busy: bool = False
         self._last_forward_w: Optional[float] = None
         self._last_reflected_w: Optional[float] = None
+
+        self._last_status: Optional['RfStatus'] = None
 
     # ---------- 내부 유틸 ----------
     def _cmd_label(self, cmd: int) -> str:
@@ -577,12 +593,70 @@ class RFPulseController(QObject):
                         ok = True
                         result = b""
                     else:
-                        kind, _ = self._recv_frame(timeout_ms=cmd.timeout_ms, allow_ack_only=True)
-                        ok = (kind in ("ACK_ONLY", "FRAME"))
-                        result = b"\x06" if ok else None
+                        # ① ACK 대기 (ACK_ONLY 또는 바로 온 프레임 처리)
+                        t_ack = QElapsedTimer(); t_ack.start()
+                        early_data: Optional[bytes] = None
+                        try:
+                            kind, payload = self._recv_frame(
+                                timeout_ms=min(ACK_TIMEOUT_MS, cmd.timeout_ms),
+                                allow_ack_only=True
+                            )
+                            if kind == "FRAME" and payload:
+                                # 동일 cmd 프레임이면 데이터 추출(= CSR 바이트일 가능성)
+                                hdr = payload[0]; cmd_b = payload[1]
+                                rx_addr = (hdr >> 3) & 0x1F
+                                if rx_addr == self.addr and cmd_b == cmd.cmd:
+                                    length_bits = hdr & 0x07
+                                    idx = 2
+                                    if length_bits == 7:
+                                        if len(payload) < 4:
+                                            raise TimeoutError("short frame")
+                                        dlen = payload[idx]; idx += 1
+                                    else:
+                                        dlen = length_bits
+                                    early_data = bytes(payload[idx:idx+dlen])
+                                else:
+                                    self._try_log_other_frame(payload)
+                        except TimeoutError:
+                            ok = False
+                            fail_reason = "ack-timeout"
 
-                        if ok and cmd.cmd == CMD_RF_ON:
-                            QTimer.singleShot(0, self.target_reached.emit)
+                        # ② CSR 프레임 확보 (필요하면 추가 대기)
+                        if fail_reason is None:
+                            if early_data is None:
+                                remain = max(1, cmd.timeout_ms - t_ack.elapsed())
+                                try:
+                                    csr_bytes = self._recv_matching_frame(
+                                        cmd.cmd, timeout_ms=remain, tag=(cmd.tag or "")
+                                    )
+                                except TimeoutError:
+                                    ok = False
+                                    fail_reason = "csr-timeout"
+                                    csr_bytes = None
+                            else:
+                                csr_bytes = early_data
+
+                            # ③ CSR 판정 (1바이트: 0=OK, 그 외=에러)
+                            if fail_reason is None:
+                                if not csr_bytes or len(csr_bytes) < 1:
+                                    ok = False
+                                    fail_reason = "no-csr"
+                                else:
+                                    csr = csr_bytes[0]
+                                    csr_msg = CSR_CODES.get(csr, f"Unknown({csr})")
+                                    if csr != 0:
+                                        ok = False
+                                        fail_reason = f"csr={csr} {csr_msg}"
+                                        self.status_message.emit(
+                                            "RFPulse",
+                                            f"CSR {csr} ({csr_msg}) for {self._cmd_label(cmd.cmd)}"
+                                        )
+                                    else:
+                                        ok = True
+                                        result = csr_bytes
+                                        # ※ 실제 성공으로 확정된 뒤에만 target_reached
+                                        if cmd.cmd == CMD_RF_ON:
+                                            QTimer.singleShot(0, self.target_reached.emit)
 
                 else:
                     # === 읽기(리드백) 명령 처리 ===
@@ -699,8 +773,14 @@ class RFPulseController(QObject):
             self.enqueue_query(CMD_REPORT_REFLECTED, b"", tag="[POLL REF]",
                                timeout_ms=POLL_QUERY_TIMEOUT_MS, callback=on_ref)
 
-        def after_wake(_b: Optional[bytes]):
-            # WAKE 성공/실패와 무관하게 FWD 시도
+        def after_wake(b: Optional[bytes]):
+            st = self._parse_status_0xA2(b)
+            if st:
+                self._last_status = st
+                self.rf_status_updated.emit(st)
+                self.status_message.emit("RFPulse", f"STATUS {self._status_summary_str(st)}")
+                self._validate_status(st)
+            # FWD 이어서
             self.enqueue_query(CMD_REPORT_FORWARD, b"", tag="[POLL FWD]",
                                timeout_ms=POLL_QUERY_TIMEOUT_MS, callback=on_fwd)
 
@@ -886,10 +966,70 @@ class RFPulseController(QObject):
                 self.update_rf_status_display.emit(f, r)
 
         # WAKE → FWD → REF
+        def _once_wake_cb(b: Optional[bytes]):
+            st = self._parse_status_0xA2(b)
+            if st:
+                self._last_status = st
+                self.rf_status_updated.emit(st)
+                self.status_message.emit("RFPulse", f"[ONCE] STATUS {self._status_summary_str(st)}")
+                self._validate_status(st)
+            self.enqueue_query(CMD_REPORT_FORWARD, b"", tag="[ONCE FWD]",
+                               timeout_ms=POLL_QUERY_TIMEOUT_MS, callback=_f)
+
         self.enqueue_query(CMD_REPORT_STATUS, b"", tag="[ONCE WAKE]",
-                           timeout_ms=POLL_QUERY_TIMEOUT_MS,
-                           callback=lambda _b: self.enqueue_query(
-                               CMD_REPORT_FORWARD, b"", tag="[ONCE FWD]",
-                               timeout_ms=POLL_QUERY_TIMEOUT_MS, callback=_f))
+                           timeout_ms=POLL_QUERY_TIMEOUT_MS, callback=_once_wake_cb)
+
         self.enqueue_query(CMD_REPORT_REFLECTED, b"", tag="[ONCE REF]",
                            timeout_ms=POLL_QUERY_TIMEOUT_MS, callback=_r)
+        
+    # ---------- CSR 파싱 헬퍼 ---------- 
+    def _parse_csr(self, cmd_num: int, data_bytes: Optional[bytes]) -> tuple[bool, int, str]:
+        """
+        AE Bus 규약: 쓰기 명령(1..127)은 ACK 후 동일 cmd 번호의 프레임이 오고,
+        그 데이터 1바이트가 CSR 코드다(0=OK). 없거나 길이가 0이면 오류로 본다.
+        """
+        if not data_bytes or len(data_bytes) < 1:
+            return (False, -1, "No CSR byte")
+        csr = data_bytes[0]
+        msg = CSR_CODES.get(csr, f"Unknown({csr})")
+        if csr != 0:
+            self.status_message.emit(
+                "RFPulse", f"CSR {csr} ({msg}) for {self._cmd_label(cmd_num)}"
+            )
+        return (csr == 0, csr, msg)
+    
+    # ---------- WAKE 파싱 헬퍼 ---------- 
+    def _parse_status_0xA2(self, data: Optional[bytes]) -> Optional['RfStatus']:
+        if not data or len(data) < 4:
+            self.status_message.emit("RFPulse", "STATUS payload too short")
+            return None
+        b1, b2, b3, b4 = data[0], data[1], data[2], data[3]
+        return RFPulseController.RfStatus(
+            rf_output_on      = bool(b1 & (1 << 5)),
+            rf_on_requested   = bool(b1 & (1 << 6)),
+            setpoint_mismatch = bool(b1 & (1 << 7)),
+            interlock_open    = bool(b2 & (1 << 7)),
+            overtemp          = bool(b2 & (1 << 3)),
+            current_limit     = bool(b4 & (1 << 0)),
+            extended_fault    = bool(b4 & (1 << 5)),
+            cex_lock          = bool(b4 & (1 << 7)),
+            raw = bytes(data[:4])
+        )
+    
+    def _status_summary_str(self, st: 'RfStatus') -> str:
+        return (f"on={int(st.rf_output_on)} req={int(st.rf_on_requested)} "
+                f"sp_miss={int(st.setpoint_mismatch)} ilock={int(st.interlock_open)} "
+                f"ot={int(st.overtemp)} limI={int(st.current_limit)} "
+                f"xflt={int(st.extended_fault)} cex={int(st.cex_lock)}")
+
+    def _validate_status(self, st: 'RfStatus') -> None:
+        # 필요 시 더 강하게 게이팅/중단 로직을 붙일 수 있음. 여기선 경고 로깅.
+        if st.interlock_open:
+            self.status_message.emit("RFPulse", "STATUS: Interlock OPEN detected")
+        if st.overtemp:
+            self.status_message.emit("RFPulse", "STATUS: Over-Temperature detected")
+        if st.extended_fault:
+            self.status_message.emit("RFPulse", "STATUS: Extended fault present")
+        # 요청됐지만 아직 출력이 안 켜진 상태(램프업 지연 등)도 알려줌
+        if st.rf_on_requested and not st.rf_output_on:
+            self.status_message.emit("RFPulse", "STATUS: RF requested but output not ON yet")

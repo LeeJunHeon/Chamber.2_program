@@ -17,8 +17,9 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Deque, Callable, Optional
 import re
+import time
 
-from PyQt6.QtCore import QObject, QTimer, QIODeviceBase, pyqtSignal as Signal, pyqtSlot as Slot
+from PyQt6.QtCore import QCoreApplication, QObject, QTimer, QIODeviceBase, pyqtSignal as Signal, pyqtSlot as Slot
 from PyQt6.QtSerialPort import QSerialPort, QSerialPortInfo
 
 @dataclass
@@ -107,6 +108,9 @@ class MFCController(QObject):
         self._stabilizing_target: float = 0.0   # 장비 단위
         self._pending_cmd_for_timer: Optional[str] = None
         self.stabilization_attempts = 0
+
+        # ★ 폴링 사이클 진행 중 여부(중첩 금지용)
+        self._poll_cycle_active: bool = False
 
     # -------------------------------------------------
     # 지연 생성 헬퍼(반드시 MFC 스레드에서 호출)
@@ -235,6 +239,7 @@ class MFCController(QObject):
         self._stabilizing_channel = None
         self._stabilizing_target = 0.0
         self._pending_cmd_for_timer = None
+        self._poll_cycle_active = False
 
         # 타이머들 정지/파기
         for t_attr in ("_cmd_timer", "_gap_timer", "polling_timer", "stabilization_timer", "_watchdog"):
@@ -289,6 +294,7 @@ class MFCController(QObject):
         if self._gap_timer:
             self._gap_timer.stop()
         self._rx.clear()
+        self._poll_cycle_active = False
 
         QTimer.singleShot(0, self._watch_connection)
 
@@ -390,6 +396,9 @@ class MFCController(QObject):
         self._send_spin = True
 
         try:
+            # ★ 전송 직전: OS 입력버퍼 소프트 드레인
+            self._drain_input_soft(80)
+
             cmd = self._cmd_q.popleft()
             self._inflight = cmd
             self._rx.clear()
@@ -419,6 +428,8 @@ class MFCController(QObject):
                 if cmd.allow_no_reply:
                     # 응답을 기대하지 않는 명령은 타임아웃을 걸지 말고 바로 완료 처리
                     QTimer.singleShot(0, lambda: self._finish_command(None))
+                    # ★ 늦게 도착할 ACK를 흡수(다음 전송 전에 또 한 번 드레인하므로 매우 짧게)
+                    QTimer.singleShot(1, lambda: self._drain_input_soft(60))
                 else:
                     self._cmd_timer.start(cmd.timeout_ms)
 
@@ -539,21 +550,39 @@ class MFCController(QObject):
         if should_poll:
             if not self.polling_timer.isActive():
                 self.status_message.emit("MFC", "주기적 읽기(Polling) 시작")
+                self._poll_cycle_active = False
                 self.polling_timer.start()
         else:
             if self.polling_timer.isActive():
                 self.polling_timer.stop()
                 self.status_message.emit("MFC", "주기적 읽기(Polling) 중지")
+            self._poll_cycle_active = False
             # 🔑 폴링 Off 직후: 폴링으로만 날리는 읽기(R60/R5) 명령만 싹 정리
             self._purge_poll_reads_only(cancel_inflight=True, reason="polling off/shutter closed")
 
     def _enqueue_poll_cycle(self):
-        self._read_flow_all_async(tag="[POLL R60]")
+        """
+        폴링은 '한 번에 하나' 사이클만:
+        R60(전체유량) → (콜백에서) R5(압력) → 사이클 종료
+        진행/대기 중 폴링 읽기가 있으면 이번 틱은 건너뜀.
+        """
+        # ★ 중첩 금지: 이미 진행/대기 중이면 스킵
+        if self._poll_cycle_active or self._has_pending_poll_reads():
+            return
+        self._poll_cycle_active = True
 
-        cmdp = MFC_COMMANDS['READ_PRESSURE']
-        def on_p(line: Optional[str]):
-            self._emit_pressure_ui(line)
-        self.enqueue(cmdp, on_p, timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS, tag="[POLL PRESS]")
+        def _after_flow(_vals):
+            # (유량 값은 _read_flow_all_async 내부에서 UI emit + 모니터링 이미 수행)
+            # 이어서 압력 읽기
+            cmdp = MFC_COMMANDS['READ_PRESSURE']
+            def on_p(line: Optional[str]):
+                self._emit_pressure_ui(line)
+                # ★ 사이클 종료
+                self._poll_cycle_active = False
+            self.enqueue(cmdp, on_p, timeout_ms=MFC_TIMEOUT, gap_ms=MFC_GAP_MS, tag="[POLL PRESS]")
+
+        # 사이클 시작: 전체 유량 → on_done에서 압력
+        self._read_flow_all_async(on_done=_after_flow, tag="[POLL R60]")
 
     # ---------- 큐/상태 정리 유틸 ----------
     @Slot()
@@ -594,6 +623,7 @@ class MFCController(QObject):
         # 잔여 목표/카운터 초기화
         self.last_setpoints = {1: 0.0, 2: 0.0, 3: 0.0}
         self.flow_error_counters = {1: 0, 2: 0, 3: 0}
+        self._poll_cycle_active = False
 
     # ---------- 상위에서 호출하는 공개 API ----------
     @Slot(str, dict)
@@ -1190,3 +1220,41 @@ class MFCController(QObject):
         fmt = "{:." + str(int(MFC_PRESSURE_DECIMALS)) + "f}"
         self.update_pressure.emit(fmt.format(ui_val))     # UI 라벨용 문자열
         self.update_pressure_value.emit(float(ui_val))    # CSV/그래프용 숫자
+
+    def _has_pending_poll_reads(self) -> bool:
+        """인플라이트/큐에 폴링 읽기(R60/R5)가 있으면 True."""
+        if self._inflight and self._is_poll_read_cmd(self._inflight.cmd_str, self._inflight.tag):
+            return True
+        for c in self._cmd_q:
+            if self._is_poll_read_cmd(c.cmd_str, c.tag):
+                return True
+        return False
+    
+    def _drain_input_soft(self, budget_ms: int = 80):
+        """
+        OS 수신버퍼에 남아있는 지연 응답/잡음 라인을 짧게 비웁니다.
+        - 현재 inflight 명령이 없을 때만 호출되는 위치에 배치하세요(전송 직전).
+        - 내부 누적 버퍼(_rx)도 함께 정리합니다.
+        """
+        if not (self.serial_mfc and self.serial_mfc.isOpen()):
+            return
+
+        t0 = time.monotonic()
+        # 남아있는 바이트를 budget 내에서 모두 흡수
+        while (time.monotonic() - t0) * 1000 < budget_ms:
+            if self.serial_mfc.bytesAvailable() <= 0:
+                break
+            try:
+                self.serial_mfc.readAll()
+            except Exception:
+                break
+            # 이벤트 한 번 처리(readyRead 중첩 가능성 완화)
+            QCoreApplication.processEvents()
+
+        # 내부 파서 버퍼도 비워 잔여 CR/LF 조각 제거
+        try:
+            self._rx.clear()
+        except Exception:
+            pass
+
+

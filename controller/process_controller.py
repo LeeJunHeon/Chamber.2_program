@@ -1112,6 +1112,7 @@ class ProcessController(QObject):
         self._px = None
         self.process_sequence.clear()
         self.current_params.clear()
+        self._apply_polling(False)
         self.process_status_changed.emit(False)
         self.update_process_state.emit("대기 중")
         self.log_message.emit("Process", "프로세스 컨트롤러가 리셋되었습니다.")

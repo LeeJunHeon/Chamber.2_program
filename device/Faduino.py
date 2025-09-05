@@ -17,7 +17,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Optional, Deque
 
-from PyQt6.QtCore import QObject, QTimer, QIODeviceBase, pyqtSignal as Signal, pyqtSlot as Slot
+from PyQt6.QtCore import QObject, QTimer, QIODeviceBase, QCoreApplication, pyqtSignal as Signal, pyqtSlot as Slot
 from PyQt6.QtSerialPort import QSerialPort, QSerialPortInfo
 
 from lib.config import (
@@ -88,6 +88,8 @@ class FaduinoController(QObject):
         self.rf_reflected = 0.0
         self.dc_voltage = 0.0
         self.dc_current = 0.0
+
+        self._poll_cycle_active: bool = False
 
     # ---------- 내부 헬퍼(지연 생성) ----------
     def _ensure_serial_created(self):
@@ -307,6 +309,7 @@ class FaduinoController(QObject):
         # 타이머/버퍼 정리
         if self._gap_timer: self._gap_timer.stop()
         self._rx.clear()
+        self._poll_cycle_active = False
 
         # 다음 틱에 워치독이 재연결 시도
         QTimer.singleShot(0, self._watch_connection)
@@ -404,6 +407,9 @@ class FaduinoController(QObject):
         self._send_spin = True
 
         try:
+            # ★ 전송 직전: OS 입력버퍼 소프트 드레인(직전 늦은 ACK/잡음 제거)
+            self._drain_input_soft(80)
+
             cmd = self._cmd_q.popleft()
             self._inflight = cmd
             self._rx.clear()
@@ -430,7 +436,12 @@ class FaduinoController(QObject):
 
             if self._cmd_timer:
                 self._cmd_timer.stop()
-                self._cmd_timer.start(cmd.timeout_ms)
+                if cmd.allow_no_reply:
+                    # ★ 응답을 기대하지 않는 명령은 즉시 완료 처리 + 아주 짧은 드레인
+                    QTimer.singleShot(0, lambda: self._finish_command(None))
+                    QTimer.singleShot(1, lambda: self._drain_input_soft(60))
+                else:
+                    self._cmd_timer.start(cmd.timeout_ms)
 
         except Exception as e:
             self.status_message.emit("Faduino", f"[ERROR] Send failed: {e}")
@@ -496,14 +507,6 @@ class FaduinoController(QObject):
         if self._gap_timer: 
             self._gap_timer.start(cmd.gap_ms)
 
-    # 읽기성 명령인지 판별 (상태 S, 소문자 r/d, 핀 읽기 P)
-    def _is_read_cmd(self, cmd_str: str) -> bool:
-        c = (cmd_str or "").lstrip()
-        if not c:
-            return False
-        head = c[0]
-        return head in ("S", "P", "r", "d")  # 상태/핀/소문자 r,d 읽기
-
     def _purge_reads_only(self, cancel_inflight: bool = True, reason: str = ""):
         # 인플라이트가 읽기면 취소
         if cancel_inflight and self._inflight and self._is_read_cmd(self._inflight.cmd_str):
@@ -545,6 +548,7 @@ class FaduinoController(QObject):
         self._ensure_timers_created()
         if should_poll:
             self._is_first_poll = True
+            self._poll_cycle_active = False
             if self.polling_timer and not self.polling_timer.isActive():
                 self.status_message.emit("Faduino", "공정 감시 폴링 시작")
                 self.polling_timer.start()
@@ -554,24 +558,31 @@ class FaduinoController(QObject):
                 self.status_message.emit("Faduino", "공정 감시 폴링 중지")
             # 🔑 폴링 off 직후, S/r/d/P 등 '읽기' 명령을 즉시 정리
             #    (이미 예약된 singleShot·gap 타이머로 들어올 수 있는 잔여 읽기도 제거)
+            self._poll_cycle_active = False
             self._purge_reads_only(cancel_inflight=True, reason="polling off")
 
     def _enqueue_poll_cycle(self):
-        def on_s(line: Optional[str]):
-            p = self._parse_ok_and_compute(line or "")
-            if p and p.get("type") == "ERROR":
-                self.command_failed.emit("Faduino", p.get("msg", "ERROR"))
-                return
-            if not p or p.get("type") != "OK_S":
-                return
-            try:
-                relay_mask = p["relay_mask"]
+        # 포트 안 열려 있으면 이번 틱 스킵
+        if not (self.serial_faduino and self.serial_faduino.isOpen()):
+            return
+        # 이미 진행/대기 중인 읽기가 있으면 스킵
+        if self._poll_cycle_active or self._has_pending_reads():
+            return
 
-                # ✅ 공통 헬퍼 호출: 이번이 첫 S라면 여기서 시드하고 끝.
+        self._poll_cycle_active = True
+
+        def on_s(line: Optional[str]):
+            try:
+                p = self._parse_ok_and_compute(line or "")
+                if p and p.get("type") == "ERROR":
+                    self.command_failed.emit("Faduino", p.get("msg", "ERROR"))
+                    return
+                if not p or p.get("type") != "OK_S":
+                    return
+                relay_mask = p["relay_mask"]
                 if self._initial_sync_if_needed(relay_mask):
                     pass
                 else:
-                    # 첫 S가 아니면 검증
                     if relay_mask != self.expected_relay_mask:
                         msg = f"릴레이 상태 불일치! 예상: {self.expected_relay_mask}, 실제: {relay_mask}"
                         self.status_message.emit("Faduino(경고)", msg)
@@ -580,8 +591,10 @@ class FaduinoController(QObject):
                     self._update_rf(*p["rf"])
                 if self.is_dc_active and "dc" in p:
                     self._update_dc(*p["dc"])
-            except Exception:
-                pass
+            finally:
+                # 성공/실패/무응답 어떤 경우든 사이클 플래그 내려줌
+                self._poll_cycle_active = False
+
         self.enqueue('S', on_s, timeout_ms=FADUINO_TIMEOUT_MS, gap_ms=FADUINO_GAP_MS, tag='[POLL S]')
 
     # ---------- 큐/상태 정리 유틸 ----------
@@ -902,3 +915,43 @@ class FaduinoController(QObject):
         except Exception as e:
             self.status_message.emit("Faduino", traceback.format_exc())
             self.status_message.emit("Faduino", f"콜백 오류: {e}")
+
+    def _is_read_cmd(self, cmd_str: str) -> bool:
+        c = (cmd_str or "").lstrip()
+        if not c: return False
+        return c[0] in ("S", "P", "r", "d")
+
+    def _has_pending_reads(self) -> bool:
+        if self._inflight and self._is_read_cmd(self._inflight.cmd_str):
+            return True
+        for c in self._cmd_q:
+            if self._is_read_cmd(c.cmd_str):
+                return True
+        return False
+    
+    def _drain_input_soft(self, budget_ms: int = 80):
+        """
+        OS 수신버퍼에 남아있는 지연 응답/잡음 라인을 짧게 비웁니다.
+        - inflight이 없고, '전송 직전'에만 호출됩니다.
+        - 내부 누적 버퍼(_rx)도 함께 정리합니다.
+        """
+        if not (self.serial_faduino and self.serial_faduino.isOpen()):
+            return
+
+        t0 = time.monotonic()
+        while (time.monotonic() - t0) * 1000 < budget_ms:
+            try:
+                if self.serial_faduino.bytesAvailable() <= 0:
+                    break
+                self.serial_faduino.readAll()
+            except Exception:
+                break
+            # readyRead 재진입/이벤트 처리 최소화
+            QCoreApplication.processEvents()
+
+        try:
+            self._rx.clear()
+        except Exception:
+            pass
+
+
